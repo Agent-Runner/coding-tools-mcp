@@ -115,16 +115,32 @@ Human-side commands:
 
 ```bash
 ctc baton show /path/to/repo
-ctc tui
+ctc            # opens the TUI (ctc tui is a deprecated alias)
 ctc tui <session-id>
 ```
 
-`ctc tui` attaches to the latest session log by default. It shows session
-metadata, backend status, recent tool calls, the latest `show_changes` diff, and
-current baton status. If the model calls the lower `request_permissions` tool
-while the TUI is attached, Conductor pauses that request for a local `y` / `n`
-decision. Without an attached TUI, the request falls back to the lower backend's
-existing permission flow.
+The TUI attaches to the latest session log by default and renders activity as
+an append-only transcript that flows into the terminal scrollback, in the
+style of Claude Code: each tool call is a `●` line with a dimmed `⎿` result
+(or a red error), review checkpoints render as inline diff cards, and TUI
+notices appear as `✓` / `✗` / `·` notes. Updates are event-driven — the TUI
+watches `~/.ctc/logs` with a dirty-checked snapshot store instead of
+repainting on a timer — so external stdio sessions stream in near real time
+without flicker.
+
+Interaction is input-first: printable keys always go to the composer, and
+typing `/` opens a navigable command menu (arrows to choose, Tab to complete,
+Enter to run). Bounded panels open over the live region for `/diff`,
+`/baton`, `/approvals`, `/config`, `/inspect` (also Ctrl+O), `/doctor`, and
+`/help`; arrows scroll them and Esc closes. Tab cycles session tabs when the
+composer is empty, `/clear` resets the transcript, and Ctrl+C must be pressed
+twice to quit so a stray interrupt cannot tear down live sessions.
+
+If the model calls the lower `request_permissions` tool while the TUI is
+attached, Conductor pauses the request and shows an approval prompt with
+selectable options (`y`/`n`, `1`/`2`, arrows + Enter; left/right walk the
+queue when several requests are pending; Esc denies). Without an attached
+TUI, the request falls back to the lower backend's existing permission flow.
 
 ## M5 Surface
 

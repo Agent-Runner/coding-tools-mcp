@@ -59,22 +59,28 @@ export const slashCommands: SlashCommand[] = [
     stage: "available",
   },
   {
+    name: "inspect",
+    usage: "/inspect",
+    description: "Open the event inspector with full arguments and results (Ctrl+O).",
+    stage: "available",
+  },
+  {
     name: "doctor",
     usage: "/doctor",
-    description: "Run environment checks. Not wired into the TUI yet - run: ctc doctor",
-    stage: "planned",
+    description: "Run profile, git, worktree, and backend checks for this repo.",
+    stage: "available",
+  },
+  {
+    name: "clear",
+    usage: "/clear",
+    description: "Clear the transcript and start a fresh screen.",
+    stage: "available",
   },
   {
     name: "clean",
     usage: "/clean",
     description: "Clean managed workspace records. Not wired into the TUI yet - run: ctc ws clean",
     stage: "planned",
-  },
-  {
-    name: "messages",
-    usage: "/messages",
-    description: "Show the recent TUI status message history.",
-    stage: "available",
   },
   {
     name: "quit",

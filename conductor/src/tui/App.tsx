@@ -1,48 +1,65 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Box, Text, useApp, useInput, useStdout } from "ink";
-import TextInput from "ink-text-input";
-import { formatBatonBundle } from "../baton/protocol.js";
+import { runDoctor } from "../cli/doctor.js";
 import { markTuiAttached, type PermissionApprovalRequest } from "../shared/approvals.js";
-import type { ConductorEvent, PermissionRequestEvent, ToolCallEvent } from "../shared/types.js";
 import {
   findSlashCommand,
   parseCloseCommand,
   parseNewCommand,
   parseSlashCommand,
   parseTunnelCommand,
-  slashCommands,
   suggestSlashCommands,
-  type ParsedSlashCommand,
-  type SlashCommand,
 } from "./commands/registry.js";
+import { ApprovalPrompt } from "./components/ApprovalPrompt.js";
+import { Composer, SlashMenu } from "./components/Composer.js";
+import { OnboardingView, optionsForStep } from "./components/OnboardingView.js";
+import {
+  ScrollPanel,
+  approvalPanelLines,
+  batonPanelLines,
+  doctorLines,
+  helpLines,
+  inspectLines,
+} from "./components/Panels.js";
+import { StatusBar } from "./components/StatusBar.js";
+import { Transcript } from "./components/Transcript.js";
+import { diffDisplayLines, errorMessage, formatElapsedSeconds, textDisplayLines } from "./format.js";
 import {
   advanceOnboarding,
   loadOnboardingState,
   onboardingDefault,
-  onboardingPrompt,
   type OnboardingState,
 } from "./onboarding.js";
 import { TuiSessionController } from "./session-controller.js";
-import { loadTuiSnapshot, type TuiSessionSummary, type TuiSnapshot } from "./state.js";
+import { TuiSnapshotStore } from "./store.js";
+import { glyphs, palette, spinnerFrames, type DisplayLine } from "./theme.js";
+import { TranscriptBuilder, type NoteKind, type TranscriptItem } from "./transcript.js";
 
-type ViewMode = "events" | "detail" | "diff" | "baton" | "help" | "approvals" | "config" | "messages";
-type StreamEvent = ToolCallEvent | PermissionRequestEvent;
-
-interface StatusMessage {
-  ts: string;
-  text: string;
-}
-
-interface DisplayLine {
-  text: string;
-  color?: string;
-  dim?: boolean;
-  bold?: boolean;
-}
-
-const SPINNER_FRAMES = ["|", "/", "-", "\\"];
+const CTC_VERSION = "0.1.0";
 const HISTORY_LIMIT = 50;
-const MESSAGE_LIMIT = 100;
+const CTRL_C_WINDOW_MS = 1500;
+
+type PanelKind = "help" | "diff" | "baton" | "approvals" | "config" | "inspect" | "doctor";
+
+interface PanelState {
+  kind: PanelKind;
+  lines?: DisplayLine[];
+}
+
+interface BusyState {
+  label: string;
+  startedAt: number;
+}
+
+const PANEL_TITLES: Record<PanelKind, string> = {
+  help: "Help",
+  diff: "Recent Changes",
+  baton: "Baton",
+  approvals: "Pending Approvals",
+  config: "Profile",
+  inspect: "Event Inspector",
+  doctor: "Doctor",
+};
 
 export function TuiApp({
   requestedSessionId,
@@ -53,44 +70,69 @@ export function TuiApp({
 }): React.ReactElement {
   const { exit } = useApp();
   const { stdout } = useStdout();
-  const controller = useRef<TuiSessionController | undefined>(undefined);
-  if (!controller.current) controller.current = new TuiSessionController();
-  const [snapshot, setSnapshot] = useState<TuiSnapshot>(() => emptySnapshot(initialWorkspacePath));
-  const [activeSessionId, setActiveSessionId] = useState<string | undefined>(requestedSessionId);
-  const [viewMode, setViewMode] = useState<ViewMode>("events");
-  const [input, setInput] = useState("");
-  const [messages, setMessages] = useState<StatusMessage[]>(() => [
-    { ts: new Date().toISOString(), text: "Ready. Type /help for commands." },
+
+  const controllerRef = useRef<TuiSessionController | undefined>(undefined);
+  if (!controllerRef.current) controllerRef.current = new TuiSessionController();
+  const controller = controllerRef.current;
+
+  const storeRef = useRef<TuiSnapshotStore | undefined>(undefined);
+  if (!storeRef.current) storeRef.current = new TuiSnapshotStore({ requestedSessionId, initialWorkspacePath });
+  const store = storeRef.current;
+
+  const builderRef = useRef<TranscriptBuilder | undefined>(undefined);
+  if (!builderRef.current) builderRef.current = new TranscriptBuilder();
+  const builder = builderRef.current;
+
+  const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot);
+
+  const [size, setSize] = useState(() => ({ columns: stdout.columns || 80, rows: stdout.rows || 24 }));
+  const textWidth = Math.max(40, Math.min(size.columns - 2, 120));
+
+  const [items, setItems] = useState<TranscriptItem[]>(() => [
+    builder.banner({
+      title: "Coding Tools Conductor",
+      version: CTC_VERSION,
+      workspace: initialWorkspacePath ?? process.cwd(),
+      tips: [
+        "/new opens a workspace session for model clients",
+        "/help lists commands and keys",
+        `Tab cycles sessions ${glyphs.dot} Ctrl+O inspects recent events`,
+      ],
+    }),
   ]);
+  const [epoch, setEpoch] = useState(0);
+
+  const [input, setInput] = useState("");
+  const [menuIndex, setMenuIndex] = useState(0);
   const [history, setHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState<number | undefined>(undefined);
   const historyDraft = useRef("");
-  const [onboarding, setOnboarding] = useState<OnboardingState | undefined>();
-  const [onboardingChoice, setOnboardingChoice] = useState(0);
-  const [refreshNonce, setRefreshNonce] = useState(0);
-  const [busy, setBusy] = useState(false);
+
+  const [panel, setPanel] = useState<PanelState | undefined>(undefined);
+  const [scroll, setScroll] = useState(0);
+
+  const [busy, setBusy] = useState<BusyState | undefined>(undefined);
   const [spinnerFrame, setSpinnerFrame] = useState(0);
-  const [configText, setConfigText] = useState("No profile loaded.");
-  const [tunnelMessage, setTunnelMessage] = useState(() => controller.current?.tunnelStatus().message ?? "tunnel:off");
-  const [follow, setFollow] = useState(true);
-  const [selectedKey, setSelectedKey] = useState<string | undefined>(undefined);
-  const [viewScroll, setViewScroll] = useState(0);
+
+  const [onboarding, setOnboarding] = useState<OnboardingState | undefined>(undefined);
+  const [onboardingChoice, setOnboardingChoice] = useState(0);
+
   const [approvalCursor, setApprovalCursor] = useState(0);
-  const [quitArmed, setQuitArmed] = useState(false);
-  const quitTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const [approvalChoice, setApprovalChoice] = useState(0);
 
-  const terminalRows = stdout?.rows ?? 24;
-  const streamHeight = Math.max(6, terminalRows - 12);
-  const panelHeight = Math.max(8, terminalRows - 10);
+  const [ctrlCArmed, setCtrlCArmed] = useState(false);
+  const ctrlCTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
-  const allStreamEvents = useMemo(() => [...snapshot.events].filter(isStreamEvent).reverse(), [snapshot.events]);
-  const selectedIndex = useMemo(() => {
-    if (follow || !selectedKey) return 0;
-    const found = allStreamEvents.findIndex((event) => eventKey(event) === selectedKey);
-    return found === -1 ? Math.min(0, allStreamEvents.length - 1) : found;
-  }, [follow, selectedKey, allStreamEvents]);
-  const selectedEvent = allStreamEvents[Math.max(0, Math.min(selectedIndex, allStreamEvents.length - 1))];
-  const latestCheckpoint = snapshot.checkpoints.at(-1);
+  const [tunnelMessage, setTunnelMessage] = useState(() => controller.tunnelStatus().message);
+
+  const suggestions = useMemo(() => (input.startsWith("/") ? suggestSlashCommands(input) : []), [input]);
+  const menuVisible = !onboarding && suggestions.length > 0;
+
+  const orderedSessions = useMemo(
+    () => [...snapshot.sessions].sort((a, b) => a.sessionId.localeCompare(b.sessionId)),
+    [snapshot.sessions],
+  );
+
   const approvalQueue = useMemo(() => {
     const seen = new Set<string>();
     const queue: PermissionApprovalRequest[] = [];
@@ -103,64 +145,75 @@ export function TuiApp({
   }, [snapshot.pendingApprovals, snapshot.allPendingApprovals]);
   const approvalVisible = approvalQueue.length > 0 && !onboarding;
   const activeApproval = approvalQueue[Math.min(approvalCursor, Math.max(approvalQueue.length - 1, 0))];
-  const suggestions = useMemo(() => suggestSlashCommands(input), [input]);
-  const activeSummary = snapshot.sessions.find((session) => session.sessionId === snapshot.sessionId);
-  const message = messages.at(-1)?.text ?? "";
 
-  const pushMessage = (text: string): void => {
-    setMessages((items) => [...items, { ts: new Date().toISOString(), text }].slice(-MESSAGE_LIMIT));
+  const onboardingOptions = useMemo(() => (onboarding ? optionsForStep(onboarding) : []), [onboarding]);
+
+  const appendItems = (added: TranscriptItem[]): void => {
+    if (added.length) setItems((previous) => [...previous, ...added]);
   };
 
+  const appendNote = (text: string, kind: NoteKind = "info"): void => {
+    appendItems([builder.note(text, kind, textWidth)]);
+  };
+
+  // Store lifecycle: watch ~/.ctc/logs and poll as a fallback.
+  useEffect(() => {
+    store.start();
+    return () => {
+      store.stop();
+    };
+  }, [store]);
+
+  // In-process events from TUI-owned sessions refresh the snapshot instantly.
+  useEffect(() => {
+    return controller.onEvent(() => {
+      store.requestRefresh();
+    });
+  }, [controller, store]);
+
+  useEffect(() => {
+    return () => {
+      void controller.closeClients();
+    };
+  }, [controller]);
+
+  // Append newly observed session events to the committed transcript.
+  useEffect(() => {
+    if (!snapshot.sessionId) return;
+    if (!store.requestedSession()) store.setRequestedSession(snapshot.sessionId);
+    const summary = snapshot.sessions.find((session) => session.sessionId === snapshot.sessionId);
+    appendItems(
+      builder.syncSession({
+        sessionId: snapshot.sessionId,
+        label: summary?.label ?? snapshot.sessionId,
+        events: snapshot.events,
+        width: textWidth,
+      }),
+    );
+  }, [snapshot, textWidth]);
+
+  // Onboarding kicks in when the initial workspace has no profile yet.
   useEffect(() => {
     if (requestedSessionId) return undefined;
     let cancelled = false;
     void loadOnboardingState(initialWorkspacePath).then((state) => {
       if (cancelled) return;
       setOnboarding(state);
-      if (state) pushMessage("No profile found for this repo. Complete onboarding, then run /new.");
+      if (state) appendNote("No profile found for this repo — answer three quick questions, then run /new.", "hint");
     });
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestedSessionId, initialWorkspacePath]);
 
-  useEffect(() => {
-    const current = controller.current;
-    return () => {
-      void current?.closeClients();
-    };
-  }, []);
-
-  useEffect(() => {
-    const unsubscribe = controller.current?.onEvent(() => {
-      setRefreshNonce((value) => value + 1);
-    });
-    return () => {
-      unsubscribe?.();
-    };
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    const refresh = async (): Promise<void> => {
-      const next = await loadTuiSnapshot({ requestedSessionId: activeSessionId, initialWorkspacePath });
-      if (cancelled) return;
-      setSnapshot(next);
-      if (!activeSessionId && next.sessionId) setActiveSessionId(next.sessionId);
-    };
-    void refresh();
-    const interval = setInterval(() => void refresh(), 1000);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [activeSessionId, initialWorkspacePath, refreshNonce]);
-
+  // Heartbeat that routes lower-level permission requests to this TUI.
   useEffect(() => {
     if (!snapshot.sessionId) return undefined;
-    void markTuiAttached(snapshot.sessionId);
-    const interval = setInterval(() => void markTuiAttached(snapshot.sessionId ?? ""), 1000);
+    const sessionId = snapshot.sessionId;
+    void markTuiAttached(sessionId);
+    const interval = setInterval(() => {
+      void markTuiAttached(sessionId);
+    }, 1000);
     return () => {
       clearInterval(interval);
     };
@@ -168,73 +221,65 @@ export function TuiApp({
 
   useEffect(() => {
     if (!busy) return undefined;
-    const interval = setInterval(() => setSpinnerFrame((frame) => (frame + 1) % SPINNER_FRAMES.length), 150);
+    const interval = setInterval(() => {
+      setSpinnerFrame((frame) => (frame + 1) % spinnerFrames.length);
+    }, 120);
     return () => {
       clearInterval(interval);
     };
   }, [busy]);
 
   useEffect(() => {
+    const onResize = (): void => {
+      setSize({ columns: stdout.columns, rows: stdout.rows });
+    };
+    stdout.on("resize", onResize);
+    return () => {
+      stdout.off("resize", onResize);
+    };
+  }, [stdout]);
+
+  useEffect(() => {
     setApprovalCursor((cursor) => Math.min(cursor, Math.max(approvalQueue.length - 1, 0)));
   }, [approvalQueue.length]);
 
   useEffect(() => {
-    setViewScroll(0);
-  }, [viewMode]);
+    setApprovalChoice(0);
+  }, [activeApproval?.id]);
+
+  useEffect(() => {
+    setScroll(0);
+  }, [panel?.kind]);
 
   useEffect(() => {
     return () => {
-      if (quitTimer.current) clearTimeout(quitTimer.current);
+      if (ctrlCTimer.current) clearTimeout(ctrlCTimer.current);
     };
   }, []);
 
-  const armQuit = (): void => {
-    if (quitArmed) {
-      exit();
-      return;
-    }
-    setQuitArmed(true);
-    pushMessage(busy ? "A command is still running. Press q again to force quit." : "Press q again to quit.");
-    if (quitTimer.current) clearTimeout(quitTimer.current);
-    quitTimer.current = setTimeout(() => setQuitArmed(false), 2000);
-  };
-
   const switchToSession = (sessionId: string): void => {
-    setActiveSessionId(sessionId);
-    setViewMode("events");
-    setFollow(true);
-    setSelectedKey(undefined);
+    store.setRequestedSession(sessionId);
+    setPanel(undefined);
   };
 
-  const switchByOffset = (offset: number): void => {
-    if (!snapshot.sessions.length) return;
+  const cycleSession = (offset: number): void => {
+    if (!orderedSessions.length) return;
     const currentIndex = Math.max(
       0,
-      snapshot.sessions.findIndex((session) => session.sessionId === snapshot.sessionId),
+      orderedSessions.findIndex((session) => session.sessionId === snapshot.sessionId),
     );
-    const next = snapshot.sessions[(currentIndex + offset + snapshot.sessions.length) % snapshot.sessions.length];
-    if (next) switchToSession(next.sessionId);
-  };
-
-  const moveSelection = (offset: number): void => {
-    if (!allStreamEvents.length) return;
-    const nextIndex = Math.max(0, Math.min(allStreamEvents.length - 1, selectedIndex + offset));
-    const nextEvent = allStreamEvents[nextIndex];
-    if (!nextEvent) return;
-    setSelectedKey(eventKey(nextEvent));
-    setFollow(false);
-  };
-
-  const resumeFollow = (): void => {
-    setFollow(true);
-    setSelectedKey(undefined);
+    const next = orderedSessions[(currentIndex + offset + orderedSessions.length) % orderedSessions.length];
+    if (next && next.sessionId !== snapshot.sessionId) switchToSession(next.sessionId);
   };
 
   const respondToApproval = (approved: boolean): void => {
     if (!activeApproval) return;
-    void controller.current?.respondToApproval(activeApproval.sessionId, activeApproval.id, approved);
-    pushMessage(`${approved ? "Approved" : "Denied"} ${activeApproval.id} (${activeApproval.sessionId}).`);
-    setRefreshNonce((value) => value + 1);
+    void controller.respondToApproval(activeApproval.sessionId, activeApproval.id, approved);
+    appendNote(
+      `${approved ? "Approved" : "Denied"} permission request in ${activeApproval.sessionId}.`,
+      approved ? "success" : "info",
+    );
+    store.requestRefresh();
   };
 
   const navigateHistory = (direction: -1 | 1): void => {
@@ -258,18 +303,63 @@ export function TuiApp({
     setInput(history[next] ?? "");
   };
 
-  const completeCommand = (): void => {
-    if (!input.startsWith("/") || !suggestions.length) return;
-    const first = suggestions[0];
-    if (!first) return;
-    const parsed = parseSlashCommand(input);
-    if (parsed && parsed.name === first.name && parsed.args.length) return;
-    setInput(`/${first.name} `);
+  const completeSelected = (): void => {
+    const selected = suggestions[Math.min(menuIndex, suggestions.length - 1)];
+    if (!selected) return;
+    const parsed = safeParse(input);
+    if (parsed && parsed.name === selected.name && parsed.args.length) return;
+    setInput(`/${selected.name} `);
+    setMenuIndex(0);
   };
 
   const handleInputChange = (value: string): void => {
     setHistoryIndex(undefined);
+    setMenuIndex(0);
     setInput(value);
+  };
+
+  const clearInput = (): void => {
+    setInput("");
+    setMenuIndex(0);
+    setHistoryIndex(undefined);
+  };
+
+  const handleCtrlC = (): void => {
+    if (ctrlCArmed) {
+      exit();
+      return;
+    }
+    clearInput();
+    setCtrlCArmed(true);
+    if (ctrlCTimer.current) clearTimeout(ctrlCTimer.current);
+    ctrlCTimer.current = setTimeout(() => {
+      setCtrlCArmed(false);
+    }, CTRL_C_WINDOW_MS);
+  };
+
+  const clearTranscript = (): void => {
+    stdout.write("\u001B[2J\u001B[3J\u001B[H");
+    setItems([]);
+    setEpoch((value) => value + 1);
+    appendNote("Transcript cleared.", "hint");
+  };
+
+  const pushHistory = (entry: string): void => {
+    setHistory((entries) => {
+      const next = entries.filter((item) => item !== entry);
+      return [...next, entry].slice(-HISTORY_LIMIT);
+    });
+  };
+
+  const runWithBusy = async (label: string, task: () => Promise<void>): Promise<void> => {
+    setBusy({ label, startedAt: Date.now() });
+    try {
+      await task();
+    } catch (error) {
+      appendNote(errorMessage(error), "error");
+    } finally {
+      setBusy(undefined);
+    }
   };
 
   const submitInput = (value: string): void => {
@@ -278,78 +368,96 @@ export function TuiApp({
       void submitOnboarding(value);
       return;
     }
-    void runCommand(value);
-  };
+    const trimmed = value.trim();
+    clearInput();
+    if (!trimmed) return;
 
-  const onboardingOptions = onboarding ? optionsForStep(onboarding) : [];
+    let commandText = trimmed;
+    if (trimmed.startsWith("/")) {
+      const menu = suggestSlashCommands(trimmed);
+      const selected = menu[Math.min(menuIndex, Math.max(menu.length - 1, 0))];
+      const parsed = safeParse(trimmed);
+      if (selected && parsed && !parsed.args.length && parsed.name !== selected.name) {
+        commandText = `/${selected.name}`;
+      }
+    }
+    void runCommand(commandText);
+  };
 
   const submitOnboarding = async (value: string): Promise<void> => {
     if (!onboarding || busy) return;
     const typed = value.trim();
     const option = onboardingOptions[Math.min(onboardingChoice, Math.max(onboardingOptions.length - 1, 0))];
-    if (!typed && option && option.requiresInput) {
-      pushMessage(option.hint ?? "Type a value and press Enter.");
+    if (!typed && option?.requiresInput) {
+      appendNote(option.hint ?? "Type a value and press Enter.", "hint");
       return;
     }
     const answer = typed || option?.value || "";
-    setInput("");
-    setBusy(true);
+    clearInput();
+    setBusy({ label: "Saving profile", startedAt: Date.now() });
     try {
       const next = await advanceOnboarding(onboarding, answer);
       setOnboardingChoice(0);
       if (next.complete) {
         setOnboarding(undefined);
-        pushMessage(`Profile written for ${next.repoPath}. Run /new to open a workspace session.`);
+        appendNote(`Profile written for ${next.repoPath}. Run /new to open a workspace session.`, "success");
       } else {
         setOnboarding(next);
-        pushMessage(`${onboardingPrompt(next)} [${onboardingDefault(next)}]`);
       }
     } catch (error) {
-      pushMessage(errorMessage(error));
+      appendNote(errorMessage(error), "error");
     } finally {
-      setBusy(false);
+      setBusy(undefined);
     }
   };
 
-  const runCommand = async (value: string): Promise<void> => {
-    const trimmed = value.trim();
-    setInput("");
-    if (!trimmed) return;
-    if (busy) {
-      pushMessage("A TUI command is already running.");
+  const runCommand = async (trimmed: string): Promise<void> => {
+    pushHistory(trimmed);
+    if (!trimmed.startsWith("/")) {
+      appendNote("The transcript mirrors model-driven sessions; type / to browse TUI commands.", "hint");
       return;
     }
-    setHistory((items) => {
-      const next = items.filter((item) => item !== trimmed);
-      return [...next, trimmed].slice(-HISTORY_LIMIT);
-    });
-
-    let parsed: ParsedSlashCommand | undefined;
+    let parsed;
     try {
       parsed = parseSlashCommand(trimmed);
     } catch (error) {
-      pushMessage(errorMessage(error));
+      appendNote(errorMessage(error), "error");
       return;
     }
-    if (!parsed) {
-      pushMessage("Only slash commands are supported in this TUI milestone.");
-      return;
-    }
-
+    if (!parsed) return;
     const command = findSlashCommand(parsed.name);
     if (!command) {
-      pushMessage(`Unknown command ${parsed.raw}. Type /help to see available commands.`);
+      appendNote(`Unknown command ${parsed.raw}. Type /help to see available commands.`, "error");
       return;
     }
     if (command.stage === "planned") {
-      pushMessage(`${command.usage} is not wired into the TUI yet. ${command.description}`);
+      appendNote(`${command.usage} is not wired into the TUI yet. ${command.description}`, "hint");
+      return;
+    }
+    if (busy && command.name !== "quit") {
+      appendNote("A TUI command is already running.", "hint");
       return;
     }
 
+    setPanel(undefined);
     switch (command.name) {
       case "help":
-        setViewMode("help");
-        pushMessage("Showing TUI commands.");
+        setPanel({ kind: "help" });
+        break;
+      case "diff":
+        setPanel({ kind: "diff" });
+        break;
+      case "baton":
+        setPanel({ kind: "baton" });
+        break;
+      case "approvals":
+        setPanel({ kind: "approvals" });
+        break;
+      case "inspect":
+        setPanel({ kind: "inspect" });
+        break;
+      case "clear":
+        clearTranscript();
         break;
       case "switch":
         runSwitchCommand(parsed.args);
@@ -369,736 +477,249 @@ export function TuiApp({
       case "config":
         await runConfigCommand(parsed.args);
         break;
-      case "diff":
-        setViewMode("diff");
-        pushMessage("Showing the latest recorded review checkpoint.");
-        break;
-      case "approvals":
-        setViewMode("approvals");
-        pushMessage("Showing pending approvals across attached sessions.");
-        break;
-      case "baton":
-        setViewMode("baton");
-        pushMessage("Showing baton state for the active session.");
-        break;
-      case "messages":
-        setViewMode("messages");
-        pushMessage("Showing recent status messages.");
+      case "doctor":
+        await runDoctorCommand();
         break;
       case "quit":
         exit();
         break;
       default:
-        pushMessage(`${command.usage} is registered but not wired yet.`);
-    }
-  };
-
-  const runNewCommand = async (args: string[]): Promise<void> => {
-    setBusy(true);
-    try {
-      const parsedNew = parseNewCommand(args);
-      const path = parsedNew.path ?? initialWorkspacePath;
-      pushMessage(parsedNew.resume ? `Resuming ${parsedNew.resume}...` : "Opening workspace session...");
-      const current = controller.current;
-      if (!current) throw new Error("TUI session controller is not ready.");
-      const result = await current.create({ path, mode: parsedNew.mode, resume: parsedNew.resume });
-      setActiveSessionId(result.sessionId);
-      setViewMode("events");
-      pushMessage(result.message);
-      setRefreshNonce((value) => value + 1);
-    } catch (error) {
-      pushMessage(errorMessage(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const runCloseCommand = async (args: string[]): Promise<void> => {
-    if (!snapshot.sessionId) {
-      pushMessage("No active session to close.");
-      return;
-    }
-    setBusy(true);
-    try {
-      const parsedClose = parseCloseCommand(args);
-      const current = controller.current;
-      if (!current) throw new Error("TUI session controller is not ready.");
-      const result = await current.close(snapshot.sessionId, { force: parsedClose.force });
-      pushMessage(result.message);
-      if (result.closed) setActiveSessionId(undefined);
-      setRefreshNonce((value) => value + 1);
-    } catch (error) {
-      pushMessage(errorMessage(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const runMergeCommand = async (): Promise<void> => {
-    if (!snapshot.sessionId) {
-      pushMessage("No active session to merge.");
-      return;
-    }
-    setBusy(true);
-    try {
-      const current = controller.current;
-      if (!current) throw new Error("TUI session controller is not ready.");
-      const result = await current.merge(snapshot.sessionId);
-      pushMessage(result.message);
-      setRefreshNonce((value) => value + 1);
-    } catch (error) {
-      pushMessage(errorMessage(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const runTunnelCommand = async (args: string[]): Promise<void> => {
-    setBusy(true);
-    try {
-      const parsedTunnel = parseTunnelCommand(args);
-      const current = controller.current;
-      if (!current) throw new Error("TUI session controller is not ready.");
-      if (parsedTunnel.action === "start") {
-        const result = await current.startTunnel();
-        setTunnelMessage(result.state.message);
-        pushMessage(result.message);
-      } else if (parsedTunnel.action === "stop") {
-        const result = await current.stopTunnel();
-        setTunnelMessage(result.state.message);
-        pushMessage(result.message);
-      } else {
-        const state = current.tunnelStatus();
-        setTunnelMessage(state.message);
-        pushMessage(state.publicUrl ? `Tunnel: ${state.publicUrl}` : state.message);
-      }
-    } catch (error) {
-      pushMessage(errorMessage(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const runConfigCommand = async (args: string[]): Promise<void> => {
-    setBusy(true);
-    try {
-      const current = controller.current;
-      if (!current) throw new Error("TUI session controller is not ready.");
-      const result = await current.configure(initialWorkspacePath, args);
-      setConfigText(result.text);
-      setViewMode("config");
-      pushMessage(result.changed ? "Profile updated." : "Showing profile.");
-    } catch (error) {
-      pushMessage(errorMessage(error));
-    } finally {
-      setBusy(false);
+        appendNote(`${command.usage} is registered but not wired yet.`, "hint");
     }
   };
 
   const runSwitchCommand = (args: string[]): void => {
-    if (!snapshot.sessions.length) {
-      pushMessage("No attached sessions found yet.");
+    if (!orderedSessions.length) {
+      appendNote("No sessions found yet — /new opens one.", "hint");
       return;
     }
     const target = args[0];
     if (!target) {
-      switchByOffset(1);
+      cycleSession(1);
       return;
     }
     const numeric = Number.parseInt(target, 10);
     const session = Number.isInteger(numeric)
-      ? snapshot.sessions[numeric - 1]
-      : snapshot.sessions.find((item) => item.sessionId.includes(target) || item.label.includes(target));
+      ? orderedSessions[numeric - 1]
+      : orderedSessions.find((item) => item.sessionId.includes(target) || item.label.includes(target));
     if (!session) {
-      pushMessage(`No session matched ${target}.`);
+      appendNote(`No session matched ${target}.`, "error");
       return;
     }
     switchToSession(session.sessionId);
   };
 
+  const runNewCommand = async (args: string[]): Promise<void> => {
+    await runWithBusy("Opening workspace", async () => {
+      const parsedNew = parseNewCommand(args);
+      const path = parsedNew.path ?? initialWorkspacePath;
+      const result = await controller.create({ path, mode: parsedNew.mode, resume: parsedNew.resume });
+      switchToSession(result.sessionId);
+      appendNote(result.message, "success");
+      store.requestRefresh();
+    });
+  };
+
+  const runCloseCommand = async (args: string[]): Promise<void> => {
+    const sessionId = snapshot.sessionId;
+    if (!sessionId) {
+      appendNote("No active session to close.", "hint");
+      return;
+    }
+    await runWithBusy("Closing workspace", async () => {
+      const parsedClose = parseCloseCommand(args);
+      const result = await controller.close(sessionId, { force: parsedClose.force });
+      appendNote(result.message, result.closed ? "success" : "hint");
+      if (result.closed) store.setRequestedSession(undefined);
+      store.requestRefresh();
+    });
+  };
+
+  const runMergeCommand = async (): Promise<void> => {
+    const sessionId = snapshot.sessionId;
+    if (!sessionId) {
+      appendNote("No active session to merge.", "hint");
+      return;
+    }
+    await runWithBusy("Merging worktree", async () => {
+      const result = await controller.merge(sessionId);
+      appendNote(result.message, result.applied ? "success" : "hint");
+      store.requestRefresh();
+    });
+  };
+
+  const runTunnelCommand = async (args: string[]): Promise<void> => {
+    await runWithBusy("Updating tunnel", async () => {
+      const parsedTunnel = parseTunnelCommand(args);
+      if (parsedTunnel.action === "start") {
+        const result = await controller.startTunnel();
+        setTunnelMessage(result.state.message);
+        appendNote(result.message, "success");
+      } else if (parsedTunnel.action === "stop") {
+        const result = await controller.stopTunnel();
+        setTunnelMessage(result.state.message);
+        appendNote(result.message, "info");
+      } else {
+        const state = controller.tunnelStatus();
+        setTunnelMessage(state.message);
+        appendNote(state.publicUrl ? `Tunnel: ${state.publicUrl}` : state.message, "info");
+      }
+    });
+  };
+
+  const runConfigCommand = async (args: string[]): Promise<void> => {
+    await runWithBusy("Loading profile", async () => {
+      const result = await controller.configure(initialWorkspacePath, args);
+      setPanel({ kind: "config", lines: textDisplayLines(result.text) });
+      if (result.changed) appendNote("Profile updated.", "success");
+    });
+  };
+
+  const runDoctorCommand = async (): Promise<void> => {
+    await runWithBusy("Running doctor checks", async () => {
+      const root = snapshot.workspace?.activePath ?? snapshot.session?.workspacePath ?? initialWorkspacePath;
+      const checks = await runDoctor(root);
+      setPanel({ kind: "doctor", lines: doctorLines(checks) });
+      if (checks.some((check) => check.status === "fail")) appendNote("Doctor found failing checks.", "error");
+    });
+  };
+
+  const panelLines = useMemo((): DisplayLine[] => {
+    if (!panel) return [];
+    switch (panel.kind) {
+      case "diff":
+        return diffDisplayLines(snapshot.checkpoints.at(-1));
+      case "baton":
+        return batonPanelLines(snapshot);
+      case "help":
+        return helpLines();
+      case "approvals":
+        return approvalPanelLines(approvalQueue);
+      case "inspect":
+        return inspectLines(snapshot.events);
+      default:
+        return panel.lines ?? [];
+    }
+  }, [panel, snapshot, approvalQueue]);
+
+  const panelHeight = Math.max(8, Math.min(size.rows - 9, panelLines.length + 3));
+  const pageSize = Math.max(1, panelHeight - 3);
+
   useInput((inputChar, key) => {
+    const isCtrlC = (key.ctrl && (inputChar === "c" || inputChar === "C")) || inputChar === "\u0003";
+    if (isCtrlC) {
+      handleCtrlC();
+      return;
+    }
     if (onboarding) {
-      if (key.upArrow && !input) {
-        setOnboardingChoice((choice) => Math.max(0, choice - 1));
-        return;
-      }
-      if (key.downArrow && !input) {
+      if (key.upArrow && !input) setOnboardingChoice((choice) => Math.max(0, choice - 1));
+      else if (key.downArrow && !input)
         setOnboardingChoice((choice) => Math.min(Math.max(onboardingOptions.length - 1, 0), choice + 1));
-        return;
-      }
-      if (key.return && !input) {
-        void submitOnboarding("");
-        return;
-      }
+      else if (key.escape) clearInput();
       return;
     }
-    if (approvalVisible) {
-      if (inputChar === "y") {
-        respondToApproval(true);
-        return;
-      }
-      if (inputChar === "n") {
-        respondToApproval(false);
-        return;
-      }
-      if (key.leftArrow) {
-        setApprovalCursor((cursor) => Math.max(0, cursor - 1));
-        return;
-      }
-      if (key.rightArrow) {
-        setApprovalCursor((cursor) => Math.min(approvalQueue.length - 1, cursor + 1));
-        return;
-      }
+    if (approvalVisible && activeApproval) {
+      if (inputChar === "y" || inputChar === "Y" || inputChar === "1") respondToApproval(true);
+      else if (inputChar === "n" || inputChar === "N" || inputChar === "2" || key.escape) respondToApproval(false);
+      else if (key.upArrow) setApprovalChoice(0);
+      else if (key.downArrow) setApprovalChoice(1);
+      else if (key.return) respondToApproval(approvalChoice === 0);
+      else if (key.leftArrow) setApprovalCursor((cursor) => Math.max(0, cursor - 1));
+      else if (key.rightArrow) setApprovalCursor((cursor) => Math.min(approvalQueue.length - 1, cursor + 1));
       return;
     }
-    if (key.ctrl && /^[1-9]$/.test(inputChar)) {
-      const next = snapshot.sessions[Number(inputChar) - 1];
-      if (next) switchToSession(next.sessionId);
-      return;
-    }
-    if (key.tab) {
-      if (input.startsWith("/")) completeCommand();
-      else if (!input) switchByOffset(1);
+    if (key.ctrl && (inputChar === "o" || inputChar === "O" || inputChar === "\u000F")) {
+      setPanel((current) => (current?.kind === "inspect" ? undefined : { kind: "inspect" }));
       return;
     }
     if (key.escape) {
-      if (input) {
-        setInput("");
-        setHistoryIndex(undefined);
-      } else if (viewMode !== "events") {
-        setViewMode("events");
-      } else if (!follow) {
-        resumeFollow();
-      }
+      if (input) clearInput();
+      else if (panel) setPanel(undefined);
+      return;
+    }
+    if (key.tab && key.shift) {
+      if (!input) cycleSession(-1);
+      return;
+    }
+    if (key.tab) {
+      if (menuVisible) completeSelected();
+      else if (!input) cycleSession(1);
       return;
     }
     if (key.upArrow) {
-      navigateHistory(-1);
+      if (menuVisible) setMenuIndex((index) => Math.max(0, index - 1));
+      else if (panel) setScroll((value) => Math.max(0, value - 1));
+      else navigateHistory(-1);
       return;
     }
     if (key.downArrow) {
-      navigateHistory(1);
+      if (menuVisible) setMenuIndex((index) => Math.min(suggestions.length - 1, index + 1));
+      else if (panel) setScroll((value) => value + 1);
+      else navigateHistory(1);
       return;
     }
-    if (input) return;
-    if (inputChar === "q") {
-      armQuit();
+    if (key.pageUp && panel) {
+      setScroll((value) => Math.max(0, value - pageSize));
       return;
     }
-    if (inputChar === "?") {
-      setViewMode("help");
-      return;
-    }
-    if (inputChar === "d") {
-      setViewMode((mode) => (mode === "diff" ? "events" : "diff"));
-      return;
-    }
-    if (inputChar === "b") {
-      setViewMode((mode) => (mode === "baton" ? "events" : "baton"));
-      return;
-    }
-    if (viewMode === "events") {
-      if (inputChar === "f") {
-        resumeFollow();
-        return;
-      }
-      if (inputChar === "k") {
-        moveSelection(-1);
-        return;
-      }
-      if (inputChar === "j") {
-        moveSelection(1);
-        return;
-      }
-      if (key.pageUp) {
-        moveSelection(-streamHeight);
-        return;
-      }
-      if (key.pageDown) {
-        moveSelection(streamHeight);
-        return;
-      }
-      if (key.return) {
-        if (selectedEvent) setViewMode("detail");
-        return;
-      }
-      return;
-    }
-    if (inputChar === "k" || key.pageUp) {
-      setViewScroll((scroll) => Math.max(0, scroll - (key.pageUp ? panelHeight : 1)));
-      return;
-    }
-    if (inputChar === "j" || key.pageDown) {
-      setViewScroll((scroll) => scroll + (key.pageDown ? panelHeight : 1));
-      return;
-    }
-    if (key.return && viewMode === "detail") {
-      setViewMode("events");
+    if (key.pageDown && panel) {
+      setScroll((value) => value + pageSize);
     }
   });
 
+  const hint = ctrlCArmed
+    ? "Press Ctrl+C again to exit"
+    : onboarding
+      ? `↑/↓ choose ${glyphs.dot} Enter accept ${glyphs.dot} or type a value`
+      : approvalVisible
+        ? "Answer the permission request above"
+        : panel
+          ? `↑/↓ scroll ${glyphs.dot} PgUp/PgDn page ${glyphs.dot} Esc close`
+          : menuVisible
+            ? `↑/↓ choose ${glyphs.dot} Tab complete ${glyphs.dot} Enter run ${glyphs.dot} Esc clear`
+            : `/ commands ${glyphs.dot} Tab sessions ${glyphs.dot} Ctrl+O inspector ${glyphs.dot} Ctrl+C twice to quit`;
+
   return (
-    <Box flexDirection="column" paddingX={1}>
-      <Tabs sessions={snapshot.sessions} activeSessionId={snapshot.sessionId} />
-      {onboarding ? (
-        <OnboardingView state={onboarding} options={onboardingOptions} choice={onboardingChoice} />
-      ) : approvalVisible && activeApproval ? (
-        <ApprovalModal approval={activeApproval} index={approvalCursor} total={approvalQueue.length} />
-      ) : viewMode === "diff" ? (
-        <ScrollPanel title="Recent Changes" lines={diffLines(latestCheckpoint)} scroll={viewScroll} height={panelHeight} />
-      ) : viewMode === "baton" ? (
-        <ScrollPanel title="Baton" lines={batonLines(snapshot)} scroll={viewScroll} height={panelHeight} />
-      ) : viewMode === "detail" ? (
-        <ScrollPanel title="Event Detail" lines={detailLines(selectedEvent)} scroll={viewScroll} height={panelHeight} />
-      ) : viewMode === "help" ? (
-        <ScrollPanel title="Commands" lines={helpLines()} scroll={viewScroll} height={panelHeight} />
-      ) : viewMode === "approvals" ? (
-        <ScrollPanel title="Pending Approvals" lines={approvalLines(approvalQueue)} scroll={viewScroll} height={panelHeight} />
-      ) : viewMode === "config" ? (
-        <ScrollPanel title="Profile" lines={textLines(configText)} scroll={viewScroll} height={panelHeight} />
-      ) : viewMode === "messages" ? (
-        <ScrollPanel title="Status Messages" lines={messageLines(messages)} scroll={viewScroll} height={panelHeight} />
-      ) : (
-        <EventStream
-          events={allStreamEvents}
-          selectedIndex={selectedIndex}
-          height={streamHeight}
-          follow={follow}
-        />
-      )}
-      {onboarding || approvalVisible ? null : <CommandSuggestions input={input} suggestions={suggestions} />}
-      <InputBar
-        value={input}
-        onChange={handleInputChange}
-        onSubmit={submitInput}
-        placeholder={onboarding ? onboardingDefault(onboarding) : "/"}
-        focus={!approvalVisible}
-      />
-      <StatusBar
-        snapshot={snapshot}
-        activeSummary={activeSummary}
-        tunnelMessage={tunnelMessage}
-        message={busy ? `${SPINNER_FRAMES[spinnerFrame] ?? "|"} Working... ${message}` : message}
-        hints={keyHints({ onboarding: Boolean(onboarding), approval: approvalVisible, viewMode, follow })}
-      />
-    </Box>
-  );
-}
-
-interface OnboardingOption {
-  label: string;
-  value: string;
-  requiresInput?: boolean;
-  hint?: string;
-}
-
-function optionsForStep(state: OnboardingState): OnboardingOption[] {
-  if (state.step === "backend") {
-    return [
-      { label: "stdio (default)", value: "stdio" },
-      { label: "docker", value: "docker" },
-      {
-        label: "http(s) URL...",
-        value: "",
-        requiresInput: true,
-        hint: "Type the remote MCP HTTP URL, for example http://127.0.0.1:8765/mcp, then press Enter.",
-      },
-    ];
-  }
-  if (state.step === "workspace") {
-    return [
-      { label: "worktree (default) - isolated git worktree per session", value: "worktree" },
-      { label: "direct - edit the repo in place", value: "direct" },
-    ];
-  }
-  return [
-    { label: "safe (default) - ask before risky operations", value: "safe" },
-    { label: "trusted - skip approval prompts", value: "trusted" },
-  ];
-}
-
-function Tabs({ sessions, activeSessionId }: { sessions: TuiSessionSummary[]; activeSessionId?: string }): React.ReactElement {
-  return (
-    <Box borderStyle="single" paddingX={1}>
-      <Text bold>ctc </Text>
-      {sessions.length ? (
-        sessions.slice(0, 9).map((session, index) => {
-          const active = session.sessionId === activeSessionId;
-          return (
-            <React.Fragment key={session.sessionId}>
-              <Text color={active ? "cyan" : undefined} bold={active}>
-                [{index + 1}:{truncate(session.label, 18)}
-                {session.mode === "worktree" ? " wt" : ""}
-              </Text>
-              {session.pendingApprovalCount ? (
-                <Text color="yellow" bold>
-                  {" "}({session.pendingApprovalCount} pending)
-                </Text>
-              ) : null}
-              <Text color={active ? "cyan" : undefined} bold={active}>
-                :{session.owner === "tui" ? "tui" : "attached"}]{" "}
-              </Text>
-            </React.Fragment>
-          );
-        })
-      ) : (
-        <Text dimColor>[no attached sessions]</Text>
-      )}
-    </Box>
-  );
-}
-
-function EventStream({
-  events,
-  selectedIndex,
-  height,
-  follow,
-}: {
-  events: StreamEvent[];
-  selectedIndex: number;
-  height: number;
-  follow: boolean;
-}): React.ReactElement {
-  if (!events.length) {
-    return (
-      <Box flexDirection="column" marginTop={1} minHeight={height}>
-        <Text dimColor>No attached session events yet.</Text>
-        <Text dimColor>Start with /new, /help, or connect a model client through ctc start for v1 attachment.</Text>
-      </Box>
-    );
-  }
-  const start = Math.max(0, Math.min(selectedIndex - Math.floor(height / 2), events.length - height));
-  const visible = events.slice(start, start + height);
-  return (
-    <Box flexDirection="column" marginTop={1} minHeight={height}>
-      <Text dimColor>
-        {follow ? "following latest" : "selection paused (f to follow)"} - {start + 1}-{start + visible.length} of {events.length}
-      </Text>
-      {visible.map((event, offset) => {
-        const index = start + offset;
-        return (
-          <Text key={eventKey(event)} color={eventColor(event, index === selectedIndex)}>
-            {index === selectedIndex ? ">" : " "} {formatStreamEvent(event)}
-          </Text>
-        );
-      })}
-    </Box>
-  );
-}
-
-function ApprovalModal({
-  approval,
-  index,
-  total,
-}: {
-  approval: PermissionApprovalRequest;
-  index: number;
-  total: number;
-}): React.ReactElement {
-  return (
-    <Box flexDirection="column" borderStyle="double" borderColor="yellow" paddingX={1} marginTop={1}>
-      <Text color="yellow" bold>
-        Permission request {index + 1} of {total}
-      </Text>
-      <Text>
-        session: <Text bold>{approval.sessionId}</Text>  requested: {timeOf(approval.createdAt)}
-      </Text>
-      <Text bold>Full arguments:</Text>
-      <Text wrap="wrap">{approval.argsSummary}</Text>
-      <Text color="yellow">y approve  n deny{total > 1 ? "  left/right switch request" : ""}</Text>
-    </Box>
-  );
-}
-
-function OnboardingView({
-  state,
-  options,
-  choice,
-}: {
-  state: OnboardingState;
-  options: OnboardingOption[];
-  choice: number;
-}): React.ReactElement {
-  const steps: OnboardingState["step"][] = ["backend", "workspace", "permissions"];
-  const stepNumber = steps.indexOf(state.step) + 1;
-  return (
-    <Box flexDirection="column" marginTop={1} minHeight={10}>
-      <Text bold>Repo Onboarding</Text>
-      <Text>Profile: {state.repoPath}</Text>
-      <Text>
-        Step {String(stepNumber)}/3: {onboardingPrompt(state)}
-      </Text>
-      {options.map((option, index) => (
-        <Text key={option.label} color={index === choice ? "cyan" : undefined} bold={index === choice}>
-          {index === choice ? ">" : " "} {option.label}
-        </Text>
-      ))}
-      <Text dimColor>Up/Down to choose, Enter to accept. Or type a value and press Enter.</Text>
-    </Box>
-  );
-}
-
-function ScrollPanel({
-  title,
-  lines,
-  scroll,
-  height,
-}: {
-  title: string;
-  lines: DisplayLine[];
-  scroll: number;
-  height: number;
-}): React.ReactElement {
-  const bodyHeight = Math.max(1, height - 2);
-  const maxScroll = Math.max(0, lines.length - bodyHeight);
-  const start = Math.min(scroll, maxScroll);
-  const visible = lines.slice(start, start + bodyHeight);
-  return (
-    <Box flexDirection="column" marginTop={1} minHeight={height}>
-      <Text bold>
-        {title}
-        {lines.length > bodyHeight ? (
-          <Text dimColor>
-            {"  "}({start + 1}-{start + visible.length} of {lines.length}, j/k scroll)
+    <Box flexDirection="column">
+      <Transcript items={items} epoch={epoch} />
+      <Box flexDirection="column" paddingX={1} marginTop={1}>
+        {onboarding ? (
+          <OnboardingView state={onboarding} options={onboardingOptions} choice={onboardingChoice} />
+        ) : approvalVisible && activeApproval ? (
+          <ApprovalPrompt
+            approval={activeApproval}
+            index={approvalCursor}
+            total={approvalQueue.length}
+            choice={approvalChoice}
+            width={textWidth}
+          />
+        ) : panel ? (
+          <ScrollPanel title={PANEL_TITLES[panel.kind]} lines={panelLines} scroll={scroll} height={panelHeight} />
+        ) : null}
+        {busy ? (
+          <Text color={palette.accent}>
+            {spinnerFrames[spinnerFrame] ?? "⠋"} {busy.label}…{" "}
+            <Text dimColor>({formatElapsedSeconds(busy.startedAt)})</Text>
           </Text>
         ) : null}
-      </Text>
-      {visible.length ? (
-        visible.map((line, index) => (
-          <Text key={`${String(start + index)}-${line.text.slice(0, 24)}`} color={line.color} dimColor={line.dim} bold={line.bold}>
-            {line.text || " "}
-          </Text>
-        ))
-      ) : (
-        <Text dimColor>Nothing to show.</Text>
-      )}
+        <Composer
+          value={input}
+          onChange={handleInputChange}
+          onSubmit={submitInput}
+          placeholder={onboarding ? onboardingDefault(onboarding) : "/ for commands"}
+          focus={!approvalVisible}
+        />
+        {menuVisible && !approvalVisible ? <SlashMenu suggestions={suggestions} selected={menuIndex} /> : null}
+        <StatusBar snapshot={snapshot} sessions={orderedSessions} tunnelMessage={tunnelMessage} hint={hint} />
+      </Box>
     </Box>
   );
 }
 
-function diffLines(checkpoint: TuiSnapshot["checkpoints"][number] | undefined): DisplayLine[] {
-  if (!checkpoint) return [{ text: "No review checkpoint recorded yet.", dim: true }];
-  const lines: DisplayLine[] = [{ text: checkpoint.statSummary, bold: true }];
-  const body = checkpoint.diff?.trimEnd();
-  if (!body) {
-    lines.push({ text: "No diff body recorded for the latest checkpoint.", dim: true });
-    return lines;
+function safeParse(value: string): { name: string; args: string[] } | undefined {
+  try {
+    return parseSlashCommand(value);
+  } catch {
+    return undefined;
   }
-  for (const raw of body.split("\n")) {
-    if (raw.startsWith("+++") || raw.startsWith("---")) lines.push({ text: raw, bold: true });
-    else if (raw.startsWith("@@")) lines.push({ text: raw, color: "cyan" });
-    else if (raw.startsWith("+")) lines.push({ text: raw, color: "green" });
-    else if (raw.startsWith("-")) lines.push({ text: raw, color: "red" });
-    else if (raw.startsWith("diff ")) lines.push({ text: raw, bold: true, color: "yellow" });
-    else lines.push({ text: raw });
-  }
-  return lines;
-}
-
-function detailLines(event: StreamEvent | undefined): DisplayLine[] {
-  if (!event) return [{ text: "No event selected.", dim: true }];
-  const lines: DisplayLine[] = [
-    { text: `type:      ${event.type}` },
-    { text: `time:      ${event.ts}` },
-  ];
-  if (event.type === "tool_call") {
-    lines.push({ text: `tool:      ${event.tool}` });
-    lines.push({ text: `duration:  ${String(event.durationMs)}ms` });
-    lines.push({ text: `status:    ${event.error ? "error" : "ok"}`, color: event.error ? "red" : "green" });
-  } else {
-    lines.push({ text: `state:     ${event.state}`, color: event.state === "pending" ? "yellow" : undefined });
-  }
-  lines.push({ text: "arguments:", bold: true });
-  for (const chunk of wrapText(event.argsSummary, 100)) lines.push({ text: `  ${chunk}` });
-  if (event.type === "tool_call" && event.error) {
-    lines.push({ text: "error:", bold: true, color: "red" });
-    for (const chunk of wrapText(String(event.error), 100)) lines.push({ text: `  ${chunk}`, color: "red" });
-  }
-  return lines;
-}
-
-function batonLines(snapshot: TuiSnapshot): DisplayLine[] {
-  if (!snapshot.baton) return [{ text: "No baton workspace found for this session.", dim: true }];
-  return formatBatonBundle(snapshot.baton)
-    .trimEnd()
-    .split("\n")
-    .map((text) => ({ text }));
-}
-
-function approvalLines(approvals: PermissionApprovalRequest[]): DisplayLine[] {
-  if (!approvals.length) return [{ text: "No pending approvals.", dim: true }];
-  return approvals.map((approval) => ({
-    text: `${timeOf(approval.createdAt)} ${approval.sessionId} ${approval.argsSummary}`,
-    color: "yellow",
-  }));
-}
-
-function messageLines(messages: StatusMessage[]): DisplayLine[] {
-  if (!messages.length) return [{ text: "No messages yet.", dim: true }];
-  return [...messages].reverse().map((item) => ({ text: `${timeOf(item.ts)} ${item.text}` }));
-}
-
-function textLines(text: string): DisplayLine[] {
-  return text.split("\n").map((line) => ({ text: line }));
-}
-
-function helpLines(): DisplayLine[] {
-  const available = slashCommands.filter((command) => command.stage === "available");
-  const planned = slashCommands.filter((command) => command.stage === "planned");
-  const lines: DisplayLine[] = available.map((command) => ({
-    text: `${pad(command.usage, 40)} ${command.description}`,
-  }));
-  lines.push({ text: "Planned", bold: true });
-  for (const command of planned) lines.push({ text: `${pad(command.usage, 40)} ${command.description}`, dim: true });
-  lines.push({ text: "" });
-  lines.push({ text: "Keys", bold: true });
-  lines.push({ text: "  j/k or PgUp/PgDn   select event (pauses follow) / scroll views" });
-  lines.push({ text: "  f                  resume following latest events" });
-  lines.push({ text: "  Enter              open detail for the selected event" });
-  lines.push({ text: "  Up/Down            command history" });
-  lines.push({ text: "  Tab                complete slash command, or next session tab when empty" });
-  lines.push({ text: "  Ctrl+1..9          jump to session tab" });
-  lines.push({ text: "  y/n                answer the pending approval (modal only)" });
-  lines.push({ text: "  Esc                clear input / back to events / resume follow" });
-  lines.push({ text: "  q q                quit (press twice)" });
-  return lines;
-}
-
-function keyHints({
-  onboarding,
-  approval,
-  viewMode,
-  follow,
-}: {
-  onboarding: boolean;
-  approval: boolean;
-  viewMode: ViewMode;
-  follow: boolean;
-}): string {
-  if (onboarding) return "Up/Down choose  Enter accept  or type a value";
-  if (approval) return "y approve  n deny  left/right queue";
-  if (viewMode === "events") {
-    return `j/k select  Enter detail  ${follow ? "" : "f follow  "}d diff  b baton  Tab session  Up history  ? help  qq quit`;
-  }
-  return "j/k scroll  Esc back  ? help  qq quit";
-}
-
-function CommandSuggestions({ input, suggestions }: { input: string; suggestions: SlashCommand[] }): React.ReactElement | null {
-  if (!input.startsWith("/") || !suggestions.length) return null;
-  return (
-    <Box flexDirection="column" marginTop={1} borderStyle="single" paddingX={1}>
-      {suggestions.map((command, index) => (
-        <Text key={command.name} color={command.stage === "planned" ? "gray" : index === 0 ? "cyan" : undefined}>
-          {index === 0 ? "Tab> " : "     "}
-          {pad(command.usage, 40)} {command.description}
-        </Text>
-      ))}
-    </Box>
-  );
-}
-
-function InputBar({
-  value,
-  onChange,
-  onSubmit,
-  placeholder,
-  focus,
-}: {
-  value: string;
-  onChange: (value: string) => void;
-  onSubmit: (value: string) => void;
-  placeholder: string;
-  focus: boolean;
-}): React.ReactElement {
-  return (
-    <Box marginTop={1}>
-      <Text>{"> "}</Text>
-      <TextInput value={value} onChange={onChange} onSubmit={onSubmit} placeholder={placeholder} focus={focus} />
-    </Box>
-  );
-}
-
-function StatusBar({
-  snapshot,
-  activeSummary,
-  tunnelMessage,
-  message,
-  hints,
-}: {
-  snapshot: TuiSnapshot;
-  activeSummary?: TuiSessionSummary;
-  tunnelMessage: string;
-  message: string;
-  hints: string;
-}): React.ReactElement {
-  const workspace = snapshot.workspace?.activePath ?? snapshot.session?.workspacePath ?? snapshot.initialWorkspacePath ?? "no workspace";
-  const mode = snapshot.workspace?.mode ?? snapshot.session?.defaultMode ?? "attached";
-  const backend = snapshot.session?.backendStatus.connected ? "ok" : snapshot.session ? "disconnected" : "idle";
-  const client = activeSummary?.owner === "tui" ? "tui-owned" : snapshot.sessionId ? "attached-v1" : "idle";
-  return (
-    <Box marginTop={1} borderStyle="single" paddingX={1} flexDirection="column">
-      <Text>
-        {mode} | backend:{backend} | client:{client} | {tunnelMessage} | {truncate(workspace, 64)}
-      </Text>
-      <Text dimColor>{message}</Text>
-      <Text dimColor>{hints}</Text>
-    </Box>
-  );
-}
-
-function formatStreamEvent(event: StreamEvent): string {
-  if (event.type === "permission_request") {
-    return `${timeOf(event.ts)} approval ${event.state} ${truncate(event.argsSummary, 82)}`;
-  }
-  return `${timeOf(event.ts)} ${event.tool} ${truncate(event.argsSummary, 62)} ${String(event.durationMs)}ms ${event.error ? "x" : "ok"}`;
-}
-
-function eventColor(event: StreamEvent, selected: boolean): string | undefined {
-  if (selected) return "cyan";
-  if (event.type === "permission_request") return event.state === "pending" ? "yellow" : undefined;
-  return event.error ? "red" : undefined;
-}
-
-function eventKey(event: StreamEvent): string {
-  const tag = event.type === "tool_call" ? event.tool : event.state;
-  return `${event.ts}|${event.type}|${tag}|${event.argsSummary.slice(0, 48)}`;
-}
-
-function isStreamEvent(event: ConductorEvent): event is StreamEvent {
-  return event.type === "tool_call" || event.type === "permission_request";
-}
-
-function emptySnapshot(initialWorkspacePath?: string): TuiSnapshot {
-  return {
-    initialWorkspacePath,
-    sessions: [],
-    events: [],
-    toolCalls: [],
-    checkpoints: [],
-    pendingApprovals: [],
-    allPendingApprovals: [],
-  };
-}
-
-function wrapText(value: string, width: number): string[] {
-  if (!value) return [""];
-  const chunks: string[] = [];
-  for (let index = 0; index < value.length; index += width) chunks.push(value.slice(index, index + width));
-  return chunks;
-}
-
-function timeOf(ts: string): string {
-  return ts.slice(11, 19);
-}
-
-function truncate(value: string, max: number): string {
-  return value.length <= max ? value : `${value.slice(0, Math.max(0, max - 3))}...`;
-}
-
-function pad(value: string, width: number): string {
-  return value.length >= width ? value : `${value}${" ".repeat(width - value.length)}`;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

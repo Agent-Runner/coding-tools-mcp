@@ -33,7 +33,10 @@ export class ConductorHttpServer {
     });
     await new Promise<void>((resolve, reject) => {
       const server = this.server;
-      if (!server) return reject(new Error("HTTP server was not created."));
+      if (!server) {
+        reject(new Error("HTTP server was not created."));
+        return;
+      }
       server.once("error", reject);
       server.listen(port, this.host, () => {
         server.off("error", reject);
@@ -79,7 +82,10 @@ export class ConductorHttpServer {
     this.port = undefined;
     if (!server) return;
     await new Promise<void>((resolve, reject) => {
-      server.close((error) => (error ? reject(error) : resolve()));
+      server.close((error) => {
+        if (error) reject(error);
+        else resolve();
+      });
     });
   }
 

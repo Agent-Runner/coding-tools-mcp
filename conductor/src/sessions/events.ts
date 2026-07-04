@@ -40,13 +40,14 @@ export class SessionEventBus extends EventEmitter implements SessionEventSink {
     super();
   }
 
-  async append(event: SessionEvent): Promise<void> {
+  append(event: SessionEvent): Promise<void> {
     const current = this.buffers.get(event.sessionId) ?? [];
     current.push(event);
     if (current.length > this.maxEvents) current.splice(0, current.length - this.maxEvents);
     this.buffers.set(event.sessionId, current);
     this.emit("event", event);
     this.emit(`event:${event.sessionId}`, event);
+    return Promise.resolve();
   }
 
   events(sessionId: string): SessionEvent[] {

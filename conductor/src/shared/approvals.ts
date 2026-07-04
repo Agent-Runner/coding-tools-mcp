@@ -81,8 +81,8 @@ export class FileApprovalBroker implements ApprovalBroker {
 export class MemoryApprovalBroker implements ApprovalBroker {
   private readonly pendingRequests = new Map<string, PendingMemoryApproval>();
 
-  async isAvailable(): Promise<boolean> {
-    return true;
+  isAvailable(): Promise<boolean> {
+    return Promise.resolve(true);
   }
 
   async request(
@@ -107,11 +107,13 @@ export class MemoryApprovalBroker implements ApprovalBroker {
     await this.finish(sessionId, requestId, approved ? "approved" : "denied");
   }
 
-  async pending(sessionId?: string): Promise<PermissionApprovalRequest[]> {
-    return [...this.pendingRequests.values()]
-      .map((entry) => entry.request)
-      .filter((request) => request.status === "pending" && (!sessionId || request.sessionId === sessionId))
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  pending(sessionId?: string): Promise<PermissionApprovalRequest[]> {
+    return Promise.resolve(
+      [...this.pendingRequests.values()]
+        .map((entry) => entry.request)
+        .filter((request) => request.status === "pending" && (!sessionId || request.sessionId === sessionId))
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
+    );
   }
 
   private async finish(sessionId: string, requestId: string, status: ApprovalStatus): Promise<void> {
