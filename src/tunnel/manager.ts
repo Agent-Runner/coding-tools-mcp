@@ -25,7 +25,9 @@ export class TunnelManager {
     this.process = child;
 
     const publicUrl = await new Promise<string>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("Timed out waiting for cloudflared tunnel URL.")), 15_000);
+      const timeout = setTimeout(() => {
+        reject(new Error("Timed out waiting for cloudflared tunnel URL."));
+      }, 15_000);
       const onData = (chunk: Buffer): void => {
         const url = parseCloudflaredUrl(chunk.toString("utf8"));
         if (!url) return;
@@ -53,7 +55,7 @@ export class TunnelManager {
       child.stderr.on("data", onData);
       child.once("error", onError);
       child.once("exit", onExit);
-    }).catch(async (error) => {
+    }).catch(async (error: unknown) => {
       await this.stop();
       throw error;
     });
@@ -75,12 +77,12 @@ export class TunnelManager {
     return this.status();
   }
 
-  async stop(): Promise<TunnelState> {
+  stop(): Promise<TunnelState> {
     const child = this.process;
     this.process = undefined;
     if (child && child.exitCode === null && child.signalCode === null) child.kill();
     this.state = { running: false, provider: "cloudflared", message: "tunnel:off" };
-    return this.status();
+    return Promise.resolve(this.status());
   }
 }
 

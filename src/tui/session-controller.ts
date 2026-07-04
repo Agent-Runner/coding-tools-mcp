@@ -82,9 +82,9 @@ export class TuiSessionController {
     const runtime = new ConductorRuntime(runtimeOptions, { owner: "tui", events, approvals: this.approvals });
     try {
       await runtime.start();
-      const opened = requireStructured<OpenWorkspaceRuntimeResult>(
+      const opened = requireStructured(
         await runtime.callTool("open_workspace", { path: runtimeOptions.workspacePath, mode: options.mode }),
-      );
+      ) as OpenWorkspaceRuntimeResult;
       const httpUrl = await this.registerHttpSession(runtimeOptions.sessionId, runtime, runtimeOptions.workspacePath);
       this.sessions.set(runtimeOptions.sessionId, { runtime, events, httpUrl });
       return {
@@ -103,9 +103,9 @@ export class TuiSessionController {
     const hosted = this.sessions.get(sessionId);
     const started = performance.now();
     if (hosted) {
-      const result = requireStructured<CloseWorkspaceResult>(
+      const result = requireStructured(
         await hosted.runtime.callTool("close_workspace", { force: options.force }),
-      );
+      ) as CloseWorkspaceResult;
       if (result.closed) {
         await this.http?.unregisterSession(sessionId).catch(() => undefined);
         await hosted.runtime.stop().catch(() => undefined);
@@ -150,8 +150,8 @@ export class TuiSessionController {
     if (!http.origin) throw new Error("HTTP MCP server is not listening.");
     const state = await this.tunnel.start(http.origin);
     http.setBearerToken(state.token);
-    const sampleSession = this.sessions.keys().next().value as string | undefined;
-    const route = `${state.publicUrl}/mcp/${sampleSession ?? "<session-id>"}`;
+    const sampleSession = this.sessions.keys().next().value;
+    const route = `${state.publicUrl ?? "<public-url>"}/mcp/${sampleSession ?? "<session-id>"}`;
     return {
       state,
       message: `Tunnel ready: ${route} with Authorization: Bearer ${state.token ?? "<token>"}`,
@@ -301,12 +301,12 @@ function summarizeObject(value: object): string {
   return summarizeResult({ content: [{ type: "text", text: JSON.stringify(value) }], isError: false });
 }
 
-function requireStructured<T extends object>(result: CallToolResult): T {
+function requireStructured(result: CallToolResult): unknown {
   if (result.isError) throw new Error(resultText(result) || "MCP tool call failed.");
-  if (result.structuredContent) return result.structuredContent as T;
+  if (result.structuredContent) return result.structuredContent;
   const text = resultText(result);
   if (!text) throw new Error("MCP tool call returned no structured content.");
-  return JSON.parse(text) as T;
+  return JSON.parse(text) as unknown;
 }
 
 function resultText(result: CallToolResult): string | undefined {
