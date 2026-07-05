@@ -5,23 +5,23 @@ Publishable npm packages that protect and serve this project's names on the npm 
 | Package | Contents |
 | --- | --- |
 | [`coding-tools-conductor`](../conductor) | The canonical Conductor CLI/TUI (`ctc` command). Lives in `conductor/`, not here. |
-| [`ctc-conductor`](./ctc-conductor) | Name alias. Installs the same `ctc` command and delegates to `coding-tools-conductor`. |
+| [`run-ctc`](./run-ctc) | Name alias. Installs the same `ctc` command and delegates to `coding-tools-conductor`. |
 | [`coding-tools-mcp`](./coding-tools-mcp) | Launcher for the Python MCP server on PyPI, via `uvx`/`pipx`. |
 
-`ctc-conductor` is not named `ctc-cli` because npm's registry rejects new unscoped
+`run-ctc` isn't named `ctc-cli` because npm's registry rejects new unscoped
 names it considers too similar to existing popular packages (this one collided
 with `cp-cli`/`cpy-cli`/`dts-cli`) — the registry itself suggests scoping
 (`@you/ctc-cli`) as the workaround. We picked a different unscoped name instead
 so a plain `npx <package>` keeps working with no scope to type. This works
 because npm's bin resolution (`libnpmexec/get-bin-from-manifest.js`) runs
 whatever the package's sole `bin` entry is, regardless of whether it matches
-the package name — so `npx ctc-conductor` still launches the `ctc` command.
+the package name — so `npx run-ctc` still launches the `ctc` command.
 If you also want the exact literal `ctc-cli` name, it is only obtainable
 scoped, e.g. `@<your-npm-user>/ctc-cli` published with `--access public`.
 
 ## Publishing a beta
 
-Publish the canonical package first — `ctc-conductor` depends on it:
+Publish the canonical package first — `run-ctc` depends on it:
 
 ```bash
 # 1. Canonical conductor package (builds automatically via prepack)
@@ -30,7 +30,7 @@ npm version 0.1.0-beta.1 --no-git-tag-version
 npm publish --tag beta
 
 # 2. Alias + launcher
-cd ../npm/ctc-conductor
+cd ../npm/run-ctc
 npm version 0.1.0-beta.1 --no-git-tag-version
 npm publish --tag beta
 
