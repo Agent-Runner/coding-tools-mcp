@@ -154,9 +154,11 @@ queue when several requests are pending; Esc denies). Without an attached
 TUI, the request falls back to the lower backend's existing permission flow.
 
 `/tunnel start` exposes the MCP server over a free try.cloudflare.com tunnel.
-If `cloudflared` is already installed it starts immediately. Otherwise the TUI
-does not dead-end — it opens a picker (arrows/number keys, Enter, Esc) of the
-ways this host can run a tunnel:
+It requires a live session (`/new`) — a tunnel in front of a session-less
+server could only answer 503, which remote connectors surface as a failed
+setup. If `cloudflared` is already installed it starts immediately. Otherwise
+the TUI does not dead-end — it opens a picker (arrows/number keys, Enter, Esc)
+of the ways this host can run a tunnel:
 
 - **Use wrangler (no install)** — runs `wrangler tunnel quick-start <url>`,
   using a `wrangler` on PATH or `npx wrangler` (the first `npx` run downloads

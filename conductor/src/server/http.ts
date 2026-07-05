@@ -47,6 +47,14 @@ const MCP_SESSION_HEADER = "mcp-session-id";
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
 const MAX_TRANSPORTS_PER_ROUTE = 64;
 const MAX_LEGACY_TRANSPORTS = 64;
+// Node closes idle keep-alive sockets after 5s by default, but tunnel providers pool
+// origin connections much longer (cloudflared reuses them for ~90s idle). A pooled
+// request landing on a socket the origin already closed is answered with 502 Bad
+// Gateway by the tunnel. Keep origin sockets alive longer than any pool reuse window
+// so the tunnel always closes first. headersTimeout must exceed keepAliveTimeout,
+// otherwise Node re-arms a shorter clock while waiting for the next request's headers.
+const KEEP_ALIVE_TIMEOUT_MS = 120_000;
+const HEADERS_TIMEOUT_MS = 125_000;
 // SSE comment pings keep free-tier tunnels (cloudflared idles streams out around 100s)
 // and strict proxies from dropping otherwise-quiet legacy streams.
 const LEGACY_KEEPALIVE_MS = 25_000;
@@ -75,6 +83,8 @@ export class ConductorHttpServer {
     this.server = createServer((req, res) => {
       void this.handle(req, res);
     });
+    this.server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
+    this.server.headersTimeout = HEADERS_TIMEOUT_MS;
     await new Promise<void>((resolve, reject) => {
       const server = this.server;
       if (!server) {
