@@ -1,5 +1,6 @@
 import { request as httpRequest } from "node:http";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -167,7 +168,141 @@ describe("ConductorHttpServer", () => {
     });
     expect(authorized.status).toBe(200);
   });
+
+  it("serves the legacy HTTP+SSE transport to SDK SSE clients on /sse and /mcp/sse", async () => {
+    http = new ConductorHttpServer();
+    const origin = await http.listen();
+    await http.registerSession("session-a", () => createListToolsServer("server-a"));
+
+    for (const path of ["/sse", "/mcp/sse"]) {
+      const client = new Client({ name: "ctc-legacy-test", version: "0.1.0" }, { capabilities: {} });
+      const transport = new SSEClientTransport(new URL(`${origin}${path}`));
+      await client.connect(transport);
+      expect(client.getServerVersion()?.name).toBe("server-a");
+      await expect(client.listTools()).resolves.toEqual({ tools: [] });
+      await client.close();
+    }
+  });
+
+  it("answers the legacy SSE probe on GET /mcp with the old handshake", async () => {
+    http = new ConductorHttpServer();
+    await http.listen();
+    const registered = await http.registerSession("session-a", () => createListToolsServer("server-a"));
+
+    // Transport-fallback probe used by connector platforms: GET the configured URL with
+    // an SSE Accept and no Mcp-Session-Id, expecting the 2024-11-05 endpoint event.
+    const probe = await fetch(registered.url, { headers: { Accept: "text/event-stream" } });
+    expect(probe.status).toBe(200);
+    expect(probe.headers.get("content-type")).toContain("text/event-stream");
+    const body = probe.body;
+    if (!body) throw new Error("SSE probe returned no body.");
+    const reader = body.getReader();
+    const handshake = await readSse(reader, (text) => text.includes("\n\n"));
+    expect(handshake).toContain("event: endpoint");
+    const endpoint = /data: (\S+)/.exec(handshake)?.[1];
+    expect(endpoint).toContain("/messages?sessionId=");
+
+    const posted = await fetch(new URL(endpoint ?? "", registered.url), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: initializeBody,
+    });
+    expect(posted.status).toBe(202);
+    const initialized = await readSse(reader, (text) => text.includes("serverInfo"));
+    expect(initialized).toContain("server-a");
+    await reader.cancel();
+  });
+
+  it("serves a routable server card on /, plain GET /mcp, and /.well-known/mcp.json", async () => {
+    http = new ConductorHttpServer();
+    const origin = await http.listen();
+    await http.registerSession("session-a", () => createListToolsServer("server-a"));
+
+    for (const path of ["/", "/mcp", "/.well-known/mcp.json", "/.well-known/mcp/server-card.json"]) {
+      const response = await fetch(`${origin}${path}`);
+      expect(response.status).toBe(200);
+      const card = (await response.json()) as { transport: { endpoint: string }; legacyTransport: { endpoint: string } };
+      expect(card.transport.endpoint).toBe("/mcp");
+      expect(card.legacyTransport.endpoint).toBe("/sse");
+    }
+  });
+
+  it("aliases the tunnel root to the MCP endpoint for clients configured without /mcp", async () => {
+    http = new ConductorHttpServer();
+    const origin = await http.listen();
+    await http.registerSession("session-a", () => createListToolsServer("server-a"));
+
+    const response = await fetch(`${origin}/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "*/*" },
+      body: initializeBody,
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("mcp-session-id")).toBeTruthy();
+  });
+
+  it("returns 503 (not 404) when no ctc session is active", async () => {
+    http = new ConductorHttpServer();
+    const origin = await http.listen();
+
+    const posted = await fetch(`${origin}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "*/*" },
+      body: initializeBody,
+    });
+    expect(posted.status).toBe(503);
+
+    const probed = await fetch(`${origin}/mcp`, { headers: { Accept: "text/event-stream" } });
+    expect(probed.status).toBe(503);
+
+    const card = await fetch(`${origin}/`);
+    expect(card.status).toBe(200);
+  });
+
+  it("keeps discovery public and legacy endpoints gated in bearer mode", async () => {
+    http = new ConductorHttpServer();
+    const origin = await http.listen();
+    await http.registerSession("session-a", () => createListToolsServer("server-a"));
+    http.setBearerToken("secret-token");
+
+    const wellKnown = await fetch(`${origin}/.well-known/mcp.json`);
+    expect(wellKnown.status).toBe(200);
+    expect(((await wellKnown.json()) as { auth: { type: string } }).auth.type).toBe("bearer");
+
+    const denied = await fetch(`${origin}/sse`, { headers: { Accept: "text/event-stream" } });
+    expect(denied.status).toBe(401);
+
+    const stream = await fetch(`${origin}/sse`, {
+      headers: { Accept: "text/event-stream", Authorization: "Bearer secret-token" },
+    });
+    expect(stream.status).toBe(200);
+    await stream.body?.cancel();
+
+    const orphaned = await fetch(`${origin}/messages?sessionId=not-a-live-session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer secret-token" },
+      body: initializeBody,
+    });
+    expect(orphaned.status).toBe(404);
+  });
 });
+
+async function readSse(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  until: (text: string) => boolean,
+  timeoutMs = 4000,
+): Promise<string> {
+  const decoder = new TextDecoder();
+  let text = "";
+  const deadline = Date.now() + timeoutMs;
+  while (!until(text)) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for SSE content. Received: ${JSON.stringify(text)}`);
+    const { value, done } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+  }
+  return text;
+}
 
 async function connect(url: string): Promise<{ client: Client; transport: StreamableHTTPClientTransport }> {
   const client = new Client({ name: "ctc-test", version: "0.1.0" }, { capabilities: {} });
