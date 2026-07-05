@@ -3,6 +3,7 @@ import {
   findSlashCommand,
   fuzzyMatch,
   parseCloseCommand,
+  parseMcpCommand,
   parseNewCommand,
   parseSlashCommand,
   parseTunnelCommand,
@@ -33,6 +34,19 @@ describe("TUI slash command registry", () => {
     expect(() => parseNewCommand(["--bogus"])).toThrow(/Unknown \/new option/);
     expect(() => parseCloseCommand(["--bogus"])).toThrow(/Unknown \/close option/);
     expect(() => parseTunnelCommand(["restart"])).toThrow(/action must be/);
+  });
+
+  it("parses /mcp actions with optional server names", () => {
+    expect(parseMcpCommand([])).toEqual({ action: "status" });
+    expect(parseMcpCommand(["enable"])).toEqual({ action: "enable", server: undefined });
+    expect(parseMcpCommand(["disable", "github"])).toEqual({ action: "disable", server: "github" });
+    expect(parseMcpCommand(["reconnect", "playwright"])).toEqual({ action: "reconnect", server: "playwright" });
+    expect(parseMcpCommand(["trust", "docs"])).toEqual({ action: "trust", server: "docs" });
+    expect(() => parseMcpCommand(["trust"])).toThrow(/requires a server name/);
+    expect(() => parseMcpCommand(["restart"])).toThrow(/action must be/);
+    expect(() => parseMcpCommand(["enable", "a", "b"])).toThrow(/at most/);
+    expect(suggestSlashCommands("/mc")[0]?.name).toBe("mcp");
+    expect(findSlashCommand("mcp")?.stage).toBe("available");
   });
 
   it("resolves aliases and suggestions", () => {

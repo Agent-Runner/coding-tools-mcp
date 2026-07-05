@@ -1,4 +1,4 @@
-import type { ConductorEvent, ReviewCheckpointEvent, ToolCallEvent } from "../shared/types.js";
+import type { ConductorEvent, ReviewCheckpointEvent, ServerStatusEvent, ToolCallEvent } from "../shared/types.js";
 import { colorizeDiffLine, formatDuration, timeOf, truncate, wrapText } from "./format.js";
 import { glyphs, palette } from "./theme.js";
 
@@ -140,14 +140,20 @@ export class TranscriptBuilder {
     if (event.type === "review_checkpoint") {
       return { key, kind: "lines", lines: checkpointLines(event, width) };
     }
+    if (event.type === "server_status") {
+      return { key, kind: "lines", lines: serverStatusLines(event, width) };
+    }
     // session_started
+    const mcpSummary = event.mcpServers?.length
+      ? ` ${glyphs.dot} mcp ${String(event.mcpServers.filter((server) => server.state === "connected").length)}/${String(event.mcpServers.length)}`
+      : "";
     return {
       key,
       kind: "lines",
       lines: [
         [
           {
-            text: `${glyphs.dot} ${timeOf(event.ts)} session started ${glyphs.dot} owner ${event.owner ?? "stdio"} ${glyphs.dot} ${event.backendType} backend ${glyphs.dot} ${truncate(event.workspacePath, Math.max(10, width - 48))}`,
+            text: `${glyphs.dot} ${timeOf(event.ts)} session started ${glyphs.dot} owner ${event.owner ?? "stdio"} ${glyphs.dot} ${event.backendType} backend ${glyphs.dot} ${truncate(event.workspacePath, Math.max(10, width - 48))}${mcpSummary}`,
             dim: true,
           },
         ],
@@ -206,6 +212,37 @@ function checkpointLines(event: ReviewCheckpointEvent, width: number): Transcrip
       const more = hidden > 0 ? `${String(hidden)} more lines` : "diff truncated";
       lines.push([{ text: `    … ${more} ${glyphs.dot} /diff to view`, dim: true }]);
     }
+  }
+  return lines;
+}
+
+function serverStatusLines(event: ServerStatusEvent, width: number): TranscriptSpan[][] {
+  if (event.state === "connected") {
+    const tools = event.toolCount !== undefined ? ` ${glyphs.dot} ${String(event.toolCount)} tools` : "";
+    return [
+      [
+        { text: `${glyphs.bullet} `, color: palette.ok },
+        { text: `mcp ${event.server}`, bold: true },
+        { text: ` connected${tools}`, dim: true },
+      ],
+    ];
+  }
+  if (event.state === "disabled") {
+    const reason = event.error ? ` ${glyphs.dot} ${event.error}` : "";
+    return [[{ text: `${glyphs.dot} mcp ${event.server} disabled${reason}`, dim: true }]];
+  }
+  const lines: TranscriptSpan[][] = [
+    [
+      { text: `${glyphs.bullet} `, color: palette.error },
+      { text: `mcp ${event.server}`, bold: true },
+      { text: ` ${event.state}`, color: palette.error },
+    ],
+  ];
+  if (event.error) {
+    lines.push([
+      { text: `  ${glyphs.result} `, dim: true },
+      { text: truncate(event.error, Math.max(20, width - 6)), color: palette.error },
+    ]);
   }
   return lines;
 }

@@ -60,6 +60,7 @@ program
   .option("--backend-token-env <name>", "environment variable containing the HTTP bearer token")
   .option("--allow <tools...>", "allow only these lower tools")
   .option("--deny <tools...>", "deny these lower tools")
+  .option("--trust-workspace-mcp", "trust MCP servers declared in <repo>/.ctc/mcp.json for this session")
   .option("--quiet", "disable concise stderr tool-call logs")
   .action(async (path: string | undefined, opts: StartCommandOptions) => {
     const runtime = await resolveRuntimeOptions({
@@ -72,6 +73,7 @@ program
       allow: opts.allow,
       deny: opts.deny,
       conciseLogs: !opts.quiet,
+      trustWorkspaceMcp: opts.trustWorkspaceMcp,
     });
     await startConductorServer(runtime);
   });
@@ -132,6 +134,7 @@ interface StartCommandOptions {
   backendTokenEnv?: string;
   allow?: string[];
   deny?: string[];
+  trustWorkspaceMcp?: boolean;
   quiet?: boolean;
 }
 

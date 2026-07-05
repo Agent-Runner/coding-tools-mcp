@@ -23,11 +23,15 @@ export function StatusBar({
     snapshot.workspace?.activePath ?? snapshot.session?.workspacePath ?? snapshot.initialWorkspacePath ?? "no workspace";
   const mode = snapshot.workspace?.mode ?? snapshot.session?.defaultMode ?? "attached";
   const backend = snapshot.session?.backendStatus.connected ? "backend ok" : snapshot.session ? "backend off" : "backend idle";
+  const mcpTotal = snapshot.mcpServers.length;
+  const mcpConnected = snapshot.mcpServers.filter((server) => server.state === "connected").length;
+  const mcp = mcpTotal ? ` ${glyphs.dot} mcp ${String(mcpConnected)}/${String(mcpTotal)}` : "";
   return (
     <Box flexDirection="column" paddingX={1}>
       <SessionTabs sessions={sessions} activeSessionId={snapshot.sessionId} />
       <Text dimColor wrap="truncate-end">
-        {mode} {glyphs.dot} {backend} {glyphs.dot} {tunnelMessage} {glyphs.dot} {truncate(workspace, 48)}
+        {mode} {glyphs.dot} {backend}
+        {mcp} {glyphs.dot} {tunnelMessage} {glyphs.dot} {truncate(workspace, 48)}
       </Text>
       <Text dimColor wrap="truncate-end">
         {hint}

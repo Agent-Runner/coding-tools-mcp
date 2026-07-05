@@ -2,9 +2,11 @@ import React, { useEffect, useMemo, useRef, useState, useSyncExternalStore } fro
 import { Box, Text, useApp, useInput, useStdout } from "ink";
 import { runDoctor } from "../cli/doctor.js";
 import { markTuiAttached, type PermissionApprovalRequest } from "../shared/approvals.js";
+import type { ExtraServerStatus } from "../shared/types.js";
 import {
   findSlashCommand,
   parseCloseCommand,
+  parseMcpCommand,
   parseNewCommand,
   parseSlashCommand,
   parseTunnelCommand,
@@ -21,6 +23,7 @@ import {
   doctorLines,
   helpLines,
   inspectLines,
+  mcpPanelLines,
 } from "./components/Panels.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { Transcript } from "./components/Transcript.js";
@@ -40,7 +43,7 @@ const CTC_VERSION = "0.1.0";
 const HISTORY_LIMIT = 50;
 const CTRL_C_WINDOW_MS = 1500;
 
-type PanelKind = "help" | "diff" | "baton" | "approvals" | "config" | "inspect" | "doctor";
+type PanelKind = "help" | "diff" | "baton" | "approvals" | "config" | "inspect" | "doctor" | "mcp";
 
 interface PanelState {
   kind: PanelKind;
@@ -60,7 +63,13 @@ const PANEL_TITLES: Record<PanelKind, string> = {
   config: "Profile",
   inspect: "Event Inspector",
   doctor: "Doctor",
+  mcp: "MCP Servers",
 };
+
+interface McpPickState {
+  action: "enable" | "disable" | "reconnect";
+  options: ExtraServerStatus[];
+}
 
 export function TuiApp({
   requestedSessionId,
@@ -136,6 +145,10 @@ export function TuiApp({
   const [tunnelMethods, setTunnelMethods] = useState<TunnelMethod[] | undefined>(undefined);
   const [tunnelChoice, setTunnelChoice] = useState(0);
 
+  const [mcpPick, setMcpPick] = useState<McpPickState | undefined>(undefined);
+  const [mcpChoice, setMcpChoice] = useState(0);
+  const untrustedNoticeFor = useRef<string | undefined>(undefined);
+
   // The menu is a command picker: it opens on "/name" and closes once you type a
   // space and move on to arguments (matching Codex CLI / OpenCode).
   const menuOpen = !onboarding && /^\/\S*$/.test(input);
@@ -161,6 +174,7 @@ export function TuiApp({
   const approvalVisible = approvalQueue.length > 0 && !onboarding;
   const activeApproval = approvalQueue[Math.min(approvalCursor, Math.max(approvalQueue.length - 1, 0))];
   const tunnelPickVisible = Boolean(tunnelMethods?.length) && !onboarding && !approvalVisible;
+  const mcpPickVisible = Boolean(mcpPick?.options.length) && !onboarding && !approvalVisible && !tunnelPickVisible;
 
   const onboardingOptions = useMemo(() => (onboarding ? optionsForStep(onboarding) : []), [onboarding]);
 
@@ -221,6 +235,18 @@ export function TuiApp({
       cancelled = true;
     };
   }, [requestedSessionId, initialWorkspacePath]);
+
+  // One-time nudge per session when workspace-declared MCP servers await trust.
+  useEffect(() => {
+    if (!snapshot.sessionId || untrustedNoticeFor.current === snapshot.sessionId) return;
+    const untrusted = snapshot.mcpServers.filter((server) => server.untrusted);
+    if (!untrusted.length) return;
+    untrustedNoticeFor.current = snapshot.sessionId;
+    appendNote(
+      `${String(untrusted.length)} MCP server(s) from .ctc/mcp.json are not trusted yet — /mcp to review, /mcp trust <name> to enable.`,
+      "hint",
+    );
+  }, [snapshot.sessionId, snapshot.mcpServers]);
 
   // Heartbeat that routes lower-level permission requests to this TUI.
   useEffect(() => {
@@ -493,6 +519,9 @@ export function TuiApp({
       case "config":
         await runConfigCommand(parsed.args);
         break;
+      case "mcp":
+        await runMcpCommand(parsed.args);
+        break;
       case "doctor":
         await runDoctorCommand();
         break;
@@ -633,6 +662,75 @@ export function TuiApp({
     });
   };
 
+  const runMcpCommand = async (args: string[]): Promise<void> => {
+    let parsedMcp;
+    try {
+      parsedMcp = parseMcpCommand(args);
+    } catch (error) {
+      appendNote(errorMessage(error), "error");
+      return;
+    }
+    if (parsedMcp.action === "status") {
+      setPanel({ kind: "mcp" });
+      return;
+    }
+    const hosted = controller.mcpStatuses(snapshot.sessionId);
+    // Trust only writes the profile, so it works without a hosted session too.
+    if (!hosted && parsedMcp.action !== "trust") {
+      appendNote(
+        "/mcp changes apply to TUI-owned sessions; this session is external and read-only. Run /new to host one.",
+        "hint",
+      );
+      return;
+    }
+    if (parsedMcp.server) {
+      await runMcpAction(parsedMcp.action, parsedMcp.server);
+      return;
+    }
+    const action = parsedMcp.action;
+    if (action === "trust") return; // parser guarantees trust always carries a server name
+    const options = (hosted ?? []).filter((server) =>
+      action === "enable" ? server.state === "disabled" && !server.untrusted : server.state !== "disabled",
+    );
+    if (!options.length) {
+      appendNote(`No MCP servers available to ${action}. /mcp shows the current list.`, "hint");
+      return;
+    }
+    setMcpChoice(0);
+    setMcpPick({ action, options });
+  };
+
+  const runMcpAction = async (action: "enable" | "disable" | "reconnect" | "trust", server: string): Promise<void> => {
+    const labels = { enable: "Enabling", disable: "Disabling", reconnect: "Reconnecting", trust: "Trusting" } as const;
+    await runWithBusy(`${labels[action]} mcp ${server}`, async () => {
+      let status: ExtraServerStatus | undefined;
+      if (action === "trust") {
+        status = await controller.mcpTrust(initialWorkspacePath, snapshot.sessionId, server);
+        if (!status) {
+          appendNote(`Trusted workspace MCP server ${server}; it connects when a hosted session starts.`, "success");
+          return;
+        }
+      } else if (action === "reconnect") {
+        status = await controller.mcpReconnect(snapshot.sessionId, server);
+      } else {
+        status = await controller.mcpSetEnabled(snapshot.sessionId, server, action === "enable");
+      }
+      appendNote(describeMcpStatus(status), status.state === "connected" || status.state === "disabled" ? "success" : "error");
+      store.requestRefresh();
+    });
+  };
+
+  const pickMcpServer = (status: ExtraServerStatus | undefined): void => {
+    const action = mcpPick?.action;
+    setMcpPick(undefined);
+    setMcpChoice(0);
+    if (!status || !action) {
+      appendNote("MCP action canceled.", "hint");
+      return;
+    }
+    void runMcpAction(action, status.name);
+  };
+
   const runDoctorCommand = async (): Promise<void> => {
     await runWithBusy("Running doctor checks", async () => {
       const root = snapshot.workspace?.activePath ?? snapshot.session?.workspacePath ?? initialWorkspacePath;
@@ -655,10 +753,12 @@ export function TuiApp({
         return approvalPanelLines(approvalQueue);
       case "inspect":
         return inspectLines(snapshot.events);
+      case "mcp":
+        return mcpPanelLines(snapshot.mcpServers, { hosted: controller.mcpStatuses(snapshot.sessionId) !== undefined });
       default:
         return panel.lines ?? [];
     }
-  }, [panel, snapshot, approvalQueue]);
+  }, [panel, snapshot, approvalQueue, controller]);
 
   const panelHeight = Math.max(8, Math.min(size.rows - 9, panelLines.length + 3));
   const pageSize = Math.max(1, panelHeight - 3);
@@ -694,6 +794,16 @@ export function TuiApp({
       else if (key.upArrow) setTunnelChoice((choice) => Math.max(0, choice - 1));
       else if (key.downArrow) setTunnelChoice((choice) => Math.min(count - 1, choice + 1));
       else if (key.return) pickTunnelMethod(tunnelMethods[Math.min(tunnelChoice, count - 1)]);
+      return;
+    }
+    if (mcpPickVisible && mcpPick) {
+      const count = mcpPick.options.length;
+      const digit = Number.parseInt(inputChar, 10);
+      if (key.escape || inputChar === "n" || inputChar === "N") pickMcpServer(undefined);
+      else if (Number.isInteger(digit) && digit >= 1 && digit <= count) pickMcpServer(mcpPick.options[digit - 1]);
+      else if (key.upArrow) setMcpChoice((choice) => Math.max(0, choice - 1));
+      else if (key.downArrow) setMcpChoice((choice) => Math.min(count - 1, choice + 1));
+      else if (key.return) pickMcpServer(mcpPick.options[Math.min(mcpChoice, count - 1)]);
       return;
     }
     if (key.ctrl && (inputChar === "o" || inputChar === "O" || inputChar === "\u000F")) {
@@ -755,6 +865,8 @@ export function TuiApp({
         ? "Answer the permission request above"
         : tunnelPickVisible
           ? "Pick a tunnel provider above · Esc cancels"
+          : mcpPickVisible
+            ? "Pick an MCP server above · Esc cancels"
           : panel
           ? `↑/↓ scroll ${glyphs.dot} ←/→ page ${glyphs.dot} Esc close`
           : menuVisible
@@ -782,6 +894,16 @@ export function TuiApp({
             options={tunnelMethods.map((method) => ({ label: method.label, hint: method.note }))}
             selected={Math.min(tunnelChoice, tunnelMethods.length - 1)}
           />
+        ) : mcpPickVisible && mcpPick ? (
+          <ChoicePrompt
+            title={`Which MCP server do you want to ${mcpPick.action}?`}
+            body={`Pick a server; /mcp ${mcpPick.action} <name> skips this prompt.`}
+            options={mcpPick.options.map((server) => ({
+              label: server.name,
+              hint: `${server.state}${server.state === "connected" ? ` ${glyphs.dot} ${String(server.toolCount)} tools` : ""}`,
+            }))}
+            selected={Math.min(mcpChoice, mcpPick.options.length - 1)}
+          />
         ) : panel ? (
           <ScrollPanel title={PANEL_TITLES[panel.kind]} lines={panelLines} scroll={scroll} height={panelHeight} />
         ) : null}
@@ -797,9 +919,9 @@ export function TuiApp({
           onChange={handleInputChange}
           onSubmit={submitInput}
           placeholder={onboarding ? onboardingDefault(onboarding) : "/ for commands"}
-          focus={!approvalVisible && !tunnelPickVisible}
+          focus={!approvalVisible && !tunnelPickVisible && !mcpPickVisible}
         />
-        {menuVisible && !approvalVisible && !tunnelPickVisible ? (
+        {menuVisible && !approvalVisible && !tunnelPickVisible && !mcpPickVisible ? (
           <SlashMenu
             suggestions={suggestions}
             selected={Math.min(menuIndex, Math.max(suggestions.length - 1, 0))}
@@ -818,4 +940,10 @@ function safeParse(value: string): { name: string; args: string[] } | undefined 
   } catch {
     return undefined;
   }
+}
+
+function describeMcpStatus(status: ExtraServerStatus): string {
+  if (status.state === "connected") return `mcp ${status.name} connected ${glyphs.dot} ${String(status.toolCount)} tools`;
+  if (status.state === "disabled") return `mcp ${status.name} disabled for this session`;
+  return `mcp ${status.name} ${status.state}${status.lastError ? `: ${status.lastError}` : ""}`;
 }

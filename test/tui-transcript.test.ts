@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ConductorEvent, ReviewCheckpointEvent, ToolCallEvent } from "../src/shared/types.js";
+import type { ConductorEvent, ReviewCheckpointEvent, ServerStatusEvent, ToolCallEvent } from "../src/shared/types.js";
 import { TranscriptBuilder, type TranscriptItem } from "../src/tui/transcript.js";
 
 function toolCall(overrides: Partial<ToolCallEvent> = {}): ToolCallEvent {
@@ -101,5 +101,46 @@ describe("TranscriptBuilder", () => {
     const builder = new TranscriptBuilder();
     expect(itemText(builder.note("saved", "success"))).toContain("✓ saved");
     expect(itemText(builder.note("boom", "error"))).toContain("✗ boom");
+  });
+
+  it("renders server_status transitions and the session_started mcp summary", () => {
+    const builder = new TranscriptBuilder();
+    const serverStatus = (overrides: Partial<ServerStatusEvent>): ServerStatusEvent => ({
+      ts: "2026-07-03T12:00:03.000Z",
+      sessionId: "session-a",
+      type: "server_status",
+      server: "github",
+      state: "connected",
+      ...overrides,
+    });
+    const events: ConductorEvent[] = [
+      {
+        ts: "2026-07-03T12:00:00.000Z",
+        sessionId: "session-a",
+        type: "session_started",
+        workspacePath: "/repo/api",
+        defaultMode: "direct",
+        backendType: "stdio",
+        backendStatus: { connected: true, reconnecting: false },
+        logPath: "log.jsonl",
+        mcpServers: [
+          { name: "github", source: "profile", state: "connected", toolCount: 12 },
+          { name: "docs", source: "workspace", state: "disabled", untrusted: true },
+        ],
+      },
+      serverStatus({ toolCount: 12 }),
+      serverStatus({ server: "playwright", state: "error", error: "spawn npx ENOENT" }),
+      serverStatus({ server: "docs", state: "disabled", error: "not trusted" }),
+    ];
+    const text = builder
+      .syncSession({ sessionId: "session-a", label: "api", events, width: 100 })
+      .map(itemText)
+      .join("\n");
+    expect(text).toContain("mcp 1/2");
+    expect(text).toContain("mcp github");
+    expect(text).toContain("12 tools");
+    expect(text).toContain("mcp playwright");
+    expect(text).toContain("spawn npx ENOENT");
+    expect(text).toContain("mcp docs disabled");
   });
 });
