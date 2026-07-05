@@ -1,5 +1,5 @@
 import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { execa } from "execa";
 import { describe, expect, it } from "vitest";
@@ -9,7 +9,7 @@ import { createGitRepo, git } from "./git-fixtures.js";
 describe("ReviewManager", () => {
   it("shows only incremental changes since the last checkpoint", async () => {
     const repo = await createGitRepo("ctc-review-repo-");
-    const review = new ReviewManager({ backend: new ExecBackend(), sessionId: "review-incremental" });
+    const review = new ReviewManager({ backend: new ExecBackend(repo), sessionId: "review-incremental" });
     await review.initializeBaseline(repo);
 
     await writeFile(join(repo, "a.txt"), "base\nfirst change\n", "utf8");
@@ -35,7 +35,7 @@ describe("ReviewManager", () => {
     await git(repo, ["add", "a.txt"]);
     const before = await git(repo, ["diff", "--cached", "--name-only"]);
 
-    const review = new ReviewManager({ backend: new ExecBackend(), sessionId: "review-index" });
+    const review = new ReviewManager({ backend: new ExecBackend(repo), sessionId: "review-index" });
     await review.initializeBaseline(repo);
     await writeFile(join(repo, "b.txt"), "unstaged new file\n", "utf8");
     await review.showChanges({ since: "workspace_open" });
@@ -46,8 +46,14 @@ describe("ReviewManager", () => {
   });
 });
 
+/**
+ * Mirrors the coding-tools-mcp exec contract: workdir must be workspace-relative
+ * and is resolved against the backend's default cwd.
+ */
 class ExecBackend implements ReviewToolCaller {
   commands: string[] = [];
+
+  constructor(private readonly defaultCwd: string) {}
 
   async callTool(name: string, args: Record<string, unknown>): Promise<CallToolResult> {
     if (name !== "exec_command") throw new Error(`Unexpected tool ${name}`);
@@ -56,7 +62,11 @@ class ExecBackend implements ReviewToolCaller {
       throw new Error(`Unsafe shell feature used by test command: ${command}`);
     }
     this.commands.push(command);
-    const workdir = String(args.workdir);
+    const workdirArg = typeof args.workdir === "string" ? args.workdir : ".";
+    if (workdirArg.startsWith("/") || /^[A-Za-z]:[\\/]/.test(workdirArg)) {
+      throw new Error(`Absolute workdir denied by the backend path contract: ${workdirArg}`);
+    }
+    const workdir = resolve(this.defaultCwd, workdirArg);
     const envArg = args.env;
     const env = envArg && typeof envArg === "object" && !Array.isArray(envArg) ? (envArg as Record<string, string>) : undefined;
     const result = await execa("bash", ["-lc", command], { cwd: workdir, env, reject: false });

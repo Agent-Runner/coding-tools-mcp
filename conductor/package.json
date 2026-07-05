@@ -27,7 +27,6 @@
     "execa": "^9.6.1",
     "ink": "^7.1.0",
     "ink-select-input": "^6.2.0",
-    "ink-text-input": "^6.0.0",
     "react": "^19.2.7",
     "zod": "^3.25.76"
   },

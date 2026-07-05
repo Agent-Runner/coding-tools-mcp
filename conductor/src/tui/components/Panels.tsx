@@ -11,7 +11,7 @@ import { glyphs, palette, type DisplayLine } from "../theme.js";
 
 /**
  * Bounded scrollable panel shown in the live region (diff, help, inspector…).
- * ArrowUp/Down and PgUp/PgDn scroll it; Esc closes it.
+ * ↑/↓ scroll by line, ←/→ (and PgUp/PgDn) by page; Esc closes it.
  */
 export function ScrollPanel({
   title,
@@ -31,7 +31,7 @@ export function ScrollPanel({
   const visible = lines.slice(start, start + bodyHeight);
   const scrollInfo =
     lines.length > bodyHeight
-      ? `  ${String(start + 1)}-${String(start + visible.length)} of ${String(lines.length)} ${glyphs.dot} ↑/↓ scroll ${glyphs.dot} Esc close`
+      ? `  ${String(start + 1)}-${String(start + visible.length)} of ${String(lines.length)} ${glyphs.dot} ↑/↓ scroll ${glyphs.dot} ←/→ page ${glyphs.dot} Esc close`
       : `  Esc close`;
   return (
     <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} height={height}>
@@ -68,6 +68,10 @@ export function helpLines(): DisplayLine[] {
   lines.push({ text: "  Tab                 complete the slash command; cycle sessions when input is empty" });
   lines.push({ text: "  Shift+Tab           cycle sessions backwards" });
   lines.push({ text: "  ↑/↓                 menu selection, panel scroll, or input history" });
+  lines.push({ text: "  ←/→                 page an open panel when the input is empty" });
+  lines.push({ text: "  Ctrl+A / Ctrl+E     move the cursor to the start / end of the line" });
+  lines.push({ text: "  Ctrl+W / Ctrl+U / Ctrl+K  delete the previous word / to line start / to line end" });
+  lines.push({ text: "  Ctrl+←/→, Alt+←/→   move the cursor by word" });
   lines.push({ text: "  Ctrl+O              open the event inspector" });
   lines.push({ text: "  Esc                 clear input / close panel / deny the pending approval" });
   lines.push({ text: "  y n 1 2 ←/→         answer permission prompts" });

@@ -67,6 +67,12 @@ Worktree creation and cleanup are the only direct git operations in the core
 runtime. Review checkpoints run git through the lower `exec_command` tool so the
 layering boundary stays intact.
 
+Managed worktrees are created inside the repository at
+`.ctc/worktrees/<session-id>` so the workspace-confined lower server can reach
+them with workspace-relative paths (it denies absolute paths). The directory is
+added to `.git/info/exclude` automatically, so it never shows up in source-repo
+status, diffs, or merges.
+
 ## M3 Surface
 
 `open_workspace` now returns a context guide in addition to workspace metadata:
@@ -129,10 +135,15 @@ repainting on a timer — so external stdio sessions stream in near real time
 without flicker.
 
 Interaction is input-first: printable keys always go to the composer, and
-typing `/` opens a navigable command menu (arrows to choose, Tab to complete,
-Enter to run). Bounded panels open over the live region for `/diff`,
+typing `/` opens a navigable command menu that fuzzy-matches as you type
+(e.g. `/dr` finds `doctor`), highlights the matched characters, and wraps at
+the ends — arrows to choose, Tab to complete, Enter to run. The composer
+supports the usual readline editing keys (Ctrl+A/E to jump to line
+start/end, Ctrl+W/U/K to delete by word or to the line edges, Ctrl+←/→ and
+Alt+←/→ to move by word). Bounded panels open over the live region for `/diff`,
 `/baton`, `/approvals`, `/config`, `/inspect` (also Ctrl+O), `/doctor`, and
-`/help`; arrows scroll them and Esc closes. Tab cycles session tabs when the
+`/help`; ↑/↓ scroll by line, ←/→ page while the composer is empty (PgUp/PgDn
+also work), and Esc closes. Tab cycles session tabs when the
 composer is empty, `/clear` resets the transcript, and Ctrl+C must be pressed
 twice to quit so a stray interrupt cannot tear down live sessions.
 
@@ -141,6 +152,22 @@ attached, Conductor pauses the request and shows an approval prompt with
 selectable options (`y`/`n`, `1`/`2`, arrows + Enter; left/right walk the
 queue when several requests are pending; Esc denies). Without an attached
 TUI, the request falls back to the lower backend's existing permission flow.
+
+`/tunnel start` exposes the MCP server over a free try.cloudflare.com tunnel.
+If `cloudflared` is already installed it starts immediately. Otherwise the TUI
+does not dead-end — it opens a picker (arrows/number keys, Enter, Esc) of the
+ways this host can run a tunnel:
+
+- **Use wrangler (no install)** — runs `wrangler tunnel quick-start <url>`,
+  using a `wrangler` on PATH or `npx wrangler` (the first `npx` run downloads
+  wrangler and can take a minute). Nothing is installed permanently.
+- **Install cloudflared** — `brew install cloudflared` on macOS when Homebrew
+  is present, otherwise the official release binary is downloaded to
+  `~/.ctc/bin/cloudflared`. Progress streams into the transcript, and the
+  managed binary is preferred on later runs, so this is a one-time step.
+
+Both providers surface the same `*.trycloudflare.com` URL. Hosts with neither
+cloudflared nor `npx` say so plainly instead of hanging.
 
 ## M5 Surface
 

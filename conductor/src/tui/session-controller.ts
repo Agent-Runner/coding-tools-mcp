@@ -21,6 +21,15 @@ import {
   SessionEventBus,
   type SessionEventSink,
 } from "../sessions/events.js";
+import {
+  availableTunnelMethods,
+  cloudflaredCommand,
+  defaultInstallDeps,
+  installCloudflared,
+  type CloudflaredInstallPlan,
+  type TunnelCommand,
+  type TunnelMethod,
+} from "../tunnel/install.js";
 import { TunnelManager, type TunnelState } from "../tunnel/manager.js";
 import {
   closeWorkspaceSession,
@@ -53,6 +62,8 @@ export interface TuiTunnelResult {
   state: TunnelState;
   message: string;
 }
+
+export type { TunnelMethod };
 
 interface HostedSession {
   runtime: ConductorRuntime;
@@ -145,16 +156,27 @@ export class TuiSessionController {
     else await respondToFileApproval(sessionId, requestId, approved);
   }
 
-  async startTunnel(): Promise<TuiTunnelResult> {
+  /** Ordered ways to start a tunnel on this host (run cloudflared/wrangler, or install). */
+  tunnelMethods(): TunnelMethod[] {
+    return availableTunnelMethods();
+  }
+
+  /** Install cloudflared per the platform plan, returning its ready run command. */
+  async installCloudflaredProvider(plan: CloudflaredInstallPlan, onLog: (line: string) => void): Promise<TunnelCommand> {
+    const path = await installCloudflared(plan, defaultInstallDeps(onLog));
+    return cloudflaredCommand(path);
+  }
+
+  async startTunnel(command: TunnelCommand): Promise<TuiTunnelResult> {
     const http = await this.ensureHttpServer();
     if (!http.origin) throw new Error("HTTP MCP server is not listening.");
-    const state = await this.tunnel.start(http.origin);
+    const state = await this.tunnel.start(http.origin, command);
     http.setBearerToken(state.token);
     const sampleSession = this.sessions.keys().next().value;
     const route = `${state.publicUrl ?? "<public-url>"}/mcp/${sampleSession ?? "<session-id>"}`;
     return {
       state,
-      message: `Tunnel ready: ${route} with Authorization: Bearer ${state.token ?? "<token>"}`,
+      message: `Tunnel ready via ${command.label}: ${route} with Authorization: Bearer ${state.token ?? "<token>"}`,
     };
   }
 
