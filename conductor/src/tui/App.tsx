@@ -103,10 +103,18 @@ export function TuiApp({
   const [epoch, setEpoch] = useState(0);
 
   const [input, setInput] = useState("");
+  const [composerEpoch, setComposerEpoch] = useState(0);
   const [menuIndex, setMenuIndex] = useState(0);
   const [history, setHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState<number | undefined>(undefined);
   const historyDraft = useRef("");
+
+  // Programmatic replacements (Tab completion, history) remount the text input via
+  // composerEpoch so the cursor lands at the end instead of staying mid-string.
+  const replaceInput = (value: string): void => {
+    setInput(value);
+    setComposerEpoch((epoch) => epoch + 1);
+  };
 
   const [panel, setPanel] = useState<PanelState | undefined>(undefined);
   const [scroll, setScroll] = useState(0);
@@ -289,18 +297,18 @@ export function TuiApp({
       historyDraft.current = input;
       const index = history.length - 1;
       setHistoryIndex(index);
-      setInput(history[index] ?? "");
+      replaceInput(history[index] ?? "");
       return;
     }
     const next = historyIndex + direction;
     if (next < 0) return;
     if (next >= history.length) {
       setHistoryIndex(undefined);
-      setInput(historyDraft.current);
+      replaceInput(historyDraft.current);
       return;
     }
     setHistoryIndex(next);
-    setInput(history[next] ?? "");
+    replaceInput(history[next] ?? "");
   };
 
   const completeSelected = (): void => {
@@ -308,7 +316,7 @@ export function TuiApp({
     if (!selected) return;
     const parsed = safeParse(input);
     if (parsed && parsed.name === selected.name && parsed.args.length) return;
-    setInput(`/${selected.name} `);
+    replaceInput(`/${selected.name} `);
     setMenuIndex(0);
   };
 
@@ -704,6 +712,7 @@ export function TuiApp({
         ) : null}
         <Composer
           value={input}
+          inputKey={composerEpoch}
           onChange={handleInputChange}
           onSubmit={submitInput}
           placeholder={onboarding ? onboardingDefault(onboarding) : "/ for commands"}

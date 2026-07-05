@@ -7,12 +7,15 @@ import { glyphs, palette } from "../theme.js";
 
 export function Composer({
   value,
+  inputKey,
   onChange,
   onSubmit,
   placeholder,
   focus,
 }: {
   value: string;
+  /** Bumped whenever the value is replaced programmatically (completion, history). */
+  inputKey: number;
   onChange: (value: string) => void;
   onSubmit: (value: string) => void;
   placeholder: string;
@@ -21,7 +24,16 @@ export function Composer({
   return (
     <Box borderStyle="round" borderColor={focus ? palette.accent : "gray"} paddingX={1}>
       <Text color={palette.accent}>{glyphs.prompt} </Text>
-      <TextInput value={value} onChange={onChange} onSubmit={onSubmit} placeholder={placeholder} focus={focus} />
+      {/* ink-text-input keeps its cursor offset when the value prop changes from outside,
+          which strands the cursor mid-string; remounting resets it to the end. */}
+      <TextInput
+        key={inputKey}
+        value={value}
+        onChange={onChange}
+        onSubmit={onSubmit}
+        placeholder={placeholder}
+        focus={focus}
+      />
     </Box>
   );
 }
