@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "ctc command alias for coding-tools-conductor, the Coding Tools Conductor CLI/TUI.",
   "type": "module",
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "node": ">=20"
   },

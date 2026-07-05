@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "A TypeScript orchestration layer for coding-tools-mcp.",
   "type": "module",
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "node": ">=20"
   },
