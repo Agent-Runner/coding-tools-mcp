@@ -67,6 +67,12 @@ Worktree creation and cleanup are the only direct git operations in the core
 runtime. Review checkpoints run git through the lower `exec_command` tool so the
 layering boundary stays intact.
 
+Managed worktrees are created inside the repository at
+`.ctc/worktrees/<session-id>` so the workspace-confined lower server can reach
+them with workspace-relative paths (it denies absolute paths). The directory is
+added to `.git/info/exclude` automatically, so it never shows up in source-repo
+status, diffs, or merges.
+
 ## M3 Surface
 
 `open_workspace` now returns a context guide in addition to workspace metadata:

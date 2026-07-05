@@ -11,8 +11,13 @@ export interface TunnelState {
 }
 
 export class TunnelManager {
+  private readonly binary: string;
   private process?: ChildProcessWithoutNullStreams;
   private state: TunnelState = { running: false, provider: "cloudflared", message: "tunnel:off" };
+
+  constructor(options: { binary?: string } = {}) {
+    this.binary = options.binary ?? "cloudflared";
+  }
 
   status(): TunnelState {
     return { ...this.state };
@@ -21,7 +26,7 @@ export class TunnelManager {
   async start(originUrl: string): Promise<TunnelState> {
     if (this.process && this.state.running) return this.status();
     const token = randomBytes(24).toString("base64url");
-    const child = spawn("cloudflared", ["tunnel", "--url", originUrl], { stdio: "pipe", env: process.env });
+    const child = spawn(this.binary, ["tunnel", "--url", originUrl], { stdio: "pipe", env: process.env });
     this.process = child;
 
     const publicUrl = await new Promise<string>((resolve, reject) => {
@@ -38,7 +43,7 @@ export class TunnelManager {
       const onError = (error: Error): void => {
         clearTimeout(timeout);
         cleanup();
-        reject(new Error(`cloudflared failed to start: ${error.message}`));
+        reject(new Error(spawnFailureMessage(this.binary, error)));
       };
       const onExit = (): void => {
         clearTimeout(timeout);
@@ -88,4 +93,16 @@ export class TunnelManager {
 
 export function parseCloudflaredUrl(text: string): string | undefined {
   return /https:\/\/[-a-zA-Z0-9.]+\.trycloudflare\.com/.exec(text)?.[0];
+}
+
+export function spawnFailureMessage(binary: string, error: Error): string {
+  if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+    return (
+      `${binary} is not installed or not on PATH. ` +
+      "Install cloudflared (macOS: brew install cloudflared; other platforms: " +
+      "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) " +
+      "and run /tunnel start again, or disable tunnels with /config tunnel none."
+    );
+  }
+  return `${binary} failed to start: ${error.message}`;
 }

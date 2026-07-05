@@ -1,10 +1,10 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, rmdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { BackendClient } from "../proxy/client.js";
-import { ctcHome, profilePathForRepo, readProfileForPath } from "../profiles/config.js";
+import { profilePathForRepo, readProfileForPath } from "../profiles/config.js";
 import type { WorkspaceProfile } from "../shared/types.js";
 
 const execFileAsync = promisify(execFile);
@@ -40,13 +40,13 @@ export async function runDoctor(path: string | undefined, options: DoctorOptions
 
   if (!profile) {
     checks.push(await checkGitVersion());
-    checks.push(await checkWorktreeDirectory());
+    checks.push(await checkWorktreeDirectory(repoPath));
     return checks;
   }
 
   checks.push(checkTokenReference(profile));
   checks.push(await checkGitVersion());
-  checks.push(await checkWorktreeDirectory());
+  checks.push(await checkWorktreeDirectory(repoPath));
 
   if (options.skipBackend) {
     checks.push({ name: "backend", status: "warn", detail: "Skipped by --skip-backend." });
@@ -96,13 +96,21 @@ async function checkBackend(profile: WorkspaceProfile): Promise<DoctorCheck> {
   }
 }
 
-async function checkWorktreeDirectory(): Promise<DoctorCheck> {
-  const dir = join(ctcHome(), "worktrees");
+async function checkWorktreeDirectory(repoPath: string): Promise<DoctorCheck> {
+  // Managed worktrees live inside the repository at .ctc/worktrees so the
+  // workspace-confined backend can reach them with relative paths.
+  const ctcDir = join(repoPath, ".ctc");
+  const dir = join(ctcDir, "worktrees");
   const probe = join(dir, ".doctor-write-test");
+  const preexisting = existsSync(dir);
   try {
     await mkdir(dir, { recursive: true });
     await writeFile(probe, "ok\n", "utf8");
     await rm(probe, { force: true });
+    if (!preexisting) {
+      await rmdir(dir).catch(() => undefined);
+      await rmdir(ctcDir).catch(() => undefined);
+    }
     return { name: "worktrees", status: "pass", detail: `${dir} is writable.` };
   } catch (error) {
     return { name: "worktrees", status: "fail", detail: errorMessage(error) };
