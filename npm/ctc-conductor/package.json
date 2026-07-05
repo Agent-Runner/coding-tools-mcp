@@ -1,7 +1,7 @@
 {
-  "name": "ctc-cli",
+  "name": "ctc-conductor",
   "version": "0.1.0",
-  "description": "ctc command alias for coding-tools-conductor, the Coding Tools Conductor CLI/TUI.",
+  "description": "ctc command alias for coding-tools-conductor, the Coding Tools Conductor CLI/TUI. Run with npx ctc-conductor.",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",
   "engines": {
@@ -28,7 +28,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/xyTom/coding-tools-mcp.git",
-    "directory": "npm/ctc-cli"
+    "directory": "npm/ctc-conductor"
   },
   "homepage": "https://github.com/xyTom/coding-tools-mcp/tree/main/conductor#readme",
   "bugs": {
