@@ -1,9 +1,10 @@
 import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { cloudflaredCommand, type TunnelCommand } from "./install.js";
 
 export interface TunnelState {
   running: boolean;
-  provider: "cloudflared";
+  provider: "cloudflared" | "wrangler";
   originUrl?: string;
   publicUrl?: string;
   token?: string;
@@ -23,16 +24,16 @@ export class TunnelManager {
     return { ...this.state };
   }
 
-  async start(originUrl: string, binary: string = this.binary): Promise<TunnelState> {
+  async start(originUrl: string, command: TunnelCommand = cloudflaredCommand(this.binary)): Promise<TunnelState> {
     if (this.process && this.state.running) return this.status();
     const token = randomBytes(24).toString("base64url");
-    const child = spawn(binary, ["tunnel", "--url", originUrl], { stdio: "pipe", env: process.env });
+    const child = spawn(command.command, [...command.baseArgs, originUrl], { stdio: "pipe", env: process.env });
     this.process = child;
 
     const publicUrl = await new Promise<string>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        reject(new Error("Timed out waiting for cloudflared tunnel URL."));
-      }, 15_000);
+        reject(new Error(`Timed out waiting for a tunnel URL from ${command.label}.`));
+      }, command.startupTimeoutMs);
       const onData = (chunk: Buffer): void => {
         const url = parseCloudflaredUrl(chunk.toString("utf8"));
         if (!url) return;
@@ -43,12 +44,12 @@ export class TunnelManager {
       const onError = (error: Error): void => {
         clearTimeout(timeout);
         cleanup();
-        reject(new Error(spawnFailureMessage(binary, error)));
+        reject(new Error(spawnFailureMessage(command.label, error)));
       };
       const onExit = (): void => {
         clearTimeout(timeout);
         cleanup();
-        reject(new Error("cloudflared exited before producing a tunnel URL."));
+        reject(new Error(`${command.label} exited before producing a tunnel URL.`));
       };
       const cleanup = (): void => {
         child.stdout.off("data", onData);
@@ -68,12 +69,12 @@ export class TunnelManager {
     child.once("exit", () => {
       if (this.process === child) {
         this.process = undefined;
-        this.state = { running: false, provider: "cloudflared", message: "tunnel:off" };
+        this.state = { running: false, provider: command.provider, message: "tunnel:off" };
       }
     });
     this.state = {
       running: true,
-      provider: "cloudflared",
+      provider: command.provider,
       originUrl,
       publicUrl,
       token,
@@ -86,7 +87,7 @@ export class TunnelManager {
     const child = this.process;
     this.process = undefined;
     if (child && child.exitCode === null && child.signalCode === null) child.kill();
-    this.state = { running: false, provider: "cloudflared", message: "tunnel:off" };
+    this.state = { running: false, provider: this.state.provider, message: "tunnel:off" };
     return Promise.resolve(this.status());
   }
 }
@@ -95,14 +96,9 @@ export function parseCloudflaredUrl(text: string): string | undefined {
   return /https:\/\/[-a-zA-Z0-9.]+\.trycloudflare\.com/.exec(text)?.[0];
 }
 
-export function spawnFailureMessage(binary: string, error: Error): string {
+export function spawnFailureMessage(label: string, error: Error): string {
   if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-    return (
-      `${binary} is not installed or not on PATH. ` +
-      "Install cloudflared (macOS: brew install cloudflared; other platforms: " +
-      "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) " +
-      "and run /tunnel start again, or disable tunnels with /config tunnel none."
-    );
+    return `${label} was not found — it is not installed or not on PATH.`;
   }
-  return `${binary} failed to start: ${error.message}`;
+  return `${label} failed to start: ${error.message}`;
 }

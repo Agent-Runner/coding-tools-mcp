@@ -96,6 +96,79 @@ export function describeInstallPlan(plan: CloudflaredInstallPlan): string {
   }
 }
 
+/** A ready-to-spawn tunnel provider command. */
+export interface TunnelCommand {
+  provider: "cloudflared" | "wrangler";
+  command: string;
+  baseArgs: string[];
+  startupTimeoutMs: number;
+  label: string;
+}
+
+export function cloudflaredCommand(binary: string): TunnelCommand {
+  return { provider: "cloudflared", command: binary, baseArgs: ["tunnel", "--url"], startupTimeoutMs: 20_000, label: "cloudflared" };
+}
+
+/**
+ * `wrangler tunnel quick-start <url>` runs the same free try.cloudflare.com
+ * tunnel without a separate install: a wrangler on PATH is used directly,
+ * otherwise `npx` fetches it on demand (slower on first run).
+ */
+export function wranglerCommand(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): TunnelCommand {
+  const direct = findOnPath("wrangler", env, platform);
+  if (direct) {
+    return { provider: "wrangler", command: direct, baseArgs: ["tunnel", "quick-start"], startupTimeoutMs: 90_000, label: "wrangler" };
+  }
+  return {
+    provider: "wrangler",
+    command: "npx",
+    baseArgs: ["-y", "wrangler", "tunnel", "quick-start"],
+    startupTimeoutMs: 90_000,
+    label: "npx wrangler",
+  };
+}
+
+export function wranglerAvailable(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): boolean {
+  return Boolean(findOnPath("wrangler", env, platform) ?? findOnPath("npx", env, platform));
+}
+
+export type TunnelMethod =
+  | { id: "cloudflared"; kind: "run"; label: string; command: TunnelCommand; note?: string }
+  | { id: "wrangler"; kind: "run"; label: string; command: TunnelCommand; note?: string }
+  | { id: "install-cloudflared"; kind: "install"; label: string; plan: CloudflaredInstallPlan; note?: string };
+
+/**
+ * Ordered tunnel start options for the current host: an already-usable
+ * cloudflared first, then the zero-install wrangler path, then installing
+ * cloudflared. Empty only when nothing is available and nothing can be built.
+ */
+export function availableTunnelMethods(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): TunnelMethod[] {
+  const methods: TunnelMethod[] = [];
+  const resolved = resolveCloudflared(env, platform);
+  if (resolved.installed) {
+    methods.push({ id: "cloudflared", kind: "run", label: "Use cloudflared", command: cloudflaredCommand(resolved.binary) });
+  }
+  if (wranglerAvailable(env, platform)) {
+    const command = wranglerCommand(env, platform);
+    methods.push({
+      id: "wrangler",
+      kind: "run",
+      label: "Use wrangler (no install)",
+      note: command.command === "npx" ? "Runs `npx wrangler`; the first run downloads wrangler and can take a minute." : undefined,
+      command,
+    });
+  }
+  const plan = cloudflaredInstallPlan(platform, arch, Boolean(findOnPath("brew", env, platform)));
+  if (plan.method !== "unsupported") {
+    methods.push({ id: "install-cloudflared", kind: "install", label: "Install cloudflared", note: describeInstallPlan(plan), plan });
+  }
+  return methods;
+}
+
 /**
  * Install cloudflared per the plan and return the path to run. Network and
  * subprocess access are injected so the orchestration is unit-testable.
