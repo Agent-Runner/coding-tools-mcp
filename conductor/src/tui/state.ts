@@ -6,6 +6,8 @@ import { ctcHome } from "../profiles/config.js";
 import { listPendingApprovals, type PermissionApprovalRequest } from "../shared/approvals.js";
 import type {
   ConductorEvent,
+  ExtraServerState,
+  McpServerSource,
   ReviewCheckpointEvent,
   SessionStartedEvent,
   ToolCallEvent,
@@ -26,6 +28,18 @@ export interface TuiSnapshot {
   baton?: BatonBundle;
   pendingApprovals: PermissionApprovalRequest[];
   allPendingApprovals: PermissionApprovalRequest[];
+  mcpServers: McpServerStatusSnapshot[];
+}
+
+export interface McpServerStatusSnapshot {
+  name: string;
+  state: ExtraServerState;
+  source?: McpServerSource;
+  toolCount?: number;
+  lastError?: string;
+  untrusted?: boolean;
+  droppedTools?: string[];
+  lastChangedTs?: string;
 }
 
 export interface TuiSessionSummary {
@@ -60,6 +74,7 @@ export async function loadTuiSnapshot(options: LoadTuiSnapshotOptions = {}): Pro
       checkpoints: [],
       pendingApprovals: [],
       allPendingApprovals,
+      mcpServers: [],
     };
   }
   const sessionId = sessionIdFromLogPath(logPath);
@@ -82,7 +97,46 @@ export async function loadTuiSnapshot(options: LoadTuiSnapshotOptions = {}): Pro
     baton,
     pendingApprovals,
     allPendingApprovals,
+    mcpServers: deriveMcpServers(events),
   };
+}
+
+/**
+ * Fold the session's mcp server history into one row per server: the last
+ * session_started summary is the baseline, later server_status events update
+ * it. Exported for tests.
+ */
+export function deriveMcpServers(events: ConductorEvent[]): McpServerStatusSnapshot[] {
+  const servers = new Map<string, McpServerStatusSnapshot>();
+  for (const event of events) {
+    if (event.type === "session_started") {
+      servers.clear();
+      for (const summary of event.mcpServers ?? []) {
+        servers.set(summary.name, {
+          name: summary.name,
+          state: summary.state,
+          source: summary.source,
+          toolCount: summary.toolCount,
+          lastError: summary.error,
+          untrusted: summary.untrusted,
+        });
+      }
+      continue;
+    }
+    if (event.type !== "server_status") continue;
+    const previous = servers.get(event.server);
+    servers.set(event.server, {
+      name: event.server,
+      state: event.state,
+      source: event.source ?? previous?.source,
+      toolCount: event.toolCount ?? (event.state === "connected" ? previous?.toolCount : undefined),
+      lastError: event.error,
+      untrusted: event.untrusted,
+      droppedTools: event.droppedTools ?? previous?.droppedTools,
+      lastChangedTs: event.ts,
+    });
+  }
+  return [...servers.values()];
 }
 
 export async function listTuiSessions(): Promise<TuiSessionSummary[]> {
@@ -204,7 +258,8 @@ function parseEvent(line: string): ConductorEvent | undefined {
       type === "tool_call" ||
       type === "review_checkpoint" ||
       type === "session_started" ||
-      type === "permission_request"
+      type === "permission_request" ||
+      type === "server_status"
     ) {
       return parsed as unknown as ConductorEvent;
     }

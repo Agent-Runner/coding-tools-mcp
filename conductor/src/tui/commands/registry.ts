@@ -26,6 +26,11 @@ export interface ParsedTunnelCommand {
   action: "start" | "stop" | "status";
 }
 
+export interface ParsedMcpCommand {
+  action: "status" | "enable" | "disable" | "reconnect" | "trust";
+  server?: string;
+}
+
 export const slashCommands: SlashCommand[] = [
   {
     name: "help",
@@ -119,6 +124,12 @@ export const slashCommands: SlashCommand[] = [
     description: "View or update the current repo profile.",
     stage: "available",
   },
+  {
+    name: "mcp",
+    usage: "/mcp [enable|disable|reconnect|trust <name>]",
+    description: "Show and manage additional MCP servers for the active session.",
+    stage: "available",
+  },
 ];
 
 export function parseSlashCommand(input: string): ParsedSlashCommand | undefined {
@@ -171,6 +182,21 @@ export function parseTunnelCommand(args: string[]): ParsedTunnelCommand {
     throw new Error("/tunnel action must be start, stop, or status.");
   }
   return { action };
+}
+
+export function parseMcpCommand(args: string[]): ParsedMcpCommand {
+  const action = args[0] ?? "status";
+  if (args.length > 2) throw new Error("/mcp accepts an action and a server name at most.");
+  if (action === "status") {
+    if (args.length > 1) throw new Error("/mcp status takes no server name.");
+    return { action };
+  }
+  if (action !== "enable" && action !== "disable" && action !== "reconnect" && action !== "trust") {
+    throw new Error("/mcp action must be enable, disable, reconnect, or trust.");
+  }
+  const server = args[1];
+  if (action === "trust" && !server) throw new Error("/mcp trust requires a server name.");
+  return { action, server };
 }
 
 export function findSlashCommand(name: string): SlashCommand | undefined {

@@ -6,15 +6,17 @@ import {
   ctcHome,
   defaultBackendForPath,
   readProfileForPath,
+  resolveProfileTargetPath,
   resolveRuntimeOptions,
   writeProfileForPath,
 } from "../profiles/config.js";
+import { mcpServerFingerprint, readWorkspaceMcpServers, WORKSPACE_MCP_FILE } from "../profiles/mcp.js";
 import { ConductorHttpServer } from "../server/http.js";
 import { ConductorRuntime } from "../server/mcp.js";
 import { MemoryApprovalBroker, respondToApproval as respondToFileApproval } from "../shared/approvals.js";
 import { JsonlEventLog } from "../shared/logging.js";
 import { summarizeResult } from "../shared/summarize.js";
-import type { BackendStatus, WorkspaceMode, WorkspaceProfile, WorkspaceState } from "../shared/types.js";
+import type { BackendStatus, ExtraServerStatus, WorkspaceMode, WorkspaceProfile, WorkspaceState } from "../shared/types.js";
 import {
   CompositeSessionEventSink,
   JsonlSessionEventSink,
@@ -230,11 +232,59 @@ export class TuiSessionController {
     return { text: formatProfile(profile), changed: true };
   }
 
+  /** Extra MCP server statuses for a TUI-hosted session; undefined for external sessions. */
+  mcpStatuses(sessionId: string | undefined): ExtraServerStatus[] | undefined {
+    if (!sessionId) return undefined;
+    return this.sessions.get(sessionId)?.runtime.mcpStatuses();
+  }
+
+  async mcpSetEnabled(sessionId: string | undefined, name: string, enabled: boolean): Promise<ExtraServerStatus> {
+    return this.requireHostedRuntime(sessionId).setMcpEnabled(name, enabled);
+  }
+
+  async mcpReconnect(sessionId: string | undefined, name: string): Promise<ExtraServerStatus> {
+    return this.requireHostedRuntime(sessionId).reconnectMcp(name);
+  }
+
+  /**
+   * Record trust for a workspace-declared server in the profile (fingerprint
+   * of the current entry), then connect it live when the session is hosted.
+   */
+  async mcpTrust(
+    path: string | undefined,
+    sessionId: string | undefined,
+    name: string,
+  ): Promise<ExtraServerStatus | undefined> {
+    const targetPath = await resolveProfileTargetPath(path ?? process.cwd());
+    const workspace = await readWorkspaceMcpServers(targetPath);
+    const entry = workspace.servers[name];
+    if (!entry) throw new Error(`No MCP server named ${name} in ${WORKSPACE_MCP_FILE}.`);
+    const existing = await readProfileForPath(targetPath).catch(() => undefined);
+    const profile: WorkspaceProfile = existing ?? {
+      repoPath: targetPath,
+      backend: defaultBackendForPath(targetPath),
+      defaultMode: "worktree",
+      permissionMode: "safe",
+      tunnel: { provider: "none" },
+    };
+    profile.trustedWorkspaceMcp = { ...(profile.trustedWorkspaceMcp ?? {}), [name]: mcpServerFingerprint(entry) };
+    await writeProfileForPath(targetPath, profile);
+    const hosted = sessionId ? this.sessions.get(sessionId) : undefined;
+    if (!hosted) return undefined;
+    return hosted.runtime.trustMcp(name);
+  }
+
   async closeClients(): Promise<void> {
     await this.stopTunnel().catch(() => undefined);
     await this.http?.close().catch(() => undefined);
     await Promise.all([...this.sessions.values()].map((session) => session.runtime.stop().catch(() => undefined)));
     this.sessions.clear();
+  }
+
+  private requireHostedRuntime(sessionId: string | undefined): ConductorRuntime {
+    const hosted = sessionId ? this.sessions.get(sessionId) : undefined;
+    if (!hosted) throw new Error("/mcp changes apply to TUI-owned sessions; this session is external and read-only.");
+    return hosted.runtime;
   }
 
   private async resume(resume: string): Promise<CreateTuiSessionResult> {
@@ -343,6 +393,8 @@ function resultText(result: CallToolResult): string | undefined {
 function formatProfile(profile: WorkspaceProfile): string {
   const allow = profile.toolPolicy?.allow?.join(", ") || "<any>";
   const deny = profile.toolPolicy?.deny?.join(", ") || "<none>";
+  const mcpServers = Object.keys(profile.mcpServers ?? {});
+  const trustedMcp = Object.keys(profile.trustedWorkspaceMcp ?? {});
   return [
     `repo: ${profile.repoPath}`,
     `backend: ${profile.backend.type}`,
@@ -352,6 +404,8 @@ function formatProfile(profile: WorkspaceProfile): string {
     `tunnel: ${profile.tunnel?.provider ?? "none"}`,
     `allow: ${allow}`,
     `deny: ${deny}`,
+    `mcp: ${mcpServers.length ? mcpServers.join(", ") : "<none>"}`,
+    `trusted workspace mcp: ${trustedMcp.length ? trustedMcp.join(", ") : "<none>"}`,
   ].join("\n");
 }
 

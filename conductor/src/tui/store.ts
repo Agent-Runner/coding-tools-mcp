@@ -155,6 +155,7 @@ export function fingerprintSnapshot(snapshot: TuiSnapshot): string {
       ]),
     approvals: snapshot.allPendingApprovals.map((approval) => approval.id),
     checkpoints: snapshot.checkpoints.length,
+    mcp: snapshot.mcpServers.map((server) => [server.name, server.state, server.toolCount ?? null]),
     workspace: snapshot.workspace ? [snapshot.workspace.activePath, snapshot.workspace.closedAt ?? null] : null,
     baton: snapshot.baton
       ? [snapshot.baton.status?.updatedAt ?? null, snapshot.baton.plan?.content.length ?? 0, snapshot.baton.report?.content.length ?? 0]
@@ -171,5 +172,6 @@ export function emptySnapshot(initialWorkspacePath?: string): TuiSnapshot {
     checkpoints: [],
     pendingApprovals: [],
     allPendingApprovals: [],
+    mcpServers: [],
   };
 }

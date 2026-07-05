@@ -20,11 +20,18 @@ import {
   batonWriteReportSchema,
 } from "../baton/protocol.js";
 import { BackendClient, BackendDisconnectedError } from "../proxy/client.js";
+import { McpServerPool } from "../proxy/pool.js";
 import { ReviewManager, showChangesSchema } from "../review/checkpoints.js";
 import { FileApprovalBroker, type ApprovalBroker } from "../shared/approvals.js";
 import { JsonlEventLog } from "../shared/logging.js";
 import { summarizeArgs, summarizeResult } from "../shared/summarize.js";
-import type { RuntimeOptions, ToolPolicy } from "../shared/types.js";
+import type {
+  ExtraServerStatus,
+  McpConfigIssue,
+  RuntimeOptions,
+  SessionMcpServerSummary,
+  ToolPolicy,
+} from "../shared/types.js";
 import { JsonlSessionEventSink, type SessionEventSink } from "../sessions/events.js";
 import { closeWorkspaceSchema, openWorkspaceSchema, WorkspaceManager } from "../workspace/manager.js";
 
@@ -47,6 +54,9 @@ export interface ConductorRuntimeHooks {
 
 export class ConductorRuntime {
   private readonly backend: BackendClient;
+  private readonly pool: McpServerPool;
+  private readonly mcpConfigIssues: McpConfigIssue[];
+  private readonly liveServers = new Set<Server>();
   private readonly events: SessionEventSink;
   private readonly approvals: ApprovalBroker;
   private readonly toolPolicy: ToolPolicy;
@@ -62,6 +72,13 @@ export class ConductorRuntime {
 
   constructor(options: RuntimeOptions, hooks: ConductorRuntimeHooks = {}) {
     this.backend = new BackendClient(options.backend);
+    this.pool = new McpServerPool(options.mcpServers, {
+      onStatus: (status) => void this.recordServerStatus(status),
+      onToolsChanged: () => {
+        this.broadcastToolListChanged();
+      },
+    });
+    this.mcpConfigIssues = options.mcpConfigIssues;
     this.events = hooks.events ?? new JsonlSessionEventSink(new JsonlEventLog(options.logPath, options.conciseLogs));
     this.approvals = hooks.approvals ?? new FileApprovalBroker();
     this.toolPolicy = options.toolPolicy;
@@ -83,6 +100,7 @@ export class ConductorRuntime {
 
   async start(): Promise<void> {
     await this.backend.start();
+    await this.pool.start();
     await this.events.append({
       ts: new Date().toISOString(),
       sessionId: this.sessionId,
@@ -93,15 +111,43 @@ export class ConductorRuntime {
       backendType: this.backendType,
       backendStatus: this.backend.status(),
       logPath: this.events.path ?? "",
+      ...(this.pool.size() ? { mcpServers: this.pool.statuses().map(toSessionMcpSummary) } : {}),
     });
+    for (const issue of this.mcpConfigIssues) {
+      await this.events.append({
+        ts: new Date().toISOString(),
+        sessionId: this.sessionId,
+        type: "server_status",
+        server: issue.name ?? ".ctc/mcp.json",
+        state: "error",
+        error: issue.message,
+      });
+    }
   }
 
   async stop(): Promise<void> {
+    await this.pool.close();
     await this.backend.close();
   }
 
   backendStatus() {
     return this.backend.status();
+  }
+
+  mcpStatuses(): ExtraServerStatus[] {
+    return this.pool.statuses();
+  }
+
+  async setMcpEnabled(name: string, enabled: boolean): Promise<ExtraServerStatus> {
+    return this.pool.setEnabled(name, enabled);
+  }
+
+  async reconnectMcp(name: string): Promise<ExtraServerStatus> {
+    return this.pool.reconnect(name);
+  }
+
+  async trustMcp(name: string): Promise<ExtraServerStatus> {
+    return this.pool.trust(name);
   }
 
   id(): string {
@@ -110,7 +156,7 @@ export class ConductorRuntime {
 
   createServer(): Server {
     const capabilities: ServerCapabilities = {
-      tools: { listChanged: false },
+      tools: { listChanged: true },
       ...(this.chatGptAdapterEnabled ? { resources: { listChanged: false } } : {}),
     };
     const server = new Server(
@@ -124,14 +170,17 @@ export class ConductorRuntime {
 
     if (this.chatGptAdapterEnabled) registerChatGptAdapter(server);
 
+    // Track live instances so extra-server tool changes can broadcast
+    // notifications/tools/list_changed to every connected client. A Server
+    // whose HTTP handshake fails before connect() never fires onclose and
+    // leaks one Set entry; that is bounded and rare, evictions do close.
+    this.liveServers.add(server);
+    server.onclose = () => {
+      this.liveServers.delete(server);
+    };
+
     server.setRequestHandler(ListToolsRequestSchema, () => ({
-      tools: this.decorateTools([
-        ...conductorTools,
-        ...this.backend
-          .tools()
-          .filter((tool) => isToolAllowed(tool.name, this.toolPolicy))
-          .filter((tool) => !conductorToolNames.has(tool.name)),
-      ]),
+      tools: this.decorateTools(this.exposedTools()),
     }));
 
     server.setRequestHandler(CallToolRequestSchema, (request): Promise<CallToolResult> => {
@@ -149,20 +198,94 @@ export class ConductorRuntime {
       return result;
     }
 
+    let attributedServer: string | undefined;
     try {
-      const result = conductorToolNames.has(name)
-        ? await this.callConductorTool(name, args)
-        : name === "request_permissions"
-          ? await this.callPermissionRequest(args)
-        : await this.backend.callTool(name, args);
-      await this.recordToolCall(name, args, started, result);
+      let result: CallToolResult;
+      if (conductorToolNames.has(name)) {
+        result = await this.callConductorTool(name, args);
+      } else if (name === "request_permissions") {
+        result = await this.callPermissionRequest(args);
+      } else {
+        const extra = this.pool.resolve(name);
+        const shadowedByPrimary = extra && this.backend.tools().some((tool) => tool.name === name);
+        if (extra && !shadowedByPrimary) {
+          attributedServer = extra.server;
+          result = await this.pool.callTool(extra.server, extra.tool, args);
+        } else {
+          result = await this.backend.callTool(name, args);
+        }
+      }
+      await this.recordToolCall(name, args, started, result, undefined, attributedServer);
       return result;
     } catch (error) {
       const message = error instanceof BackendDisconnectedError ? error.message : errorMessage(error);
       const result = errorResult(message);
-      await this.recordToolCall(name, args, started, result, message);
+      await this.recordToolCall(name, args, started, result, message, attributedServer);
       return result;
     }
+  }
+
+  /**
+   * Exposure precedence: conductor tools, then unprefixed primary tools, then
+   * `<server>__` prefixed extras; first writer wins on a name and the global
+   * tool policy applies to the exposed (prefixed) name.
+   */
+  private exposedTools(): Tool[] {
+    const exposed: Tool[] = [...conductorTools];
+    const seen = new Set<string>(conductorToolNames);
+    for (const tool of this.backend.tools()) {
+      if (seen.has(tool.name) || !isToolAllowed(tool.name, this.toolPolicy)) continue;
+      seen.add(tool.name);
+      exposed.push(tool);
+    }
+    for (const tool of this.pool.tools()) {
+      if (seen.has(tool.name) || !isToolAllowed(tool.name, this.toolPolicy)) continue;
+      seen.add(tool.name);
+      exposed.push(tool);
+    }
+    return exposed;
+  }
+
+  private broadcastToolListChanged(): void {
+    for (const server of this.liveServers) {
+      try {
+        void Promise.resolve(server.sendToolListChanged()).catch(() => undefined);
+      } catch {
+        // Not connected yet or already closing; skip.
+      }
+    }
+  }
+
+  private async recordServerStatus(status: ExtraServerStatus): Promise<void> {
+    if (status.state === "connecting") return;
+    const droppedTools = status.state === "connected" ? this.droppedToolsFor(status.name) : undefined;
+    await this.events.append({
+      ts: new Date().toISOString(),
+      sessionId: this.sessionId,
+      type: "server_status",
+      server: status.name,
+      state: status.state,
+      source: status.source,
+      ...(status.state === "connected" ? { toolCount: status.toolCount } : {}),
+      ...(status.lastError ? { error: status.lastError } : {}),
+      ...(status.untrusted ? { untrusted: true } : {}),
+      ...(droppedTools?.length ? { droppedTools } : {}),
+    });
+  }
+
+  /** Prefixed names from one server that lose the exposure race to conductor/primary/earlier extras. */
+  private droppedToolsFor(serverName: string): string[] {
+    const seen = new Set<string>(conductorToolNames);
+    for (const tool of this.backend.tools()) seen.add(tool.name);
+    const dropped: string[] = [];
+    for (const tool of this.pool.tools()) {
+      if (!seen.has(tool.name)) {
+        seen.add(tool.name);
+        continue;
+      }
+      if (this.pool.resolve(tool.name)?.server === serverName) dropped.push(tool.name);
+    }
+    return dropped;
   }
 
   private decorateTools(tools: readonly Tool[]): Tool[] {
@@ -265,6 +388,7 @@ export class ConductorRuntime {
     started: number,
     result: CallToolResult,
     error?: string,
+    server?: string,
   ): Promise<void> {
     const eventError = error ?? (result.isError ? summarizeResult(result, 240) : undefined);
     await this.events.append({
@@ -276,8 +400,21 @@ export class ConductorRuntime {
       resultSummary: summarizeResult(result),
       durationMs: Math.round(performance.now() - started),
       error: eventError,
+      ...(server ? { server } : {}),
     });
   }
+}
+
+function toSessionMcpSummary(status: ExtraServerStatus): SessionMcpServerSummary {
+  return {
+    name: status.name,
+    source: status.source,
+    // "connecting" cannot survive pool.start()'s allSettled barrier; map it defensively.
+    state: status.state === "connecting" ? "disconnected" : status.state,
+    ...(status.state === "connected" ? { toolCount: status.toolCount } : {}),
+    ...(status.lastError ? { error: status.lastError } : {}),
+    ...(status.untrusted ? { untrusted: true } : {}),
+  };
 }
 
 function isToolAllowed(name: string, policy: ToolPolicy): boolean {

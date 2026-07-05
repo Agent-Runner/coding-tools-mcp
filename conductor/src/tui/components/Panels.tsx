@@ -3,10 +3,11 @@ import { Box, Text } from "ink";
 import type { DoctorCheck } from "../../cli/doctor.js";
 import { formatBatonBundle } from "../../baton/protocol.js";
 import type { PermissionApprovalRequest } from "../../shared/approvals.js";
+import { WORKSPACE_MCP_FILE } from "../../profiles/mcp.js";
 import type { ConductorEvent } from "../../shared/types.js";
 import { slashCommands } from "../commands/registry.js";
 import { formatDuration, pad, timeOf, wrapText } from "../format.js";
-import type { TuiSnapshot } from "../state.js";
+import type { McpServerStatusSnapshot, TuiSnapshot } from "../state.js";
 import { glyphs, palette, type DisplayLine } from "../theme.js";
 
 /**
@@ -137,12 +138,67 @@ function inspectEventLines(event: ConductorEvent): DisplayLine[] {
       { text: `  ${event.statSummary}` },
     ];
   }
+  if (event.type === "server_status") {
+    const color = event.state === "connected" ? palette.ok : event.state === "disabled" ? undefined : palette.error;
+    const lines: DisplayLine[] = [
+      {
+        text: `${timeOf(event.ts)} mcp ${event.server} ${event.state}${event.toolCount !== undefined ? ` ${glyphs.dot} ${String(event.toolCount)} tools` : ""}`,
+        color,
+        bold: true,
+        dim: event.state === "disabled",
+      },
+    ];
+    if (event.error) for (const chunk of wrapText(event.error, 96).slice(0, 4)) lines.push({ text: `  ${chunk}`, color: palette.error });
+    if (event.droppedTools?.length) lines.push({ text: `  dropped ${event.droppedTools.join(", ")}`, dim: true });
+    return lines;
+  }
   return [
     {
       text: `${timeOf(event.ts)} session started ${glyphs.dot} ${event.workspacePath} ${glyphs.dot} ${event.backendType}`,
       bold: true,
     },
   ];
+}
+
+export function mcpPanelLines(servers: McpServerStatusSnapshot[], options: { hosted: boolean }): DisplayLine[] {
+  if (!servers.length) {
+    return [
+      { text: "No additional MCP servers configured.", dim: true },
+      { text: "" },
+      { text: `Add entries to ${WORKSPACE_MCP_FILE} in the repo or to the mcpServers`, dim: true },
+      { text: "field of the workspace profile (see README M6 Surface).", dim: true },
+    ];
+  }
+  const nameWidth = Math.max(4, ...servers.map((server) => server.name.length));
+  const stateWidth = Math.max(5, ...servers.map((server) => server.state.length));
+  const lines: DisplayLine[] = [
+    { text: `${pad("NAME", nameWidth)}  ${pad("STATE", stateWidth)}  ${pad("TOOLS", 5)}  ${pad("SOURCE", 9)}  DETAIL`, bold: true },
+  ];
+  for (const server of servers) {
+    const detail = server.untrusted
+      ? `untrusted ${glyphs.dot} /mcp trust ${server.name}`
+      : (server.lastError ?? (server.droppedTools?.length ? `dropped ${server.droppedTools.join(", ")}` : ""));
+    const tools = server.state === "connected" ? String(server.toolCount ?? 0) : "-";
+    lines.push({
+      text: `${pad(server.name, nameWidth)}  ${pad(server.state, stateWidth)}  ${pad(tools, 5)}  ${pad(server.source ?? "", 9)}  ${detail}`,
+      color:
+        server.state === "connected"
+          ? palette.ok
+          : server.state === "error" || server.state === "disconnected"
+            ? palette.error
+            : server.untrusted
+              ? palette.warn
+              : undefined,
+      dim: server.state === "disabled" && !server.untrusted,
+    });
+  }
+  lines.push({ text: "" });
+  lines.push(
+    options.hosted
+      ? { text: `/mcp enable|disable|reconnect|trust <name> ${glyphs.dot} enable/disable are session-only`, dim: true }
+      : { text: "read-only: this session runs under ctc start; manage servers from its own process.", dim: true },
+  );
+  return lines;
 }
 
 export function doctorLines(checks: DoctorCheck[]): DisplayLine[] {
