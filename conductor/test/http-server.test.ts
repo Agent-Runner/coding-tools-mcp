@@ -1,4 +1,5 @@
 import { request as httpRequest } from "node:http";
+import { connect as netConnect } from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -285,6 +286,45 @@ describe("ConductorHttpServer", () => {
     });
     expect(orphaned.status).toBe(404);
   });
+
+  it(
+    "keeps idle keep-alive connections open past Node's 5s default for tunnel connection pools",
+    { timeout: 15_000 },
+    async () => {
+      http = new ConductorHttpServer();
+      const origin = await http.listen();
+      await http.registerSession("session-a", () => createListToolsServer("server-a"));
+
+      // Tunnel providers (cloudflared pools origin sockets for ~90s) reuse idle
+      // connections; if the origin closes them first, the reused socket resets and the
+      // tunnel answers 502 Bad Gateway. Reproduce the pool: two requests on one socket
+      // with an idle gap beyond Node's 5s default.
+      const target = new URL(origin);
+      const socket = netConnect({ host: target.hostname, port: Number(target.port) });
+      await new Promise<void>((resolve, reject) => {
+        socket.once("connect", resolve);
+        socket.once("error", reject);
+      });
+      let closedByOrigin = false;
+      socket.on("close", () => {
+        closedByOrigin = true;
+      });
+      socket.on("error", () => undefined);
+      const request = `GET / HTTP/1.1\r\nHost: ${target.host}\r\nAccept: application/json\r\nConnection: keep-alive\r\n\r\n`;
+
+      socket.write(request);
+      const first = await new Promise<string>((resolve) => socket.once("data", (data) => { resolve(data.toString("utf8")); }));
+      expect(first).toContain("200 OK");
+
+      await new Promise((resolve) => setTimeout(resolve, 6_500));
+      expect(closedByOrigin).toBe(false);
+
+      socket.write(request);
+      const second = await new Promise<string>((resolve) => socket.once("data", (data) => { resolve(data.toString("utf8")); }));
+      expect(second).toContain("200 OK");
+      socket.destroy();
+    },
+  );
 });
 
 async function readSse(

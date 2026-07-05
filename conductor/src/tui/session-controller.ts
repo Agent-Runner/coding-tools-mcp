@@ -168,6 +168,11 @@ export class TuiSessionController {
   }
 
   async startTunnel(command: TunnelCommand): Promise<TuiTunnelResult> {
+    // A tunnel in front of a session-less server can only answer 503, which remote
+    // connectors surface as a failed setup. Refuse early with the fix instead.
+    if (this.sessions.size === 0) {
+      throw new Error("No live session to expose. Run /new to open a workspace session, then /tunnel start again.");
+    }
     const http = await this.ensureHttpServer();
     if (!http.origin) throw new Error("HTTP MCP server is not listening.");
     const state = await this.tunnel.start(http.origin, command);
