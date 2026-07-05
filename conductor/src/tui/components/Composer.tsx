@@ -1,9 +1,9 @@
 import React from "react";
 import { Box, Text } from "ink";
-import TextInput from "ink-text-input";
 import type { SlashCommand } from "../commands/registry.js";
 import { pad } from "../format.js";
 import { glyphs, palette } from "../theme.js";
+import { TextField } from "./TextField.js";
 
 export function Composer({
   value,
@@ -24,9 +24,9 @@ export function Composer({
   return (
     <Box borderStyle="round" borderColor={focus ? palette.accent : "gray"} paddingX={1}>
       <Text color={palette.accent}>{glyphs.prompt} </Text>
-      {/* ink-text-input keeps its cursor offset when the value prop changes from outside,
-          which strands the cursor mid-string; remounting resets it to the end. */}
-      <TextInput
+      {/* Remounting on programmatic replacements (completion, history) puts the
+          cursor at the end of the new value. */}
+      <TextField
         key={inputKey}
         value={value}
         onChange={onChange}

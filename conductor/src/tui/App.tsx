@@ -666,6 +666,16 @@ export function TuiApp({
       else navigateHistory(1);
       return;
     }
+    // ←/→ page open panels while the composer is empty (Mac keyboards have no
+    // PgUp/PgDn); with text present they keep moving the input cursor instead.
+    if (key.leftArrow && panel && !input) {
+      setScroll((value) => Math.max(0, value - pageSize));
+      return;
+    }
+    if (key.rightArrow && panel && !input) {
+      setScroll((value) => value + pageSize);
+      return;
+    }
     if (key.pageUp && panel) {
       setScroll((value) => Math.max(0, value - pageSize));
       return;
@@ -682,7 +692,7 @@ export function TuiApp({
       : approvalVisible
         ? "Answer the permission request above"
         : panel
-          ? `↑/↓ scroll ${glyphs.dot} PgUp/PgDn page ${glyphs.dot} Esc close`
+          ? `↑/↓ scroll ${glyphs.dot} ←/→ page ${glyphs.dot} Esc close`
           : menuVisible
             ? `↑/↓ choose ${glyphs.dot} Tab complete ${glyphs.dot} Enter run ${glyphs.dot} Esc clear`
             : `/ commands ${glyphs.dot} Tab sessions ${glyphs.dot} Ctrl+O inspector ${glyphs.dot} Ctrl+C twice to quit`;
