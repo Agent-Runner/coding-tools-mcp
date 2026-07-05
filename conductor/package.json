@@ -14,10 +14,29 @@
     "dist",
     "README.md"
   ],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "coding-agent",
+    "cli",
+    "tui",
+    "conductor",
+    "ctc"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xyTom/coding-tools-mcp.git",
+    "directory": "conductor"
+  },
+  "homepage": "https://github.com/xyTom/coding-tools-mcp/tree/main/conductor#readme",
+  "bugs": {
+    "url": "https://github.com/xyTom/coding-tools-mcp/issues"
+  },
   "scripts": {
     "build": "tsup src/cli/index.ts --format esm --dts --clean --splitting false",
     "dev": "tsx src/cli/index.ts",
     "lint": "eslint .",
+    "prepack": "npm run build",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
