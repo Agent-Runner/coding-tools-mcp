@@ -138,7 +138,8 @@ Interaction is input-first: printable keys always go to the composer, and
 typing `/` opens a navigable command menu (arrows to choose, Tab to complete,
 Enter to run). Bounded panels open over the live region for `/diff`,
 `/baton`, `/approvals`, `/config`, `/inspect` (also Ctrl+O), `/doctor`, and
-`/help`; arrows scroll them and Esc closes. Tab cycles session tabs when the
+`/help`; ↑/↓ scroll by line, ←/→ page while the composer is empty (PgUp/PgDn
+also work), and Esc closes. Tab cycles session tabs when the
 composer is empty, `/clear` resets the transcript, and Ctrl+C must be pressed
 twice to quit so a stray interrupt cannot tear down live sessions.
 
