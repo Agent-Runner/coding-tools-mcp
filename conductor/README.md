@@ -135,8 +135,12 @@ repainting on a timer — so external stdio sessions stream in near real time
 without flicker.
 
 Interaction is input-first: printable keys always go to the composer, and
-typing `/` opens a navigable command menu (arrows to choose, Tab to complete,
-Enter to run). Bounded panels open over the live region for `/diff`,
+typing `/` opens a navigable command menu that fuzzy-matches as you type
+(e.g. `/dr` finds `doctor`), highlights the matched characters, and wraps at
+the ends — arrows to choose, Tab to complete, Enter to run. The composer
+supports the usual readline editing keys (Ctrl+A/E to jump to line
+start/end, Ctrl+W/U/K to delete by word or to the line edges, Ctrl+←/→ and
+Alt+←/→ to move by word). Bounded panels open over the live region for `/diff`,
 `/baton`, `/approvals`, `/config`, `/inspect` (also Ctrl+O), `/doctor`, and
 `/help`; ↑/↓ scroll by line, ←/→ page while the composer is empty (PgUp/PgDn
 also work), and Esc closes. Tab cycles session tabs when the

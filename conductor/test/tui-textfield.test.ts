@@ -22,12 +22,40 @@ const noKeys = {
 const key = (overrides: Partial<typeof noKeys> = {}) => ({ ...noKeys, ...overrides });
 
 describe("editText", () => {
-  it("ignores ctrl and meta chords so app shortcuts do not leak characters", () => {
+  it("ignores unhandled ctrl and meta chords so app shortcuts do not leak characters", () => {
     // Ink reports Ctrl+O as input "o" with key.ctrl set and broadcasts it to
     // every handler; the composer must not insert the "o".
     expect(editText("/insp", 5, "o", key({ ctrl: true }))).toBeUndefined();
     expect(editText("", 0, "o", key({ ctrl: true }))).toBeUndefined();
-    expect(editText("abc", 3, "f", key({ meta: true }))).toBeUndefined();
+    expect(editText("abc", 3, "g", key({ meta: true }))).toBeUndefined();
+  });
+
+  it("supports readline cursor shortcuts (Ctrl+A/E/B/F, Home/End)", () => {
+    expect(editText("hello", 2, "a", key({ ctrl: true }))).toEqual({ value: "hello", cursor: 0 });
+    expect(editText("hello", 2, "e", key({ ctrl: true }))).toEqual({ value: "hello", cursor: 5 });
+    expect(editText("hello", 2, "b", key({ ctrl: true }))).toEqual({ value: "hello", cursor: 1 });
+    expect(editText("hello", 2, "f", key({ ctrl: true }))).toEqual({ value: "hello", cursor: 3 });
+  });
+
+  it("supports readline kill shortcuts (Ctrl+U/K/W/D)", () => {
+    expect(editText("foo bar", 4, "u", key({ ctrl: true }))).toEqual({ value: "bar", cursor: 0 });
+    expect(editText("foo bar", 3, "k", key({ ctrl: true }))).toEqual({ value: "foo", cursor: 3 });
+    expect(editText("foo bar", 7, "w", key({ ctrl: true }))).toEqual({ value: "foo ", cursor: 4 });
+    expect(editText("foo bar", 7, "w", key({ ctrl: true }))).toEqual({ value: "foo ", cursor: 4 });
+    expect(editText("foo", 1, "d", key({ ctrl: true }))).toEqual({ value: "fo", cursor: 1 });
+  });
+
+  it("moves and deletes by word with ctrl/alt arrows", () => {
+    expect(editText("foo bar baz", 11, "", key({ ctrl: true, leftArrow: true }))).toEqual({
+      value: "foo bar baz",
+      cursor: 8,
+    });
+    expect(editText("foo bar baz", 0, "", key({ ctrl: true, rightArrow: true }))).toEqual({
+      value: "foo bar baz",
+      cursor: 3,
+    });
+    expect(editText("foo bar", 7, "", key({ meta: true, backspace: true }))).toEqual({ value: "foo ", cursor: 4 });
+    expect(editText("foo bar", 0, "f", key({ meta: true }))).toEqual({ value: "foo bar", cursor: 3 });
   });
 
   it("leaves navigation keys the app owns untouched", () => {

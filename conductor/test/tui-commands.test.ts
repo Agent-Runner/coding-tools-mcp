@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   findSlashCommand,
+  fuzzyMatch,
   parseCloseCommand,
   parseNewCommand,
   parseSlashCommand,
@@ -38,5 +39,23 @@ describe("TUI slash command registry", () => {
     expect(findSlashCommand("?")?.name).toBe("help");
     expect(findSlashCommand("tunnel")?.stage).toBe("available");
     expect(suggestSlashCommands("/sw").map((command) => command.name)).toContain("switch");
+  });
+
+  it("fuzzy-matches non-contiguous queries and ranks the best command first", () => {
+    // "dr" is a subsequence of "doctor" but not a substring.
+    expect(suggestSlashCommands("/dr")[0]?.name).toBe("doctor");
+    expect(suggestSlashCommands("/cfg")[0]?.name).toBe("config");
+    expect(suggestSlashCommands("/mrg")[0]?.name).toBe("merge");
+    // An exact name still wins over incidental subsequence matches.
+    expect(suggestSlashCommands("/diff")[0]?.name).toBe("diff");
+    // Nonsense queries yield nothing rather than every command.
+    expect(suggestSlashCommands("/zzzz")).toEqual([]);
+  });
+
+  it("reports matched character positions for highlighting", () => {
+    expect(fuzzyMatch("dr", "doctor")?.positions).toEqual([0, 5]);
+    expect(fuzzyMatch("", "doctor")?.positions).toEqual([]);
+    expect(fuzzyMatch("xyz", "doctor")).toBeUndefined();
+    expect((fuzzyMatch("diff", "diff")?.score ?? 0) > (fuzzyMatch("df", "diff")?.score ?? 0)).toBe(true);
   });
 });
