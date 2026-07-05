@@ -169,6 +169,16 @@ ways this host can run a tunnel:
 Both providers surface the same `*.trycloudflare.com` URL. Hosts with neither
 cloudflared nor `npx` say so plainly instead of hanging.
 
+Model clients connect to the stable `/mcp` endpoint (locally
+`http://127.0.0.1:<port>/mcp`, through a tunnel `https://<tunnel-host>/mcp`).
+The port is persisted in the workspace profile, so a client configured once
+keeps working across ctc restarts. `/mcp` always serves the most recently
+opened session; `/mcp/<session-id>` remains available to pin a specific one
+when several sessions are live. Following the Streamable HTTP spec, each
+client that POSTs an `initialize` request gets its own MCP session (routed by
+the `Mcp-Session-Id` header), so any number of clients can connect, reconnect,
+and terminate sessions independently.
+
 ## M5 Surface
 
 The ChatGPT Apps adapter is optional and remains isolated under

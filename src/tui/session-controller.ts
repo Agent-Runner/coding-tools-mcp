@@ -172,8 +172,7 @@ export class TuiSessionController {
     if (!http.origin) throw new Error("HTTP MCP server is not listening.");
     const state = await this.tunnel.start(http.origin, command);
     http.setBearerToken(state.token);
-    const sampleSession = this.sessions.keys().next().value;
-    const route = `${state.publicUrl ?? "<public-url>"}/mcp/${sampleSession ?? "<session-id>"}`;
+    const route = `${state.publicUrl ?? "<public-url>"}/mcp`;
     return {
       state,
       message: `Tunnel ready via ${command.label}: ${route} with Authorization: Bearer ${state.token ?? "<token>"}`,
@@ -246,7 +245,7 @@ export class TuiSessionController {
 
   private async registerHttpSession(sessionId: string, runtime: ConductorRuntime, workspacePath: string): Promise<string> {
     const http = await this.ensureHttpServer(workspacePath);
-    const registered = await http.registerSession(sessionId, runtime.createServer());
+    const registered = await http.registerSession(sessionId, () => runtime.createServer());
     return registered.url;
   }
 
