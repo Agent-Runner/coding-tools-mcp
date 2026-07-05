@@ -133,8 +133,12 @@ export function TuiApp({
 
   const [tunnelMessage, setTunnelMessage] = useState(() => controller.tunnelStatus().message);
 
-  const suggestions = useMemo(() => (input.startsWith("/") ? suggestSlashCommands(input) : []), [input]);
-  const menuVisible = !onboarding && suggestions.length > 0;
+  // The menu is a command picker: it opens on "/name" and closes once you type a
+  // space and move on to arguments (matching Codex CLI / OpenCode).
+  const menuOpen = !onboarding && /^\/\S*$/.test(input);
+  const suggestions = useMemo(() => (menuOpen ? suggestSlashCommands(input) : []), [menuOpen, input]);
+  const menuQuery = input.startsWith("/") ? input.slice(1) : "";
+  const menuVisible = menuOpen;
 
   const orderedSessions = useMemo(
     () => [...snapshot.sessions].sort((a, b) => a.sessionId.localeCompare(b.sessionId)),
@@ -655,14 +659,16 @@ export function TuiApp({
       return;
     }
     if (key.upArrow) {
-      if (menuVisible) setMenuIndex((index) => Math.max(0, index - 1));
-      else if (panel) setScroll((value) => Math.max(0, value - 1));
+      if (menuVisible) {
+        if (suggestions.length) setMenuIndex((index) => (index - 1 + suggestions.length) % suggestions.length);
+      } else if (panel) setScroll((value) => Math.max(0, value - 1));
       else navigateHistory(-1);
       return;
     }
     if (key.downArrow) {
-      if (menuVisible) setMenuIndex((index) => Math.min(suggestions.length - 1, index + 1));
-      else if (panel) setScroll((value) => value + 1);
+      if (menuVisible) {
+        if (suggestions.length) setMenuIndex((index) => (index + 1) % suggestions.length);
+      } else if (panel) setScroll((value) => value + 1);
       else navigateHistory(1);
       return;
     }
@@ -728,7 +734,13 @@ export function TuiApp({
           placeholder={onboarding ? onboardingDefault(onboarding) : "/ for commands"}
           focus={!approvalVisible}
         />
-        {menuVisible && !approvalVisible ? <SlashMenu suggestions={suggestions} selected={menuIndex} /> : null}
+        {menuVisible && !approvalVisible ? (
+          <SlashMenu
+            suggestions={suggestions}
+            selected={Math.min(menuIndex, Math.max(suggestions.length - 1, 0))}
+            query={menuQuery}
+          />
+        ) : null}
         <StatusBar snapshot={snapshot} sessions={orderedSessions} tunnelMessage={tunnelMessage} hint={hint} />
       </Box>
     </Box>

@@ -178,14 +178,59 @@ export function findSlashCommand(name: string): SlashCommand | undefined {
   return slashCommands.find((command) => command.name === normalized || command.aliases?.includes(normalized));
 }
 
-export function suggestSlashCommands(input: string, limit = 6): SlashCommand[] {
+export interface FuzzyMatch {
+  positions: number[];
+  score: number;
+}
+
+/**
+ * Subsequence fuzzy match (à la Codex CLI / OpenCode): every query character must
+ * appear in order within the target. Returns the matched indices for highlighting
+ * plus a score that rewards contiguous runs and early/leading matches. Longer
+ * targets are nudged down so the tightest command wins ties.
+ */
+export function fuzzyMatch(query: string, target: string): FuzzyMatch | undefined {
+  if (!query) return { positions: [], score: 0 };
+  const needle = query.toLowerCase();
+  const haystack = target.toLowerCase();
+  const positions: number[] = [];
+  let cursor = 0;
+  let score = 0;
+  let previous = -2;
+  for (const char of needle) {
+    const found = haystack.indexOf(char, cursor);
+    if (found === -1) return undefined;
+    positions.push(found);
+    if (found === previous + 1) score += 4;
+    if (found === 0) score += 6;
+    score += Math.max(0, 3 - (found - Math.max(previous, 0)));
+    previous = found;
+    cursor = found + 1;
+  }
+  score -= target.length * 0.05;
+  return { positions, score };
+}
+
+function commandScore(query: string, command: SlashCommand): number | undefined {
+  let best: number | undefined;
+  for (const candidate of [command.name, ...(command.aliases ?? [])]) {
+    const match = fuzzyMatch(query, candidate);
+    if (match && (best === undefined || match.score > best)) best = match.score;
+  }
+  return best;
+}
+
+export function suggestSlashCommands(input: string, limit = 8): SlashCommand[] {
   if (!input.startsWith("/")) return [];
   const parsed = parseSlashCommand(input);
   const query = (parsed?.name ?? input.slice(1)).toLowerCase();
   if (!query) return slashCommands.slice(0, limit);
   return slashCommands
-    .filter((command) => command.name.includes(query) || command.aliases?.some((alias) => alias.includes(query)))
-    .slice(0, limit);
+    .map((command, index) => ({ command, index, score: commandScore(query, command) }))
+    .filter((entry): entry is { command: SlashCommand; index: number; score: number } => entry.score !== undefined)
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .slice(0, limit)
+    .map((entry) => entry.command);
 }
 
 function tokenizeArgs(input: string): string[] {

@@ -69,6 +69,9 @@ export function helpLines(): DisplayLine[] {
   lines.push({ text: "  Shift+Tab           cycle sessions backwards" });
   lines.push({ text: "  ↑/↓                 menu selection, panel scroll, or input history" });
   lines.push({ text: "  ←/→                 page an open panel when the input is empty" });
+  lines.push({ text: "  Ctrl+A / Ctrl+E     move the cursor to the start / end of the line" });
+  lines.push({ text: "  Ctrl+W / Ctrl+U / Ctrl+K  delete the previous word / to line start / to line end" });
+  lines.push({ text: "  Ctrl+←/→, Alt+←/→   move the cursor by word" });
   lines.push({ text: "  Ctrl+O              open the event inspector" });
   lines.push({ text: "  Esc                 clear input / close panel / deny the pending approval" });
   lines.push({ text: "  y n 1 2 ←/→         answer permission prompts" });

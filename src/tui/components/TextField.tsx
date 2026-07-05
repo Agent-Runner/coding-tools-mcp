@@ -25,19 +25,77 @@ type EditKey = Pick<
   | "delete"
 >;
 
+const WORD_CHAR = /\S/;
+
+/** Start of the word at or before `at`: skip trailing spaces, then the word. */
+function wordStartLeft(value: string, at: number): number {
+  let index = at;
+  while (index > 0 && !WORD_CHAR.test(value[index - 1] ?? "")) index -= 1;
+  while (index > 0 && WORD_CHAR.test(value[index - 1] ?? "")) index -= 1;
+  return index;
+}
+
+/** End of the word at or after `at`: skip leading spaces, then the word. */
+function wordEndRight(value: string, at: number): number {
+  let index = at;
+  while (index < value.length && !WORD_CHAR.test(value[index] ?? "")) index += 1;
+  while (index < value.length && WORD_CHAR.test(value[index] ?? "")) index += 1;
+  return index;
+}
+
+function deleteWordBackward(value: string, at: number): TextEdit {
+  const start = wordStartLeft(value, at);
+  return { value: value.slice(0, start) + value.slice(at), cursor: start };
+}
+
 /**
  * Pure single-line edit step. Returns "submit" for Enter, undefined for keys the
- * field does not own (chords, navigation the app handles), or the next state.
+ * field does not own (unhandled chords, navigation the app handles), or the next
+ * state.
  *
  * Ink broadcasts every key to all useInput handlers, so chords like Ctrl+O reach
- * this field as input "o" with key.ctrl set; ignoring all ctrl/meta combinations
- * keeps app-level shortcuts from leaking characters into the composer.
+ * this field as input "o" with key.ctrl set. We handle a fixed set of readline
+ * editing shortcuts (matching Codex CLI and OpenCode) and ignore every other
+ * ctrl/meta combination so app-level shortcuts never leak characters here.
  */
 export function editText(value: string, cursor: number, input: string, key: EditKey): TextEdit | "submit" | undefined {
-  if (key.return) return "submit";
-  if (key.ctrl || key.meta || key.tab || key.escape) return undefined;
-  if (key.upArrow || key.downArrow || key.pageUp || key.pageDown) return undefined;
   const at = Math.max(0, Math.min(cursor, value.length));
+  if (key.return) return "submit";
+
+  if (key.ctrl && !key.meta) {
+    if (key.leftArrow) return { value, cursor: wordStartLeft(value, at) };
+    if (key.rightArrow) return { value, cursor: wordEndRight(value, at) };
+    switch (input) {
+      case "a": // line start
+        return { value, cursor: 0 };
+      case "e": // line end
+        return { value, cursor: value.length };
+      case "b": // char left
+        return { value, cursor: Math.max(0, at - 1) };
+      case "f": // char right
+        return { value, cursor: Math.min(value.length, at + 1) };
+      case "u": // kill to line start
+        return { value: value.slice(at), cursor: 0 };
+      case "k": // kill to line end
+        return { value: value.slice(0, at), cursor: at };
+      case "w": // kill word backward
+        return deleteWordBackward(value, at);
+      case "d": // delete char forward
+        return at >= value.length ? { value, cursor: at } : { value: value.slice(0, at) + value.slice(at + 1), cursor: at };
+      default:
+        return undefined;
+    }
+  }
+
+  if (key.meta && !key.ctrl) {
+    if (key.backspace || key.delete) return deleteWordBackward(value, at);
+    if (input === "b" || key.leftArrow) return { value, cursor: wordStartLeft(value, at) };
+    if (input === "f" || key.rightArrow) return { value, cursor: wordEndRight(value, at) };
+    return undefined;
+  }
+
+  if (key.tab || key.escape) return undefined;
+  if (key.upArrow || key.downArrow || key.pageUp || key.pageDown) return undefined;
   if (key.leftArrow) return { value, cursor: Math.max(0, at - 1) };
   if (key.rightArrow) return { value, cursor: Math.min(value.length, at + 1) };
   if (key.home) return { value, cursor: 0 };
