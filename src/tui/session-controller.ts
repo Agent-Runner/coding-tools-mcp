@@ -21,6 +21,13 @@ import {
   SessionEventBus,
   type SessionEventSink,
 } from "../sessions/events.js";
+import {
+  cloudflaredInstallPlan,
+  defaultInstallDeps,
+  describeInstallPlan,
+  installCloudflared,
+  resolveCloudflared,
+} from "../tunnel/install.js";
 import { TunnelManager, type TunnelState } from "../tunnel/manager.js";
 import {
   closeWorkspaceSession,
@@ -53,6 +60,8 @@ export interface TuiTunnelResult {
   state: TunnelState;
   message: string;
 }
+
+export type TunnelReadiness = { ready: true } | { ready: false; installable: boolean; description: string };
 
 interface HostedSession {
   runtime: ConductorRuntime;
@@ -145,10 +154,24 @@ export class TuiSessionController {
     else await respondToFileApproval(sessionId, requestId, approved);
   }
 
+  /** Whether cloudflared can be spawned, and if not, whether ctc can install it. */
+  tunnelReadiness(): TunnelReadiness {
+    if (resolveCloudflared().installed) return { ready: true };
+    const plan = cloudflaredInstallPlan();
+    if (plan.method === "unsupported") return { ready: false, installable: false, description: plan.reason };
+    return { ready: false, installable: true, description: describeInstallPlan(plan) };
+  }
+
+  /** Install cloudflared per the platform plan, streaming progress lines. */
+  async installTunnelProvider(onLog: (line: string) => void): Promise<string> {
+    const plan = cloudflaredInstallPlan();
+    return installCloudflared(plan, defaultInstallDeps(onLog));
+  }
+
   async startTunnel(): Promise<TuiTunnelResult> {
     const http = await this.ensureHttpServer();
     if (!http.origin) throw new Error("HTTP MCP server is not listening.");
-    const state = await this.tunnel.start(http.origin);
+    const state = await this.tunnel.start(http.origin, resolveCloudflared().binary);
     http.setBearerToken(state.token);
     const sampleSession = this.sessions.keys().next().value;
     const route = `${state.publicUrl ?? "<public-url>"}/mcp/${sampleSession ?? "<session-id>"}`;

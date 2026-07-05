@@ -110,7 +110,7 @@ export const slashCommands: SlashCommand[] = [
   {
     name: "tunnel",
     usage: "/tunnel [start|stop]",
-    description: "Manage a public MCP tunnel and bearer token.",
+    description: "Manage a public MCP tunnel; offers to install cloudflared if missing.",
     stage: "available",
   },
   {

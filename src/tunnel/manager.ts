@@ -23,10 +23,10 @@ export class TunnelManager {
     return { ...this.state };
   }
 
-  async start(originUrl: string): Promise<TunnelState> {
+  async start(originUrl: string, binary: string = this.binary): Promise<TunnelState> {
     if (this.process && this.state.running) return this.status();
     const token = randomBytes(24).toString("base64url");
-    const child = spawn(this.binary, ["tunnel", "--url", originUrl], { stdio: "pipe", env: process.env });
+    const child = spawn(binary, ["tunnel", "--url", originUrl], { stdio: "pipe", env: process.env });
     this.process = child;
 
     const publicUrl = await new Promise<string>((resolve, reject) => {
@@ -43,7 +43,7 @@ export class TunnelManager {
       const onError = (error: Error): void => {
         clearTimeout(timeout);
         cleanup();
-        reject(new Error(spawnFailureMessage(this.binary, error)));
+        reject(new Error(spawnFailureMessage(binary, error)));
       };
       const onExit = (): void => {
         clearTimeout(timeout);
