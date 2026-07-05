@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server as NodeServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 
@@ -17,21 +18,47 @@ interface ActiveTransport {
   lastUsedAt: number;
 }
 
+interface ActiveLegacyTransport {
+  routeSessionId: string;
+  server: McpServer;
+  transport: SSEServerTransport;
+  keepalive: ReturnType<typeof setInterval>;
+  lastUsedAt: number;
+}
+
 interface SessionRoute {
   sessionId: string;
   createServer: () => McpServer;
   transports: Map<string, ActiveTransport>;
 }
 
+/**
+ * Where a request should be dispatched. `mcp` is the Streamable HTTP endpoint, `sse` and
+ * `messages` are the legacy 2024-11-05 HTTP+SSE transport, and `discovery` is the
+ * unauthenticated server card used by clients and humans to find the real endpoints.
+ */
+type RouteTarget =
+  | { kind: "mcp"; sessionId?: string; isRoot?: boolean }
+  | { kind: "sse"; sessionId?: string }
+  | { kind: "messages" }
+  | { kind: "discovery" };
+
 const MCP_SESSION_HEADER = "mcp-session-id";
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
 const MAX_TRANSPORTS_PER_ROUTE = 64;
+const MAX_LEGACY_TRANSPORTS = 64;
+// SSE comment pings keep free-tier tunnels (cloudflared idles streams out around 100s)
+// and strict proxies from dropping otherwise-quiet legacy streams.
+const LEGACY_KEEPALIVE_MS = 25_000;
+const LEGACY_MESSAGES_PATH = "/messages";
+const SERVER_CARD_SERVER = { name: "coding-tools-conductor", version: "0.1.0" };
 const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
 const CORS_ALLOW_HEADERS = "Accept, Authorization, Content-Type, Last-Event-ID, Mcp-Session-Id, MCP-Protocol-Version";
 const CORS_EXPOSE_HEADERS = "Mcp-Session-Id, MCP-Protocol-Version, WWW-Authenticate";
 
 export class ConductorHttpServer {
   private readonly routes = new Map<string, SessionRoute>();
+  private readonly legacyTransports = new Map<string, ActiveLegacyTransport>();
   private defaultRoute?: SessionRoute;
   private server?: NodeServer;
   private port?: number;
@@ -86,6 +113,7 @@ export class ConductorHttpServer {
     this.routes.delete(sessionId);
     if (this.defaultRoute === route) this.defaultRoute = [...this.routes.values()].pop();
     await closeRouteTransports(route);
+    await this.closeLegacyTransports((entry) => entry.routeSessionId === sessionId);
   }
 
   /** Stable MCP endpoint serving the most recently registered session. */
@@ -107,6 +135,7 @@ export class ConductorHttpServer {
   async close(): Promise<void> {
     const routes = [...this.routes.keys()];
     await Promise.all(routes.map((sessionId) => this.unregisterSession(sessionId)));
+    await this.closeLegacyTransports(() => true);
     const server = this.server;
     this.server = undefined;
     this.port = undefined;
@@ -133,9 +162,9 @@ export class ConductorHttpServer {
 
   private async route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", this.origin ?? `http://${this.host}`);
-    const match = /^\/mcp(?:\/([^/]+))?$/.exec(url.pathname);
-    if (!match) {
-      sendJsonRpcError(res, 404, -32001, "Unknown ctc MCP route.");
+    const target = parseRoutePath(url.pathname);
+    if (!target) {
+      sendJsonRpcError(res, 404, -32001, "Unknown ctc MCP route. POST /mcp (Streamable HTTP) or GET /sse (legacy SSE).");
       return;
     }
     if (!this.isAllowedRequest(req)) {
@@ -148,15 +177,40 @@ export class ConductorHttpServer {
       res.end();
       return;
     }
+    // Discovery surfaces stay readable without auth (mirroring the lower server's
+    // /.well-known behavior) so a misconfigured client fails with a routable card
+    // instead of a bare 404.
+    if (target.kind === "discovery" || (target.kind === "mcp" && target.isRoot && isPlainDiscoveryRequest(req))) {
+      this.handleDiscovery(req, res);
+      return;
+    }
     if (!this.isAuthorized(req)) {
       sendJsonRpcError(res, 401, -32600, "Missing or invalid bearer token.", { "WWW-Authenticate": "Bearer" });
       return;
     }
-    const explicitSessionId = match[1] ? decodeURIComponent(match[1]) : undefined;
-    const route = explicitSessionId ? this.routes.get(explicitSessionId) : this.defaultRoute;
+    if (target.kind === "messages") {
+      await this.handleLegacyMessage(req, res, url);
+      return;
+    }
+    const route = target.sessionId ? this.routes.get(target.sessionId) : this.defaultRoute;
     if (!route) {
-      const message = explicitSessionId ? `Unknown ctc session ${explicitSessionId}.` : "No active ctc session.";
-      sendJsonRpcError(res, 404, -32001, message);
+      if (target.sessionId) {
+        sendJsonRpcError(res, 404, -32001, `Unknown ctc session ${target.sessionId}.`);
+      } else {
+        // 503, not 404: the endpoint exists, there is just no live conductor session.
+        // Clients probing transports treat 404 as "wrong URL" and give up.
+        sendJsonRpcError(res, 503, -32000, "No active ctc session. Open a workspace in ctc, then retry.", {
+          "Retry-After": "5",
+        });
+      }
+      return;
+    }
+    if (target.kind === "sse") {
+      if (req.method !== "GET") {
+        sendJsonRpcError(res, 405, -32000, "Method not allowed.", { Allow: "GET, OPTIONS" });
+        return;
+      }
+      await this.startLegacyTransport(route, res);
       return;
     }
     switch (req.method) {
@@ -164,6 +218,19 @@ export class ConductorHttpServer {
         await this.handlePost(route, req, res);
         return;
       case "GET":
+        if (!headerValue(req, MCP_SESSION_HEADER)) {
+          // Streamable clients always send Mcp-Session-Id on GET. A GET without it and
+          // with an explicit SSE Accept is the legacy-transport probe (the spec's
+          // backwards-compatibility flow), so serve the old handshake here too.
+          if (acceptsEventStream(req)) {
+            await this.startLegacyTransport(route, res);
+            return;
+          }
+          this.handleDiscovery(req, res);
+          return;
+        }
+        await this.handleSessionScoped(route, req, res);
+        return;
       case "DELETE":
         await this.handleSessionScoped(route, req, res);
         return;
@@ -246,6 +313,101 @@ export class ConductorHttpServer {
     if (mcpSessionId) route.transports.set(mcpSessionId, { server, transport, lastUsedAt: Date.now() });
   }
 
+  /**
+   * Legacy 2024-11-05 HTTP+SSE handshake: stream the `endpoint` event pointing at
+   * `/messages?sessionId=...` and keep the response open for server messages. Hosts such
+   * as connector platforms still probe (or only speak) this transport.
+   */
+  private async startLegacyTransport(route: SessionRoute, res: ServerResponse): Promise<void> {
+    evictOldestLegacyTransports(this.legacyTransports);
+    const server = route.createServer();
+    const transport = new SSEServerTransport(LEGACY_MESSAGES_PATH, res);
+    const entry: ActiveLegacyTransport = {
+      routeSessionId: route.sessionId,
+      server,
+      transport,
+      keepalive: setInterval(() => {
+        if (!res.writableEnded && !res.destroyed) res.write(": keepalive\n\n");
+      }, LEGACY_KEEPALIVE_MS),
+      lastUsedAt: Date.now(),
+    };
+    entry.keepalive.unref();
+    transport.onclose = () => {
+      clearInterval(entry.keepalive);
+      this.legacyTransports.delete(transport.sessionId);
+    };
+    try {
+      // connect() calls transport.start(), which writes the SSE headers + endpoint event.
+      await server.connect(transport);
+    } catch (error) {
+      clearInterval(entry.keepalive);
+      throw error;
+    }
+    this.legacyTransports.set(transport.sessionId, entry);
+  }
+
+  private async handleLegacyMessage(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    if (req.method !== "POST") {
+      sendJsonRpcError(res, 405, -32000, "Method not allowed.", { Allow: "POST, OPTIONS" });
+      return;
+    }
+    const sessionId = url.searchParams.get("sessionId");
+    if (!sessionId) {
+      sendJsonRpcError(res, 400, -32000, "Bad Request: sessionId query parameter is required.");
+      return;
+    }
+    const entry = this.legacyTransports.get(sessionId);
+    if (!entry) {
+      sendJsonRpcError(res, 404, -32001, "Session not found. Reconnect to /sse to establish a new one.");
+      return;
+    }
+    entry.lastUsedAt = Date.now();
+    const body = await readBody(req, MAX_BODY_BYTES);
+    if (body === undefined) {
+      sendJsonRpcError(res, 413, -32600, "Request body exceeds maximum size.", { Connection: "close" });
+      req.destroy();
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(body.toString("utf8"));
+    } catch {
+      sendJsonRpcError(res, 400, -32700, "Parse error: Invalid JSON");
+      return;
+    }
+    // The SDK transport rejects a missing Content-Type outright; the body has already
+    // been parsed, so default it instead of failing minimal clients.
+    if (!req.headers["content-type"]) req.headers["content-type"] = "application/json";
+    await entry.transport.handlePostMessage(req, res, parsed);
+  }
+
+  private handleDiscovery(req: IncomingMessage, res: ServerResponse): void {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      sendJsonRpcError(res, 405, -32000, "Method not allowed.", { Allow: "GET, HEAD, OPTIONS" });
+      return;
+    }
+    sendJson(res, 200, this.serverCard(), req.method === "HEAD");
+  }
+
+  private serverCard(): object {
+    return {
+      server: SERVER_CARD_SERVER,
+      transport: { type: "streamable_http", endpoint: "/mcp", methods: ["GET", "POST", "DELETE", "OPTIONS"] },
+      legacyTransport: { type: "sse", endpoint: "/sse", messagesEndpoint: LEGACY_MESSAGES_PATH },
+      auth: { type: this.bearerToken ? "bearer" : "none" },
+      sessions: { active: this.routes.size, defaultEndpoint: "/mcp", byIdEndpoint: "/mcp/{ctc-session-id}" },
+    };
+  }
+
+  private async closeLegacyTransports(match: (entry: ActiveLegacyTransport) => boolean): Promise<void> {
+    const closing = [...this.legacyTransports.entries()].filter(([, entry]) => match(entry));
+    for (const [sessionId, entry] of closing) {
+      this.legacyTransports.delete(sessionId);
+      clearInterval(entry.keepalive);
+    }
+    await Promise.all(closing.map(([, entry]) => entry.transport.close().catch(() => undefined)));
+  }
+
   private isAllowedRequest(req: IncomingMessage): boolean {
     // Tunnel mode: the bearer token is the gate; Host and Origin vary by tunnel provider.
     if (this.bearerToken) return true;
@@ -259,6 +421,53 @@ export class ConductorHttpServer {
     if (!this.bearerToken) return true;
     return req.headers.authorization === `Bearer ${this.bearerToken}`;
   }
+}
+
+/**
+ * Accepted URL space. Alongside the canonical `/mcp` routes, the tunnel root and the
+ * legacy `/sse` + `/messages` pair are honored so clients configured with any of the
+ * common URL shapes (`https://host`, `https://host/mcp`, `https://host/sse`) connect.
+ */
+function parseRoutePath(pathname: string): RouteTarget | undefined {
+  if (pathname === "/") return { kind: "mcp", isRoot: true };
+  if (pathname === "/.well-known/mcp.json" || pathname === "/.well-known/mcp/server-card.json") {
+    return { kind: "discovery" };
+  }
+  let segments: string[];
+  try {
+    segments = pathname.split("/").filter(Boolean).map(decodeURIComponent);
+  } catch {
+    return undefined;
+  }
+  if (segments.length === 1) {
+    if (segments[0] === "mcp") return { kind: "mcp" };
+    if (segments[0] === "sse") return { kind: "sse" };
+    if (segments[0] === "messages") return { kind: "messages" };
+    return undefined;
+  }
+  if (segments[0] !== "mcp") return undefined;
+  if (segments.length === 2) {
+    if (segments[1] === "sse") return { kind: "sse" };
+    if (segments[1] === "messages") return { kind: "messages" };
+    return { kind: "mcp", sessionId: segments[1] };
+  }
+  if (segments.length === 3 && segments[2] === "sse") return { kind: "sse", sessionId: segments[1] };
+  if (segments.length === 3 && segments[2] === "messages") return { kind: "messages" };
+  return undefined;
+}
+
+/** A root GET/HEAD that is neither a legacy SSE probe nor a streamable stream request. */
+function isPlainDiscoveryRequest(req: IncomingMessage): boolean {
+  if (req.method !== "GET" && req.method !== "HEAD") return false;
+  return !headerValue(req, MCP_SESSION_HEADER) && !acceptsEventStream(req);
+}
+
+/**
+ * Explicit SSE intent only: wildcard Accepts (curl, browsers) must not match, otherwise
+ * a debugging GET would hang on an event stream instead of returning the server card.
+ */
+function acceptsEventStream(req: IncomingMessage): boolean {
+  return (req.headers.accept ?? "").includes("text/event-stream");
 }
 
 async function closeRouteTransports(route: SessionRoute): Promise<void> {
@@ -275,6 +484,19 @@ function evictOldestTransports(route: SessionRoute): void {
     }
     if (!oldest) return;
     route.transports.delete(oldest[0]);
+    void oldest[1].transport.close().catch(() => undefined);
+  }
+}
+
+function evictOldestLegacyTransports(transports: Map<string, ActiveLegacyTransport>): void {
+  while (transports.size >= MAX_LEGACY_TRANSPORTS) {
+    let oldest: [string, ActiveLegacyTransport] | undefined;
+    for (const candidate of transports) {
+      if (!oldest || candidate[1].lastUsedAt < oldest[1].lastUsedAt) oldest = candidate;
+    }
+    if (!oldest) return;
+    transports.delete(oldest[0]);
+    clearInterval(oldest[1].keepalive);
     void oldest[1].transport.close().catch(() => undefined);
   }
 }
@@ -350,6 +572,12 @@ async function readBody(req: IncomingMessage, maxBytes: number): Promise<Buffer 
     chunks.push(buffer);
   }
   return Buffer.concat(chunks);
+}
+
+function sendJson(res: ServerResponse, status: number, payload: object, headOnly = false): void {
+  const body = JSON.stringify(payload, null, 2);
+  res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
+  res.end(headOnly ? undefined : body);
 }
 
 function sendJsonRpcError(res: ServerResponse, status: number, code: number, message: string, headers: Record<string, string> = {}): void {

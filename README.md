@@ -179,6 +179,20 @@ client that POSTs an `initialize` request gets its own MCP session (routed by
 the `Mcp-Session-Id` header), so any number of clients can connect, reconnect,
 and terminate sessions independently.
 
+Conductor speaks both remote MCP transports, so connector platforms that
+probe or only implement the legacy 2024-11-05 HTTP+SSE transport connect too:
+a `GET /sse` — or a `GET /mcp` with an SSE `Accept` and no `Mcp-Session-Id`,
+which is the spec's transport-fallback probe — opens the old handshake
+(`endpoint` event, messages POSTed to `/messages?sessionId=...`, keepalive
+pings so free tunnels do not idle the stream out). Common URL misconfigurations
+stay routable instead of dead-ending in 404s: the bare tunnel origin `/` is an
+alias for `/mcp`, and a plain browser/curl GET on `/`, `/mcp`, or
+`/.well-known/mcp.json` returns a small server card describing the endpoints
+and auth mode (the card and `/.well-known` stay readable without the bearer
+token; everything else remains gated). When no ctc session is live, MCP
+endpoints answer `503` rather than `404`, so clients report a temporarily
+unavailable server instead of a wrong URL.
+
 ## M5 Surface
 
 The ChatGPT Apps adapter is optional and remains isolated under
