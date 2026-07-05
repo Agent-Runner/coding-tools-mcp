@@ -12,6 +12,7 @@ import {
 } from "./commands/registry.js";
 import { ApprovalPrompt } from "./components/ApprovalPrompt.js";
 import { Composer, SlashMenu } from "./components/Composer.js";
+import { ConfirmPrompt } from "./components/ConfirmPrompt.js";
 import { OnboardingView, optionsForStep } from "./components/OnboardingView.js";
 import {
   ScrollPanel,
@@ -132,6 +133,8 @@ export function TuiApp({
   const ctrlCTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const [tunnelMessage, setTunnelMessage] = useState(() => controller.tunnelStatus().message);
+  const [installPrompt, setInstallPrompt] = useState<{ description: string } | undefined>(undefined);
+  const [installChoice, setInstallChoice] = useState(0);
 
   // The menu is a command picker: it opens on "/name" and closes once you type a
   // space and move on to arguments (matching Codex CLI / OpenCode).
@@ -157,6 +160,7 @@ export function TuiApp({
   }, [snapshot.pendingApprovals, snapshot.allPendingApprovals]);
   const approvalVisible = approvalQueue.length > 0 && !onboarding;
   const activeApproval = approvalQueue[Math.min(approvalCursor, Math.max(approvalQueue.length - 1, 0))];
+  const installVisible = Boolean(installPrompt) && !onboarding && !approvalVisible;
 
   const onboardingOptions = useMemo(() => (onboarding ? optionsForStep(onboarding) : []), [onboarding]);
 
@@ -560,13 +564,43 @@ export function TuiApp({
     });
   };
 
+  const startTunnel = async (): Promise<void> => {
+    const result = await controller.startTunnel();
+    setTunnelMessage(result.state.message);
+    appendNote(result.message, "success");
+  };
+
+  const confirmInstallProvider = (accept: boolean): void => {
+    if (!installPrompt) return;
+    setInstallPrompt(undefined);
+    setInstallChoice(0);
+    if (!accept) {
+      appendNote("Skipped install. Run /tunnel start after installing cloudflared, or /config tunnel none.", "hint");
+      return;
+    }
+    void runWithBusy("Installing cloudflared", async () => {
+      const path = await controller.installTunnelProvider((line) => {
+        appendNote(line, "info");
+      });
+      appendNote(`cloudflared ready at ${path}.`, "success");
+      await startTunnel();
+      store.requestRefresh();
+    });
+  };
+
   const runTunnelCommand = async (args: string[]): Promise<void> => {
     await runWithBusy("Updating tunnel", async () => {
       const parsedTunnel = parseTunnelCommand(args);
       if (parsedTunnel.action === "start") {
-        const result = await controller.startTunnel();
-        setTunnelMessage(result.state.message);
-        appendNote(result.message, "success");
+        const readiness = controller.tunnelReadiness();
+        if (readiness.ready) {
+          await startTunnel();
+        } else if (readiness.installable) {
+          setInstallChoice(0);
+          setInstallPrompt({ description: `cloudflared is not installed. Let ctc ${readiness.description}?` });
+        } else {
+          appendNote(`Cannot start tunnel: ${readiness.description}`, "error");
+        }
       } else if (parsedTunnel.action === "stop") {
         const result = await controller.stopTunnel();
         setTunnelMessage(result.state.message);
@@ -640,6 +674,14 @@ export function TuiApp({
       else if (key.rightArrow) setApprovalCursor((cursor) => Math.min(approvalQueue.length - 1, cursor + 1));
       return;
     }
+    if (installVisible) {
+      if (inputChar === "y" || inputChar === "Y" || inputChar === "1") confirmInstallProvider(true);
+      else if (inputChar === "n" || inputChar === "N" || inputChar === "2" || key.escape) confirmInstallProvider(false);
+      else if (key.upArrow) setInstallChoice(0);
+      else if (key.downArrow) setInstallChoice(1);
+      else if (key.return) confirmInstallProvider(installChoice === 0);
+      return;
+    }
     if (key.ctrl && (inputChar === "o" || inputChar === "O" || inputChar === "\u000F")) {
       setPanel((current) => (current?.kind === "inspect" ? undefined : { kind: "inspect" }));
       return;
@@ -697,7 +739,9 @@ export function TuiApp({
       ? `↑/↓ choose ${glyphs.dot} Enter accept ${glyphs.dot} or type a value`
       : approvalVisible
         ? "Answer the permission request above"
-        : panel
+        : installVisible
+          ? "Install cloudflared? y / n"
+          : panel
           ? `↑/↓ scroll ${glyphs.dot} ←/→ page ${glyphs.dot} Esc close`
           : menuVisible
             ? `↑/↓ choose ${glyphs.dot} Tab complete ${glyphs.dot} Enter run ${glyphs.dot} Esc clear`
@@ -717,6 +761,14 @@ export function TuiApp({
             choice={approvalChoice}
             width={textWidth}
           />
+        ) : installVisible && installPrompt ? (
+          <ConfirmPrompt
+            title="Install cloudflared?"
+            body={installPrompt.description}
+            confirmLabel="Install"
+            cancelLabel="Not now"
+            choice={installChoice}
+          />
         ) : panel ? (
           <ScrollPanel title={PANEL_TITLES[panel.kind]} lines={panelLines} scroll={scroll} height={panelHeight} />
         ) : null}
@@ -732,9 +784,9 @@ export function TuiApp({
           onChange={handleInputChange}
           onSubmit={submitInput}
           placeholder={onboarding ? onboardingDefault(onboarding) : "/ for commands"}
-          focus={!approvalVisible}
+          focus={!approvalVisible && !installVisible}
         />
-        {menuVisible && !approvalVisible ? (
+        {menuVisible && !approvalVisible && !installVisible ? (
           <SlashMenu
             suggestions={suggestions}
             selected={Math.min(menuIndex, Math.max(suggestions.length - 1, 0))}

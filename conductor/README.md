@@ -153,6 +153,15 @@ selectable options (`y`/`n`, `1`/`2`, arrows + Enter; left/right walk the
 queue when several requests are pending; Esc denies). Without an attached
 TUI, the request falls back to the lower backend's existing permission flow.
 
+`/tunnel start` needs the `cloudflared` binary. When it is missing, the TUI
+does not just error out — it shows an install confirmation (`y`/`n`). On
+accept it installs cloudflared for you (`brew install cloudflared` on macOS
+when Homebrew is present, otherwise the official release binary is downloaded
+to `~/.ctc/bin/cloudflared`), streams progress, and then starts the tunnel.
+The managed binary under `~/.ctc/bin` is preferred on later runs, so the
+install is a one-time step. Platforms without a published build report that
+plainly instead of offering an install.
+
 ## M5 Surface
 
 The ChatGPT Apps adapter is optional and remains isolated under
