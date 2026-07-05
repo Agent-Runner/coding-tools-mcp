@@ -168,12 +168,16 @@ export class TuiSessionController {
   }
 
   async startTunnel(command: TunnelCommand): Promise<TuiTunnelResult> {
+    // A tunnel in front of a session-less server can only answer 503, which remote
+    // connectors surface as a failed setup. Refuse early with the fix instead.
+    if (this.sessions.size === 0) {
+      throw new Error("No live session to expose. Run /new to open a workspace session, then /tunnel start again.");
+    }
     const http = await this.ensureHttpServer();
     if (!http.origin) throw new Error("HTTP MCP server is not listening.");
     const state = await this.tunnel.start(http.origin, command);
     http.setBearerToken(state.token);
-    const sampleSession = this.sessions.keys().next().value;
-    const route = `${state.publicUrl ?? "<public-url>"}/mcp/${sampleSession ?? "<session-id>"}`;
+    const route = `${state.publicUrl ?? "<public-url>"}/mcp`;
     return {
       state,
       message: `Tunnel ready via ${command.label}: ${route} with Authorization: Bearer ${state.token ?? "<token>"}`,
@@ -246,7 +250,7 @@ export class TuiSessionController {
 
   private async registerHttpSession(sessionId: string, runtime: ConductorRuntime, workspacePath: string): Promise<string> {
     const http = await this.ensureHttpServer(workspacePath);
-    const registered = await http.registerSession(sessionId, runtime.createServer());
+    const registered = await http.registerSession(sessionId, () => runtime.createServer());
     return registered.url;
   }
 

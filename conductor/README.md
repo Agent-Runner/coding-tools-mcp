@@ -154,9 +154,11 @@ queue when several requests are pending; Esc denies). Without an attached
 TUI, the request falls back to the lower backend's existing permission flow.
 
 `/tunnel start` exposes the MCP server over a free try.cloudflare.com tunnel.
-If `cloudflared` is already installed it starts immediately. Otherwise the TUI
-does not dead-end — it opens a picker (arrows/number keys, Enter, Esc) of the
-ways this host can run a tunnel:
+It requires a live session (`/new`) — a tunnel in front of a session-less
+server could only answer 503, which remote connectors surface as a failed
+setup. If `cloudflared` is already installed it starts immediately. Otherwise
+the TUI does not dead-end — it opens a picker (arrows/number keys, Enter, Esc)
+of the ways this host can run a tunnel:
 
 - **Use wrangler (no install)** — runs `wrangler tunnel quick-start <url>`,
   using a `wrangler` on PATH or `npx wrangler` (the first `npx` run downloads
@@ -168,6 +170,30 @@ ways this host can run a tunnel:
 
 Both providers surface the same `*.trycloudflare.com` URL. Hosts with neither
 cloudflared nor `npx` say so plainly instead of hanging.
+
+Model clients connect to the stable `/mcp` endpoint (locally
+`http://127.0.0.1:<port>/mcp`, through a tunnel `https://<tunnel-host>/mcp`).
+The port is persisted in the workspace profile, so a client configured once
+keeps working across ctc restarts. `/mcp` always serves the most recently
+opened session; `/mcp/<session-id>` remains available to pin a specific one
+when several sessions are live. Following the Streamable HTTP spec, each
+client that POSTs an `initialize` request gets its own MCP session (routed by
+the `Mcp-Session-Id` header), so any number of clients can connect, reconnect,
+and terminate sessions independently.
+
+Conductor speaks both remote MCP transports, so connector platforms that
+probe or only implement the legacy 2024-11-05 HTTP+SSE transport connect too:
+a `GET /sse` — or a `GET /mcp` with an SSE `Accept` and no `Mcp-Session-Id`,
+which is the spec's transport-fallback probe — opens the old handshake
+(`endpoint` event, messages POSTed to `/messages?sessionId=...`, keepalive
+pings so free tunnels do not idle the stream out). Common URL misconfigurations
+stay routable instead of dead-ending in 404s: the bare tunnel origin `/` is an
+alias for `/mcp`, and a plain browser/curl GET on `/`, `/mcp`, or
+`/.well-known/mcp.json` returns a small server card describing the endpoints
+and auth mode (the card and `/.well-known` stay readable without the bearer
+token; everything else remains gated). When no ctc session is live, MCP
+endpoints answer `503` rather than `404`, so clients report a temporarily
+unavailable server instead of a wrong URL.
 
 ## M5 Surface
 

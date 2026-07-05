@@ -1,0 +1,37 @@
+Coding Tools MCP Source-Available License v1.0
+
+Copyright (c) 2026 Coding Tools MCP Contributors.
+All rights reserved except as expressly granted below.
+
+1. Permitted Use
+
+You may view, clone, build, run, and modify the Software solely for internal
+evaluation, development, testing, and security review.
+
+2. Restrictions
+
+Without prior written permission from the copyright holders, you may not:
+
+- distribute, publish, sublicense, sell, lease, or otherwise transfer the
+  Software or modified versions of the Software;
+- provide the Software or modified versions as a hosted, managed, or
+  software-as-a-service offering for third parties;
+- use the Software or modified versions for production commercial purposes;
+- remove or alter copyright, license, or attribution notices;
+- use the project name, trademarks, or branding to imply endorsement.
+
+3. Contributions
+
+Unless a separate written agreement says otherwise, any contribution submitted
+to this project may be used by the copyright holders under this license and
+under any future license chosen by the copyright holders.
+
+4. No Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
+OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
