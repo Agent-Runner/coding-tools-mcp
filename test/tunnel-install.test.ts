@@ -3,12 +3,15 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  availableTunnelMethods,
   cloudflaredInstallPlan,
   describeInstallPlan,
   findOnPath,
   installCloudflared,
   managedCloudflaredPath,
   resolveCloudflared,
+  wranglerAvailable,
+  wranglerCommand,
   type CloudflaredInstallPlan,
   type InstallDeps,
 } from "../src/tunnel/install.js";
@@ -74,6 +77,52 @@ describe("findOnPath / resolveCloudflared", () => {
     await mkdir(dirname(managed), { recursive: true });
     await writeFile(managed, "#!/bin/sh\n");
     expect(resolveCloudflared(process.env, "linux")).toEqual({ binary: managed, installed: true });
+  });
+});
+
+describe("wrangler provider", () => {
+  it("runs a wrangler on PATH directly, else falls back to npx", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ctc-wrangler-"));
+    await writeFile(join(dir, "wrangler"), "#!/bin/sh\n");
+    const withWrangler = { PATH: dir };
+    const direct = wranglerCommand(withWrangler, "linux");
+    expect(direct.command).toBe(join(dir, "wrangler"));
+    expect(direct.baseArgs).toEqual(["tunnel", "quick-start"]);
+
+    const npxDir = await mkdtemp(join(tmpdir(), "ctc-npx-"));
+    await writeFile(join(npxDir, "npx"), "#!/bin/sh\n");
+    const viaNpx = wranglerCommand({ PATH: npxDir }, "linux");
+    expect(viaNpx.command).toBe("npx");
+    expect(viaNpx.baseArgs).toEqual(["-y", "wrangler", "tunnel", "quick-start"]);
+
+    expect(wranglerAvailable({ PATH: dir }, "linux")).toBe(true);
+    expect(wranglerAvailable({ PATH: "/nonexistent" }, "linux")).toBe(false);
+  });
+});
+
+describe("availableTunnelMethods", () => {
+  it("offers wrangler (no install) and cloudflared install when the binary is missing", async () => {
+    const npxDir = await mkdtemp(join(tmpdir(), "ctc-npx-only-"));
+    await writeFile(join(npxDir, "npx"), "#!/bin/sh\n");
+    const methods = availableTunnelMethods({ PATH: npxDir }, "linux", "x64");
+    expect(methods.map((method) => method.id)).toEqual(["wrangler", "install-cloudflared"]);
+    const wrangler = methods.find((method) => method.id === "wrangler");
+    expect(wrangler?.note).toMatch(/npx wrangler/);
+  });
+
+  it("prefers an installed cloudflared and lists it first", async () => {
+    const managed = managedCloudflaredPath("linux");
+    await mkdir(dirname(managed), { recursive: true });
+    await writeFile(managed, "#!/bin/sh\n");
+    const methods = availableTunnelMethods({ PATH: "/nonexistent" }, "linux", "x64");
+    expect(methods[0]?.id).toBe("cloudflared");
+  });
+
+  it("still offers wrangler on platforms without a cloudflared build", async () => {
+    const npxDir = await mkdtemp(join(tmpdir(), "ctc-npx-freebsd-"));
+    await writeFile(join(npxDir, "npx"), "#!/bin/sh\n");
+    const methods = availableTunnelMethods({ PATH: npxDir }, "freebsd", "x64");
+    expect(methods.map((method) => method.id)).toEqual(["wrangler"]);
   });
 });
 

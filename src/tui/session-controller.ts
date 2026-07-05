@@ -22,11 +22,13 @@ import {
   type SessionEventSink,
 } from "../sessions/events.js";
 import {
-  cloudflaredInstallPlan,
+  availableTunnelMethods,
+  cloudflaredCommand,
   defaultInstallDeps,
-  describeInstallPlan,
   installCloudflared,
-  resolveCloudflared,
+  type CloudflaredInstallPlan,
+  type TunnelCommand,
+  type TunnelMethod,
 } from "../tunnel/install.js";
 import { TunnelManager, type TunnelState } from "../tunnel/manager.js";
 import {
@@ -61,7 +63,7 @@ export interface TuiTunnelResult {
   message: string;
 }
 
-export type TunnelReadiness = { ready: true } | { ready: false; installable: boolean; description: string };
+export type { TunnelMethod };
 
 interface HostedSession {
   runtime: ConductorRuntime;
@@ -154,30 +156,27 @@ export class TuiSessionController {
     else await respondToFileApproval(sessionId, requestId, approved);
   }
 
-  /** Whether cloudflared can be spawned, and if not, whether ctc can install it. */
-  tunnelReadiness(): TunnelReadiness {
-    if (resolveCloudflared().installed) return { ready: true };
-    const plan = cloudflaredInstallPlan();
-    if (plan.method === "unsupported") return { ready: false, installable: false, description: plan.reason };
-    return { ready: false, installable: true, description: describeInstallPlan(plan) };
+  /** Ordered ways to start a tunnel on this host (run cloudflared/wrangler, or install). */
+  tunnelMethods(): TunnelMethod[] {
+    return availableTunnelMethods();
   }
 
-  /** Install cloudflared per the platform plan, streaming progress lines. */
-  async installTunnelProvider(onLog: (line: string) => void): Promise<string> {
-    const plan = cloudflaredInstallPlan();
-    return installCloudflared(plan, defaultInstallDeps(onLog));
+  /** Install cloudflared per the platform plan, returning its ready run command. */
+  async installCloudflaredProvider(plan: CloudflaredInstallPlan, onLog: (line: string) => void): Promise<TunnelCommand> {
+    const path = await installCloudflared(plan, defaultInstallDeps(onLog));
+    return cloudflaredCommand(path);
   }
 
-  async startTunnel(): Promise<TuiTunnelResult> {
+  async startTunnel(command: TunnelCommand): Promise<TuiTunnelResult> {
     const http = await this.ensureHttpServer();
     if (!http.origin) throw new Error("HTTP MCP server is not listening.");
-    const state = await this.tunnel.start(http.origin, resolveCloudflared().binary);
+    const state = await this.tunnel.start(http.origin, command);
     http.setBearerToken(state.token);
     const sampleSession = this.sessions.keys().next().value;
     const route = `${state.publicUrl ?? "<public-url>"}/mcp/${sampleSession ?? "<session-id>"}`;
     return {
       state,
-      message: `Tunnel ready: ${route} with Authorization: Bearer ${state.token ?? "<token>"}`,
+      message: `Tunnel ready via ${command.label}: ${route} with Authorization: Bearer ${state.token ?? "<token>"}`,
     };
   }
 

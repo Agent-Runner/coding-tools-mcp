@@ -153,14 +153,21 @@ selectable options (`y`/`n`, `1`/`2`, arrows + Enter; left/right walk the
 queue when several requests are pending; Esc denies). Without an attached
 TUI, the request falls back to the lower backend's existing permission flow.
 
-`/tunnel start` needs the `cloudflared` binary. When it is missing, the TUI
-does not just error out — it shows an install confirmation (`y`/`n`). On
-accept it installs cloudflared for you (`brew install cloudflared` on macOS
-when Homebrew is present, otherwise the official release binary is downloaded
-to `~/.ctc/bin/cloudflared`), streams progress, and then starts the tunnel.
-The managed binary under `~/.ctc/bin` is preferred on later runs, so the
-install is a one-time step. Platforms without a published build report that
-plainly instead of offering an install.
+`/tunnel start` exposes the MCP server over a free try.cloudflare.com tunnel.
+If `cloudflared` is already installed it starts immediately. Otherwise the TUI
+does not dead-end — it opens a picker (arrows/number keys, Enter, Esc) of the
+ways this host can run a tunnel:
+
+- **Use wrangler (no install)** — runs `wrangler tunnel quick-start <url>`,
+  using a `wrangler` on PATH or `npx wrangler` (the first `npx` run downloads
+  wrangler and can take a minute). Nothing is installed permanently.
+- **Install cloudflared** — `brew install cloudflared` on macOS when Homebrew
+  is present, otherwise the official release binary is downloaded to
+  `~/.ctc/bin/cloudflared`. Progress streams into the transcript, and the
+  managed binary is preferred on later runs, so this is a one-time step.
+
+Both providers surface the same `*.trycloudflare.com` URL. Hosts with neither
+cloudflared nor `npx` say so plainly instead of hanging.
 
 ## M5 Surface
 

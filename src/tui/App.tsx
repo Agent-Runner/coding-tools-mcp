@@ -11,8 +11,8 @@ import {
   suggestSlashCommands,
 } from "./commands/registry.js";
 import { ApprovalPrompt } from "./components/ApprovalPrompt.js";
+import { ChoicePrompt } from "./components/ChoicePrompt.js";
 import { Composer, SlashMenu } from "./components/Composer.js";
-import { ConfirmPrompt } from "./components/ConfirmPrompt.js";
 import { OnboardingView, optionsForStep } from "./components/OnboardingView.js";
 import {
   ScrollPanel,
@@ -31,7 +31,7 @@ import {
   onboardingDefault,
   type OnboardingState,
 } from "./onboarding.js";
-import { TuiSessionController } from "./session-controller.js";
+import { TuiSessionController, type TunnelMethod } from "./session-controller.js";
 import { TuiSnapshotStore } from "./store.js";
 import { glyphs, palette, spinnerFrames, type DisplayLine } from "./theme.js";
 import { TranscriptBuilder, type NoteKind, type TranscriptItem } from "./transcript.js";
@@ -133,8 +133,8 @@ export function TuiApp({
   const ctrlCTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const [tunnelMessage, setTunnelMessage] = useState(() => controller.tunnelStatus().message);
-  const [installPrompt, setInstallPrompt] = useState<{ description: string } | undefined>(undefined);
-  const [installChoice, setInstallChoice] = useState(0);
+  const [tunnelMethods, setTunnelMethods] = useState<TunnelMethod[] | undefined>(undefined);
+  const [tunnelChoice, setTunnelChoice] = useState(0);
 
   // The menu is a command picker: it opens on "/name" and closes once you type a
   // space and move on to arguments (matching Codex CLI / OpenCode).
@@ -160,7 +160,7 @@ export function TuiApp({
   }, [snapshot.pendingApprovals, snapshot.allPendingApprovals]);
   const approvalVisible = approvalQueue.length > 0 && !onboarding;
   const activeApproval = approvalQueue[Math.min(approvalCursor, Math.max(approvalQueue.length - 1, 0))];
-  const installVisible = Boolean(installPrompt) && !onboarding && !approvalVisible;
+  const tunnelPickVisible = Boolean(tunnelMethods?.length) && !onboarding && !approvalVisible;
 
   const onboardingOptions = useMemo(() => (onboarding ? optionsForStep(onboarding) : []), [onboarding]);
 
@@ -564,44 +564,56 @@ export function TuiApp({
     });
   };
 
-  const startTunnel = async (): Promise<void> => {
-    const result = await controller.startTunnel();
-    setTunnelMessage(result.state.message);
-    appendNote(result.message, "success");
-  };
-
-  const confirmInstallProvider = (accept: boolean): void => {
-    if (!installPrompt) return;
-    setInstallPrompt(undefined);
-    setInstallChoice(0);
-    if (!accept) {
-      appendNote("Skipped install. Run /tunnel start after installing cloudflared, or /config tunnel none.", "hint");
-      return;
-    }
-    void runWithBusy("Installing cloudflared", async () => {
-      const path = await controller.installTunnelProvider((line) => {
-        appendNote(line, "info");
-      });
-      appendNote(`cloudflared ready at ${path}.`, "success");
-      await startTunnel();
+  const startTunnelWith = async (method: TunnelMethod): Promise<void> => {
+    await runWithBusy(method.kind === "install" ? "Installing cloudflared" : `Starting tunnel via ${method.label}`, async () => {
+      if (method.note) appendNote(method.note, "hint");
+      const command =
+        method.kind === "install"
+          ? await controller.installCloudflaredProvider(method.plan, (line) => {
+              appendNote(line, "info");
+            })
+          : method.command;
+      const result = await controller.startTunnel(command);
+      setTunnelMessage(result.state.message);
+      appendNote(result.message, "success");
       store.requestRefresh();
     });
   };
 
+  const pickTunnelMethod = (method: TunnelMethod | undefined): void => {
+    setTunnelMethods(undefined);
+    setTunnelChoice(0);
+    if (!method) {
+      appendNote("Tunnel canceled. Run /tunnel start to try again, or /config tunnel none.", "hint");
+      return;
+    }
+    void startTunnelWith(method);
+  };
+
   const runTunnelCommand = async (args: string[]): Promise<void> => {
+    let parsedTunnel;
+    try {
+      parsedTunnel = parseTunnelCommand(args);
+    } catch (error) {
+      appendNote(errorMessage(error), "error");
+      return;
+    }
+    if (parsedTunnel.action === "start") {
+      // startTunnelWith owns its own busy spinner, so don't nest one here.
+      const methods = controller.tunnelMethods();
+      const ready = methods.find((method) => method.id === "cloudflared");
+      if (ready) {
+        await startTunnelWith(ready); // cloudflared already installed — no prompt
+      } else if (methods.length) {
+        setTunnelChoice(0);
+        setTunnelMethods(methods);
+      } else {
+        appendNote("No tunnel provider available. Install cloudflared or Node's npx, then retry.", "error");
+      }
+      return;
+    }
     await runWithBusy("Updating tunnel", async () => {
-      const parsedTunnel = parseTunnelCommand(args);
-      if (parsedTunnel.action === "start") {
-        const readiness = controller.tunnelReadiness();
-        if (readiness.ready) {
-          await startTunnel();
-        } else if (readiness.installable) {
-          setInstallChoice(0);
-          setInstallPrompt({ description: `cloudflared is not installed. Let ctc ${readiness.description}?` });
-        } else {
-          appendNote(`Cannot start tunnel: ${readiness.description}`, "error");
-        }
-      } else if (parsedTunnel.action === "stop") {
+      if (parsedTunnel.action === "stop") {
         const result = await controller.stopTunnel();
         setTunnelMessage(result.state.message);
         appendNote(result.message, "info");
@@ -674,12 +686,14 @@ export function TuiApp({
       else if (key.rightArrow) setApprovalCursor((cursor) => Math.min(approvalQueue.length - 1, cursor + 1));
       return;
     }
-    if (installVisible) {
-      if (inputChar === "y" || inputChar === "Y" || inputChar === "1") confirmInstallProvider(true);
-      else if (inputChar === "n" || inputChar === "N" || inputChar === "2" || key.escape) confirmInstallProvider(false);
-      else if (key.upArrow) setInstallChoice(0);
-      else if (key.downArrow) setInstallChoice(1);
-      else if (key.return) confirmInstallProvider(installChoice === 0);
+    if (tunnelPickVisible && tunnelMethods) {
+      const count = tunnelMethods.length;
+      const digit = Number.parseInt(inputChar, 10);
+      if (key.escape || inputChar === "n" || inputChar === "N") pickTunnelMethod(undefined);
+      else if (Number.isInteger(digit) && digit >= 1 && digit <= count) pickTunnelMethod(tunnelMethods[digit - 1]);
+      else if (key.upArrow) setTunnelChoice((choice) => Math.max(0, choice - 1));
+      else if (key.downArrow) setTunnelChoice((choice) => Math.min(count - 1, choice + 1));
+      else if (key.return) pickTunnelMethod(tunnelMethods[Math.min(tunnelChoice, count - 1)]);
       return;
     }
     if (key.ctrl && (inputChar === "o" || inputChar === "O" || inputChar === "\u000F")) {
@@ -739,8 +753,8 @@ export function TuiApp({
       ? `↑/↓ choose ${glyphs.dot} Enter accept ${glyphs.dot} or type a value`
       : approvalVisible
         ? "Answer the permission request above"
-        : installVisible
-          ? "Install cloudflared? y / n"
+        : tunnelPickVisible
+          ? "Pick a tunnel provider above · Esc cancels"
           : panel
           ? `↑/↓ scroll ${glyphs.dot} ←/→ page ${glyphs.dot} Esc close`
           : menuVisible
@@ -761,13 +775,12 @@ export function TuiApp({
             choice={approvalChoice}
             width={textWidth}
           />
-        ) : installVisible && installPrompt ? (
-          <ConfirmPrompt
-            title="Install cloudflared?"
-            body={installPrompt.description}
-            confirmLabel="Install"
-            cancelLabel="Not now"
-            choice={installChoice}
+        ) : tunnelPickVisible && tunnelMethods ? (
+          <ChoicePrompt
+            title="Start a public tunnel with…"
+            body="cloudflared was not found. Pick how to expose this MCP server."
+            options={tunnelMethods.map((method) => ({ label: method.label, hint: method.note }))}
+            selected={Math.min(tunnelChoice, tunnelMethods.length - 1)}
           />
         ) : panel ? (
           <ScrollPanel title={PANEL_TITLES[panel.kind]} lines={panelLines} scroll={scroll} height={panelHeight} />
@@ -784,9 +797,9 @@ export function TuiApp({
           onChange={handleInputChange}
           onSubmit={submitInput}
           placeholder={onboarding ? onboardingDefault(onboarding) : "/ for commands"}
-          focus={!approvalVisible && !installVisible}
+          focus={!approvalVisible && !tunnelPickVisible}
         />
-        {menuVisible && !approvalVisible && !installVisible ? (
+        {menuVisible && !approvalVisible && !tunnelPickVisible ? (
           <SlashMenu
             suggestions={suggestions}
             selected={Math.min(menuIndex, Math.max(suggestions.length - 1, 0))}
