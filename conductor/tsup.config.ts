@@ -7,5 +7,9 @@ export default defineConfig({
   dts: true,
   clean: true,
   splitting: false,
-  sourcemap: true,
+  // Never ship sourcemaps: with sourcesContent they embed the full TypeScript
+  // source in the npm tarball. Minify so the published bundle is not
+  // readable-as-source either.
+  sourcemap: false,
+  minify: true,
 });
