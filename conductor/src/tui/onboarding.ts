@@ -1,7 +1,7 @@
 import { defaultBackendForPath, readProfileForPath, resolveProfileTargetPath, writeProfileForPath } from "../profiles/config.js";
 import type { BackendConfig, WorkspaceMode, WorkspaceProfile } from "../shared/types.js";
 
-export type OnboardingStep = "backend" | "workspace" | "permissions";
+export type OnboardingStep = "backend" | "permissions";
 export type PermissionMode = "safe" | "trusted";
 
 export interface OnboardingState {
@@ -22,7 +22,8 @@ export async function loadOnboardingState(path: string | undefined): Promise<Onb
     repoPath,
     step: "backend",
     backend: defaultBackendForPath(repoPath),
-    defaultMode: "worktree",
+    // Editing the repo in place is the default; /new --worktree opts into isolation.
+    defaultMode: "direct",
     permissionMode: "safe",
     complete: false,
   };
@@ -31,10 +32,7 @@ export async function loadOnboardingState(path: string | undefined): Promise<Onb
 export async function advanceOnboarding(state: OnboardingState, value: string): Promise<OnboardingState> {
   const input = value.trim();
   if (state.step === "backend") {
-    return { ...state, backend: parseBackendInput(state.repoPath, input), step: "workspace" };
-  }
-  if (state.step === "workspace") {
-    return { ...state, defaultMode: parseWorkspaceMode(input), step: "permissions" };
+    return { ...state, backend: parseBackendInput(state.repoPath, input), step: "permissions" };
   }
 
   const complete = { ...state, permissionMode: parsePermissionMode(input), complete: true };
@@ -44,13 +42,11 @@ export async function advanceOnboarding(state: OnboardingState, value: string): 
 
 export function onboardingPrompt(state: OnboardingState): string {
   if (state.step === "backend") return "Backend: stdio default, or paste an http(s) URL";
-  if (state.step === "workspace") return "Workspace mode: worktree default, or direct";
   return "Permission mode: safe default, or trusted";
 }
 
 export function onboardingDefault(state: OnboardingState): string {
   if (state.step === "backend") return backendLabel(state.backend);
-  if (state.step === "workspace") return state.defaultMode;
   return state.permissionMode;
 }
 
@@ -70,12 +66,6 @@ function parseBackendInput(repoPath: string, input: string): BackendConfig {
   if (input === "remote") throw new Error("Paste the remote MCP HTTP URL, for example http://127.0.0.1:8765/mcp.");
   if (/^https?:\/\//u.test(input)) return { type: "http", url: input };
   throw new Error(`Unsupported backend ${input}. Use stdio, docker, or an http(s) URL.`);
-}
-
-function parseWorkspaceMode(input: string): WorkspaceMode {
-  if (!input || input === "worktree") return "worktree";
-  if (input === "direct") return "direct";
-  throw new Error(`Unsupported workspace mode ${input}. Use worktree or direct.`);
 }
 
 function parsePermissionMode(input: string): PermissionMode {

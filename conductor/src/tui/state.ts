@@ -19,7 +19,7 @@ export interface TuiSnapshot {
   sessionId?: string;
   logPath?: string;
   initialWorkspacePath?: string;
-  sessions: TuiSessionSummary[];
+  label?: string;
   events: ConductorEvent[];
   toolCalls: ToolCallEvent[];
   checkpoints: ReviewCheckpointEvent[];
@@ -27,7 +27,6 @@ export interface TuiSnapshot {
   workspace?: WorkspaceState;
   baton?: BatonBundle;
   pendingApprovals: PermissionApprovalRequest[];
-  allPendingApprovals: PermissionApprovalRequest[];
   mcpServers: McpServerStatusSnapshot[];
 }
 
@@ -42,53 +41,35 @@ export interface McpServerStatusSnapshot {
   lastChangedTs?: string;
 }
 
-export interface TuiSessionSummary {
-  sessionId: string;
-  label: string;
-  logPath: string;
-  mtimeMs: number;
-  owner: "stdio" | "tui";
-  mode?: string;
-  workspacePath?: string;
-  backendConnected?: boolean;
-  pendingApprovalCount: number;
-  attached: boolean;
-}
-
 export interface LoadTuiSnapshotOptions {
   requestedSessionId?: string;
   initialWorkspacePath?: string;
 }
 
 export async function loadTuiSnapshot(options: LoadTuiSnapshotOptions = {}): Promise<TuiSnapshot> {
-  const sessions = await listTuiSessions();
-  const requestedSessionId = options.requestedSessionId;
-  const logPath = findSessionLog(sessions, requestedSessionId);
-  const allPendingApprovals = await listAllPendingApprovals(sessions);
-  if (!logPath) {
+  const sessionId = options.requestedSessionId;
+  if (!sessionId) {
     return {
       initialWorkspacePath: options.initialWorkspacePath,
-      sessions,
       events: [],
       toolCalls: [],
       checkpoints: [],
       pendingApprovals: [],
-      allPendingApprovals,
       mcpServers: [],
     };
   }
-  const sessionId = sessionIdFromLogPath(logPath);
+  const logPath = join(ctcHome(), "logs", `${sessionId}.jsonl`);
   const events = await readEventLog(logPath);
   const session = lastOfType(events, "session_started");
-  const workspace = sessionId ? await readWorkspaceSession(sessionId) : undefined;
+  const workspace = await readWorkspaceSession(sessionId);
   const root = workspace?.activePath ?? session?.workspacePath;
   const baton = root ? await readBatonBundle(root).catch(() => undefined) : undefined;
-  const pendingApprovals = sessionId ? await listPendingApprovals(sessionId).catch(() => []) : [];
+  const pendingApprovals = await listPendingApprovals(sessionId).catch(() => []);
   return {
     sessionId,
     logPath,
     initialWorkspacePath: options.initialWorkspacePath,
-    sessions,
+    label: labelForSession(sessionId, workspace?.activePath ?? session?.workspacePath),
     events,
     toolCalls: events.filter((event): event is ToolCallEvent => event.type === "tool_call"),
     checkpoints: events.filter((event): event is ReviewCheckpointEvent => event.type === "review_checkpoint"),
@@ -96,9 +77,21 @@ export async function loadTuiSnapshot(options: LoadTuiSnapshotOptions = {}): Pro
     workspace,
     baton,
     pendingApprovals,
-    allPendingApprovals,
     mcpServers: deriveMcpServers(events),
   };
+}
+
+/** Newest session log id by mtime — one-shot startup helper for bare `ctc tui`. */
+export async function latestSessionLogId(): Promise<string | undefined> {
+  const dir = join(ctcHome(), "logs");
+  if (!existsSync(dir)) return undefined;
+  const entries = await Promise.all(
+    (await readdir(dir))
+      .filter((name) => name.endsWith(".jsonl"))
+      .map(async (name) => ({ name, mtimeMs: (await stat(join(dir, name))).mtimeMs })),
+  );
+  const newest = entries.sort((a, b) => b.mtimeMs - a.mtimeMs)[0];
+  return newest ? basename(newest.name, ".jsonl") : undefined;
 }
 
 /**
@@ -137,48 +130,6 @@ export function deriveMcpServers(events: ConductorEvent[]): McpServerStatusSnaps
     });
   }
   return [...servers.values()];
-}
-
-export async function listTuiSessions(): Promise<TuiSessionSummary[]> {
-  const dir = join(ctcHome(), "logs");
-  if (!existsSync(dir)) return [];
-  const entries = await Promise.all(
-    (await readdir(dir))
-      .filter((name) => name.endsWith(".jsonl"))
-      .map(async (name) => summarizeSessionLog(join(dir, name), (await stat(join(dir, name))).mtimeMs)),
-  );
-  return entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
-}
-
-function findSessionLog(sessions: TuiSessionSummary[], sessionId?: string): string | undefined {
-  if (sessionId) return sessions.find((session) => session.sessionId === sessionId)?.logPath;
-  return sessions[0]?.logPath;
-}
-
-async function summarizeSessionLog(logPath: string, mtimeMs: number): Promise<TuiSessionSummary> {
-  const sessionId = sessionIdFromLogPath(logPath);
-  const events = await readEventLog(logPath);
-  const session = lastOfType(events, "session_started");
-  const workspace = await readWorkspaceSession(sessionId).catch(() => undefined);
-  const workspacePath = workspace?.activePath ?? session?.workspacePath;
-  const pendingApprovalCount = await listPendingApprovals(sessionId).then((requests) => requests.length, () => 0);
-  return {
-    sessionId,
-    label: labelForSession(sessionId, workspacePath),
-    logPath,
-    mtimeMs,
-    mode: workspace?.mode ?? session?.defaultMode,
-    workspacePath,
-    backendConnected: session?.backendStatus.connected,
-    pendingApprovalCount,
-    owner: session?.owner ?? "stdio",
-    attached: session?.owner !== "tui",
-  };
-}
-
-async function listAllPendingApprovals(sessions: TuiSessionSummary[]): Promise<PermissionApprovalRequest[]> {
-  const pending = await Promise.all(sessions.map((session) => listPendingApprovals(session.sessionId).catch(() => [])));
-  return pending.flat().sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
 interface LogCacheEntry {
@@ -278,10 +229,6 @@ function lastOfType<T extends ConductorEvent["type"]>(
     if (event?.type === type) return event as Extract<ConductorEvent, { type: T }>;
   }
   return undefined;
-}
-
-function sessionIdFromLogPath(path: string): string {
-  return basename(path, ".jsonl");
 }
 
 function labelForSession(sessionId: string, workspacePath?: string): string {

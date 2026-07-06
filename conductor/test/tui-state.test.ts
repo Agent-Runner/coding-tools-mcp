@@ -4,10 +4,10 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createApprovalRequest } from "../src/shared/approvals.js";
 import type { ConductorEvent } from "../src/shared/types.js";
-import { deriveMcpServers, listTuiSessions, loadTuiSnapshot } from "../src/tui/state.js";
+import { deriveMcpServers, latestSessionLogId, loadTuiSnapshot } from "../src/tui/state.js";
 
 describe("TUI session state", () => {
-  it("loads attached v1 sessions from JSONL logs", async () => {
+  it("loads only the requested session's log and approvals", async () => {
     const home = await mkdtemp(join(tmpdir(), "ctc-tui-home-"));
     process.env.CTC_HOME = home;
     await mkdir(join(home, "logs"), { recursive: true });
@@ -16,15 +16,35 @@ describe("TUI session state", () => {
     await writeSessionLog(home, "session-b", "/repo/web", "worktree");
     await createApprovalRequest("session-b", "{\"permission\":\"network\"}", { permission: "network" });
 
-    const sessions = await listTuiSessions();
-    expect(sessions.map((session) => session.sessionId)).toEqual(expect.arrayContaining(["session-a", "session-b"]));
-    expect(sessions.find((session) => session.sessionId === "session-b")?.pendingApprovalCount).toBe(1);
-
     const snapshot = await loadTuiSnapshot({ requestedSessionId: "session-b", initialWorkspacePath: "/repo/web" });
     expect(snapshot.sessionId).toBe("session-b");
     expect(snapshot.session?.workspacePath).toBe("/repo/web");
+    expect(snapshot.events.every((event) => event.sessionId === "session-b")).toBe(true);
     expect(snapshot.pendingApprovals).toHaveLength(1);
-    expect(snapshot.allPendingApprovals).toHaveLength(1);
+    expect(snapshot.label).toBe("web");
+
+    const other = await loadTuiSnapshot({ requestedSessionId: "session-a" });
+    expect(other.pendingApprovals).toHaveLength(0);
+  });
+
+  it("returns an empty snapshot without a requested session id", async () => {
+    process.env.CTC_HOME = await mkdtemp(join(tmpdir(), "ctc-tui-home-"));
+    const snapshot = await loadTuiSnapshot({ initialWorkspacePath: "/repo" });
+    expect(snapshot.sessionId).toBeUndefined();
+    expect(snapshot.events).toEqual([]);
+    expect(snapshot.pendingApprovals).toEqual([]);
+  });
+
+  it("latestSessionLogId picks the newest log by mtime", async () => {
+    const home = await mkdtemp(join(tmpdir(), "ctc-tui-home-"));
+    process.env.CTC_HOME = home;
+    await mkdir(join(home, "logs"), { recursive: true });
+    await expect(latestSessionLogId()).resolves.toBeUndefined();
+
+    await writeSessionLog(home, "session-old", "/repo/api", "direct");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await writeSessionLog(home, "session-new", "/repo/web", "direct");
+    await expect(latestSessionLogId()).resolves.toBe("session-new");
   });
 
   it("keeps server_status events when parsing logs and derives per-server rows", async () => {

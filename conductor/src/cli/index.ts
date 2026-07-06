@@ -4,6 +4,7 @@ import { printBatonShow } from "./baton.js";
 import { printDoctor } from "./doctor.js";
 import { resolveRuntimeOptions } from "../profiles/config.js";
 import { startConductorServer } from "../server/mcp.js";
+import { latestSessionLogId } from "../tui/state.js";
 import { runSetupCli } from "./setup.js";
 import { runTui } from "../tui/run.js";
 import { cleanWorkspacesCli, mergeWorkspaceCli, printWorkspaceList } from "./workspace.js";
@@ -14,7 +15,7 @@ program
   .name("ctc")
   .description("Coding Tools Conductor")
   .version("0.1.0")
-  .argument("[path]", "workspace path for the initial TUI workspace")
+  .argument("[path]", "repo to open the session for")
   .action(async (path: string | undefined) => {
     await runTui({ initialWorkspacePath: path ?? process.cwd() });
   });
@@ -80,11 +81,17 @@ program
 
 program
   .command("tui")
-  .argument("[session-id]", "session id to attach; defaults to the latest log")
-  .description("deprecated alias for ctc; attaches to a v1 session when a session id is provided")
+  .argument("[session-id]", "session id to observe; defaults to the latest log")
+  .description("observe an external ctc start session read-only and answer its permission prompts")
   .action(async (sessionId: string | undefined) => {
-    process.stderr.write("ctc: `ctc tui` is deprecated; use `ctc` to open the TUI.\n");
-    await runTui({ requestedSessionId: sessionId, initialWorkspacePath: process.cwd() });
+    const resolved = sessionId ?? (await latestSessionLogId());
+    if (!resolved) {
+      process.stderr.write("ctc: no session logs found under ~/.ctc/logs.\n");
+      process.exitCode = 1;
+      return;
+    }
+    if (!sessionId) process.stderr.write(`ctc: attaching to latest session ${resolved}; pass a session id to pick another.\n`);
+    await runTui({ requestedSessionId: resolved, initialWorkspacePath: process.cwd() });
   });
 
 const ws = program.command("ws").description("manage ctc worktree workspaces");

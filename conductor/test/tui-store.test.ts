@@ -71,15 +71,29 @@ describe("TuiSnapshotStore", () => {
     expect(store.requestedSession()).toBe("session-b");
   });
 
-  it("fingerprints ignore session ordering churn but track content", () => {
+  it("fingerprints track pending approvals and workspace close transitions", () => {
     const base = snapshotWithEvents([toolCall("read_file")]);
-    const sessionA = { sessionId: "a", label: "a", logPath: "a", mtimeMs: 1, owner: "stdio" as const, pendingApprovalCount: 0, attached: true };
-    const sessionB = { ...sessionA, sessionId: "b", label: "b", logPath: "b", mtimeMs: 2 };
-    const one = fingerprintSnapshot({ ...base, sessions: [sessionA, sessionB] });
-    const two = fingerprintSnapshot({ ...base, sessions: [sessionB, sessionA] });
-    expect(one).toBe(two);
-    const three = fingerprintSnapshot({ ...base, sessions: [sessionA, { ...sessionB, pendingApprovalCount: 1 }] });
-    expect(three).not.toBe(one);
+    const approval = {
+      id: "req-1",
+      sessionId: "session-a",
+      status: "pending" as const,
+      createdAt: "2026-07-03T12:00:00.000Z",
+      updatedAt: "2026-07-03T12:00:00.000Z",
+      argsSummary: "{}",
+      args: {},
+    };
+    expect(fingerprintSnapshot({ ...base, pendingApprovals: [approval] })).not.toBe(fingerprintSnapshot(base));
+
+    const workspace = {
+      sessionId: "session-a",
+      mode: "direct" as const,
+      sourcePath: "/repo",
+      activePath: "/repo",
+      openedAt: "2026-07-03T12:00:00.000Z",
+    };
+    const open = fingerprintSnapshot({ ...base, workspace });
+    const closed = fingerprintSnapshot({ ...base, workspace: { ...workspace, closedAt: "2026-07-03T13:00:00.000Z" } });
+    expect(closed).not.toBe(open);
   });
 
   it("fingerprints track mcp server state changes", () => {

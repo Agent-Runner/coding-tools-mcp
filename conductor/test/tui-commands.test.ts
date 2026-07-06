@@ -15,7 +15,7 @@ import {
 
 describe("TUI slash command registry", () => {
   it("parses slash commands with arguments", () => {
-    expect(parseSlashCommand("/switch 2")).toEqual({ raw: "/switch 2", name: "switch", args: ["2"] });
+    expect(parseSlashCommand("/close --force")).toEqual({ raw: "/close --force", name: "close", args: ["--force"] });
     expect(parseSlashCommand('/new "path with spaces" --worktree')).toEqual({
       raw: '/new "path with spaces" --worktree',
       name: "new",
@@ -55,14 +55,15 @@ describe("TUI slash command registry", () => {
   it("resolves aliases and suggestions", () => {
     expect(findSlashCommand("?")?.name).toBe("help");
     expect(findSlashCommand("tunnel")?.name).toBe("tunnel");
-    expect(suggestSlashCommands("/sw").map((command) => command.name)).toContain("switch");
+    expect(suggestSlashCommands("/mrg").map((command) => command.name)).toContain("merge");
   });
 
   it("suggests every registered command for an empty query, in registry order", () => {
     const names = suggestSlashCommands("/").map((command) => command.name);
     expect(names).toEqual(slashCommands.map((command) => command.name));
-    expect(names).toHaveLength(16);
-    expect(names.slice(0, 5)).toEqual(["new", "close", "merge", "clean", "switch"]);
+    expect(names).toHaveLength(15);
+    expect(names.slice(0, 5)).toEqual(["new", "close", "merge", "clean", "diff"]);
+    expect(findSlashCommand("new")?.usage).toContain("--worktree");
   });
 
   it("keeps groups and the flat list in sync with truthful strings", () => {
