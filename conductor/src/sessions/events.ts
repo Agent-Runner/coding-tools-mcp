@@ -33,27 +33,10 @@ export class CompositeSessionEventSink implements SessionEventSink {
   }
 }
 
+/** In-process "something happened" doorbell; the JSONL log is the source of truth. */
 export class SessionEventBus extends EventEmitter implements SessionEventSink {
-  private readonly buffers = new Map<string, SessionEvent[]>();
-
-  constructor(private readonly maxEvents = 2000) {
-    super();
-  }
-
-  async append(event: SessionEvent): Promise<void> {
-    const current = this.buffers.get(event.sessionId) ?? [];
-    current.push(event);
-    if (current.length > this.maxEvents) current.splice(0, current.length - this.maxEvents);
-    this.buffers.set(event.sessionId, current);
+  append(event: SessionEvent): Promise<void> {
     this.emit("event", event);
-    this.emit(`event:${event.sessionId}`, event);
-  }
-
-  events(sessionId: string): SessionEvent[] {
-    return [...(this.buffers.get(sessionId) ?? [])];
-  }
-
-  sessions(): string[] {
-    return [...this.buffers.keys()];
+    return Promise.resolve();
   }
 }

@@ -1,11 +1,13 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, rmdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { BackendClient } from "../proxy/client.js";
-import { ctcHome, profilePathForRepo, readProfileForPath } from "../profiles/config.js";
-import type { WorkspaceProfile } from "../shared/types.js";
+import { ExtraMcpClient } from "../proxy/extra-client.js";
+import { profilePathForRepo, readProfileForPath, resolveProfileTargetPath } from "../profiles/config.js";
+import { mergeMcpServers, readWorkspaceMcpServers, WORKSPACE_MCP_FILE } from "../profiles/mcp.js";
+import type { ResolvedMcpServer, WorkspaceProfile } from "../shared/types.js";
 
 const execFileAsync = promisify(execFile);
 const EXPECTED_LOWER_TOOLS = ["server_info", "set_default_cwd", "exec_command"];
@@ -40,19 +42,22 @@ export async function runDoctor(path: string | undefined, options: DoctorOptions
 
   if (!profile) {
     checks.push(await checkGitVersion());
-    checks.push(await checkWorktreeDirectory());
+    checks.push(await checkWorktreeDirectory(repoPath));
+    checks.push(...(await checkMcpServers(repoPath, undefined, options.skipBackend === true)));
     return checks;
   }
 
   checks.push(checkTokenReference(profile));
   checks.push(await checkGitVersion());
-  checks.push(await checkWorktreeDirectory());
+  checks.push(await checkWorktreeDirectory(repoPath));
 
   if (options.skipBackend) {
     checks.push({ name: "backend", status: "warn", detail: "Skipped by --skip-backend." });
   } else {
     checks.push(await checkBackend(profile));
   }
+
+  checks.push(...(await checkMcpServers(repoPath, profile, options.skipBackend === true)));
 
   return checks;
 }
@@ -96,13 +101,73 @@ async function checkBackend(profile: WorkspaceProfile): Promise<DoctorCheck> {
   }
 }
 
-async function checkWorktreeDirectory(): Promise<DoctorCheck> {
-  const dir = join(ctcHome(), "worktrees");
+async function checkMcpServers(
+  repoPath: string,
+  profile: WorkspaceProfile | undefined,
+  skipConnect: boolean,
+): Promise<DoctorCheck[]> {
+  const targetPath = await resolveProfileTargetPath(repoPath);
+  const workspace = await readWorkspaceMcpServers(targetPath);
+  const merged = mergeMcpServers({
+    profileServers: profile?.mcpServers,
+    workspaceServers: workspace.servers,
+    trustedWorkspaceMcp: profile?.trustedWorkspaceMcp,
+  });
+  const checks: DoctorCheck[] = [];
+  for (const issue of [...workspace.issues, ...merged.issues]) {
+    checks.push({ name: `mcp:${issue.name ?? WORKSPACE_MCP_FILE}`, status: "fail", detail: issue.message });
+  }
+  for (const server of merged.servers) {
+    const name = `mcp:${server.name}`;
+    if (server.untrusted) {
+      checks.push({
+        name,
+        status: "warn",
+        detail: `Declared in ${WORKSPACE_MCP_FILE} but not trusted; approve with /mcp trust ${server.name} or run with --trust-workspace-mcp.`,
+      });
+      continue;
+    }
+    if (!server.enabled) {
+      checks.push({ name, status: "warn", detail: "Disabled in config." });
+      continue;
+    }
+    if (skipConnect) {
+      checks.push({ name, status: "warn", detail: "Skipped by --skip-backend." });
+      continue;
+    }
+    checks.push(await checkMcpConnectivity(server));
+  }
+  return checks;
+}
+
+async function checkMcpConnectivity(server: ResolvedMcpServer): Promise<DoctorCheck> {
+  const client = new ExtraMcpClient(server);
+  const name = `mcp:${server.name}`;
+  try {
+    await client.connect();
+    return { name, status: "pass", detail: `Reachable with ${String(client.tools().length)} tools.` };
+  } catch (error) {
+    return { name, status: "fail", detail: errorMessage(error) };
+  } finally {
+    await client.close().catch(() => undefined);
+  }
+}
+
+async function checkWorktreeDirectory(repoPath: string): Promise<DoctorCheck> {
+  // Managed worktrees live inside the repository at .ctc/worktrees so the
+  // workspace-confined backend can reach them with relative paths.
+  const ctcDir = join(repoPath, ".ctc");
+  const dir = join(ctcDir, "worktrees");
   const probe = join(dir, ".doctor-write-test");
+  const preexisting = existsSync(dir);
   try {
     await mkdir(dir, { recursive: true });
     await writeFile(probe, "ok\n", "utf8");
     await rm(probe, { force: true });
+    if (!preexisting) {
+      await rmdir(dir).catch(() => undefined);
+      await rmdir(ctcDir).catch(() => undefined);
+    }
     return { name: "worktrees", status: "pass", detail: `${dir} is writable.` };
   } catch (error) {
     return { name: "worktrees", status: "fail", detail: errorMessage(error) };

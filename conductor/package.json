@@ -1,9 +1,9 @@
 {
   "name": "coding-tools-conductor",
-  "version": "0.1.0",
+  "version": "0.1.0-beta.2",
   "description": "A TypeScript orchestration layer for coding-tools-mcp.",
   "type": "module",
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "node": ">=20"
   },
@@ -12,12 +12,23 @@
   },
   "files": [
     "dist",
+    "!dist/**/*.map",
     "README.md"
   ],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "coding-agent",
+    "cli",
+    "tui",
+    "conductor",
+    "ctc"
+  ],
   "scripts": {
-    "build": "tsup src/cli/index.ts --format esm --dts --clean --splitting false",
+    "build": "tsup",
     "dev": "tsx src/cli/index.ts",
     "lint": "eslint .",
+    "prepack": "npm run build",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
@@ -27,7 +38,6 @@
     "execa": "^9.6.1",
     "ink": "^7.1.0",
     "ink-select-input": "^6.2.0",
-    "ink-text-input": "^6.0.0",
     "react": "^19.2.7",
     "zod": "^3.25.76"
   },

@@ -5871,9 +5871,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def install_sigterm_handler() -> None:
+    """Exit cleanly on SIGTERM (128 + 15), matching the KeyboardInterrupt path.
+
+    Essential as PID 1 in a container: without a handler the kernel ignores
+    SIGTERM for init, so `docker stop` hangs for its grace period and then
+    SIGKILLs the server instead of letting it shut down.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def _terminate(signum: int, _frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    try:
+        signal.signal(signal.SIGTERM, _terminate)
+    except (ValueError, OSError, AttributeError):
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    install_sigterm_handler()
     return run_stdio(args) if args.stdio else run_http(args)
 
 

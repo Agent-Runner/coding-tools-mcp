@@ -6,6 +6,7 @@ import { dirname, resolve } from "node:path";
 import { z } from "zod";
 import type { BackendConfig, RuntimeOptions, ToolPolicy, WorkspaceProfile } from "../shared/types.js";
 import { resolveGitRoot } from "../workspace/git.js";
+import { mcpServersRecordSchema, mergeMcpServers, readWorkspaceMcpServers } from "./mcp.js";
 
 type StdioBackendConfig = Extract<BackendConfig, { type: "stdio" }>;
 
@@ -14,18 +15,23 @@ const backendSchema = z.union([
   z.object({ type: z.literal("http"), url: z.string().url(), tokenRef: z.string().optional() }),
 ]);
 
-const profileSchema = z.object({
-  repoPath: z.string(),
-  backend: backendSchema,
-  defaultMode: z.enum(["direct", "worktree"]).optional(),
-  permissionMode: z.enum(["safe", "trusted"]).optional(),
-  httpPort: z.number().int().min(1).max(65535).optional(),
-  toolPolicy: z.object({ allow: z.array(z.string()).optional(), deny: z.array(z.string()).optional() }).optional(),
-  tunnel: z
-    .object({ provider: z.enum(["cloudflared", "none"]), hostname: z.string().optional(), enabled: z.boolean().optional() })
-    .optional(),
-  adapters: z.array(z.string()).optional(),
-});
+// passthrough keeps fields written by newer ctc versions intact across read-modify-write cycles.
+const profileSchema = z
+  .object({
+    repoPath: z.string(),
+    backend: backendSchema,
+    defaultMode: z.enum(["direct", "worktree"]).optional(),
+    permissionMode: z.enum(["safe", "trusted"]).optional(),
+    httpPort: z.number().int().min(1).max(65535).optional(),
+    toolPolicy: z.object({ allow: z.array(z.string()).optional(), deny: z.array(z.string()).optional() }).optional(),
+    tunnel: z
+      .object({ provider: z.enum(["cloudflared", "none"]), hostname: z.string().optional(), enabled: z.boolean().optional() })
+      .optional(),
+    adapters: z.array(z.string()).optional(),
+    mcpServers: mcpServersRecordSchema.optional(),
+    trustedWorkspaceMcp: z.record(z.string(), z.string()).optional(),
+  })
+  .passthrough();
 
 export interface ResolveRuntimeInput {
   path?: string;
@@ -37,6 +43,7 @@ export interface ResolveRuntimeInput {
   allow?: string[];
   deny?: string[];
   conciseLogs?: boolean;
+  trustWorkspaceMcp?: boolean;
 }
 
 export async function resolveRuntimeOptions(input: ResolveRuntimeInput): Promise<RuntimeOptions> {
@@ -46,6 +53,13 @@ export async function resolveRuntimeOptions(input: ResolveRuntimeInput): Promise
   const toolPolicy = mergeToolPolicy(profile?.toolPolicy, { allow: input.allow, deny: input.deny });
   const defaultMode = profile?.defaultMode ?? "direct";
   const adapters = profile?.adapters ?? [];
+  const workspaceMcp = await readWorkspaceMcpServers(workspacePath);
+  const mergedMcp = mergeMcpServers({
+    profileServers: profile?.mcpServers,
+    workspaceServers: workspaceMcp.servers,
+    trustedWorkspaceMcp: profile?.trustedWorkspaceMcp,
+    trustAllWorkspace: input.trustWorkspaceMcp,
+  });
   const sessionId = `ctc-${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID().slice(0, 8)}`;
   const logPath = `${ctcHome()}/logs/${sessionId}.jsonl`;
   await mkdir(`${ctcHome()}/logs`, { recursive: true });
@@ -58,6 +72,8 @@ export async function resolveRuntimeOptions(input: ResolveRuntimeInput): Promise
     adapters,
     logPath,
     conciseLogs: input.conciseLogs ?? true,
+    mcpServers: mergedMcp.servers,
+    mcpConfigIssues: [...workspaceMcp.issues, ...mergedMcp.issues],
   };
 }
 

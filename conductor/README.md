@@ -28,8 +28,9 @@ wizard.
     CLI supplied command.
   - `http`: connect to a Streamable HTTP MCP endpoint with an optional bearer
     token read from an environment variable.
-- Backend tools are re-exposed without prefixes, subject to profile allow/deny
-  policy.
+- Primary backend tools are re-exposed without prefixes, subject to profile
+  allow/deny policy; additional MCP servers (see M6) are re-exposed with a
+  `<server>__` prefix.
 - Every proxied tool call emits a JSONL audit event under `~/.ctc/logs/`.
 
 Example:
@@ -63,9 +64,22 @@ ctc ws clean --force --yes
 ctc ws merge <session-id>
 ```
 
+Inside the TUI, `/clean [--force|--yes]` mirrors `ctc ws clean` with an
+in-terminal confirmation prompt instead of a stdin one. Cleaning also prunes
+closed session records — their `~/.ctc` json, log, and approval files are
+deleted so state stays bounded; the TUI's active session is always exempt.
+Workspace mode defaults to `direct` (the model edits the repo in place);
+worktree isolation is the explicit opt-in via `/new --worktree`.
+
 Worktree creation and cleanup are the only direct git operations in the core
 runtime. Review checkpoints run git through the lower `exec_command` tool so the
 layering boundary stays intact.
+
+Managed worktrees are created inside the repository at
+`.ctc/worktrees/<session-id>` so the workspace-confined lower server can reach
+them with workspace-relative paths (it denies absolute paths). The directory is
+added to `.git/info/exclude` automatically, so it never shows up in source-repo
+status, diffs, or merges.
 
 ## M3 Surface
 
@@ -115,16 +129,87 @@ Human-side commands:
 
 ```bash
 ctc baton show /path/to/repo
-ctc tui
-ctc tui <session-id>
+ctc [path]           # opens the TUI and starts the session for that repo
+ctc tui [session-id] # observes an external ctc start session read-only
 ```
 
-`ctc tui` attaches to the latest session log by default. It shows session
-metadata, backend status, recent tool calls, the latest `show_changes` diff, and
-current baton status. If the model calls the lower `request_permissions` tool
-while the TUI is attached, Conductor pauses that request for a local `y` / `n`
-decision. Without an attached TUI, the request falls back to the lower backend's
-existing permission flow.
+Launching `ctc` IS the session: the TUI automatically opens a workspace
+session for the repo (direct mode by default) and quitting closes it — the
+workspace record is stamped closed and the backend stops, the way Claude Code
+or Codex CLI treat a run. `/new` replaces the session (switch to another repo,
+or opt into worktree isolation with `--worktree`); `/close` ends it without
+reopening. `ctc tui <session-id>` is the separate observe mode: it renders an
+external `ctc start` session read-only and answers its permission prompts,
+without hosting a session of its own.
+
+The TUI renders activity as an append-only transcript that flows into the
+terminal scrollback, in the style of Claude Code: each tool call is a `●`
+line with a dimmed `⎿` result (or a red error), review checkpoints render as
+inline diff cards, and TUI notices appear as `✓` / `✗` / `·` notes. Updates
+are event-driven — the TUI watches the active session's log with a
+dirty-checked snapshot store instead of repainting on a timer.
+
+Interaction is input-first: printable keys always go to the composer, and
+typing `/` opens a navigable command menu that lists every command grouped by
+area (Sessions, Review, Configure, Interface) in a scrolling window with a
+`3/16 · ↑/↓` count footer when the list overflows. It fuzzy-matches as you
+type (e.g. `/dr` finds `doctor`), highlights the matched characters, and
+wraps at the ends — arrows to choose, Tab to complete, Enter to run. The composer
+supports the usual readline editing keys (Ctrl+A/E to jump to line
+start/end, Ctrl+W/U/K to delete by word or to the line edges, Ctrl+←/→ and
+Alt+←/→ to move by word). Bounded panels open over the live region for `/diff`,
+`/baton`, `/approvals`, `/config`, `/inspect` (also Ctrl+O), `/doctor`, and
+`/help`; ↑/↓ scroll by line, ←/→ page while the composer is empty (PgUp/PgDn
+also work), and Esc closes. `/clear` resets the transcript, and Ctrl+C must be
+pressed twice to quit so a stray interrupt cannot tear down the live session.
+
+If the model calls the lower `request_permissions` tool while the TUI is
+attached, Conductor pauses the request and shows an approval prompt with
+selectable options (`y`/`n`, `1`/`2`, arrows + Enter; left/right walk the
+queue when several requests are pending; Esc denies). Without an attached
+TUI, the request falls back to the lower backend's existing permission flow.
+
+`/tunnel start` exposes the MCP server over a free try.cloudflare.com tunnel.
+It requires the live session (started automatically; `/new` restores it after
+a `/close`) — a tunnel in front of a session-less server could only answer
+503, which remote connectors surface as a failed setup. If `cloudflared` is already installed it starts immediately. Otherwise
+the TUI does not dead-end — it opens a picker (arrows/number keys, Enter, Esc)
+of the ways this host can run a tunnel:
+
+- **Use wrangler (no install)** — runs `wrangler tunnel quick-start <url>`,
+  using a `wrangler` on PATH or `npx wrangler` (the first `npx` run downloads
+  wrangler and can take a minute). Nothing is installed permanently.
+- **Install cloudflared** — `brew install cloudflared` on macOS when Homebrew
+  is present, otherwise the official release binary is downloaded to
+  `~/.ctc/bin/cloudflared`. Progress streams into the transcript, and the
+  managed binary is preferred on later runs, so this is a one-time step.
+
+Both providers surface the same `*.trycloudflare.com` URL. Hosts with neither
+cloudflared nor `npx` say so plainly instead of hanging.
+
+Model clients connect to the stable `/mcp` endpoint (locally
+`http://127.0.0.1:<port>/mcp`, through a tunnel `https://<tunnel-host>/mcp`).
+The port is persisted in the workspace profile, so a client configured once
+keeps working across ctc restarts. `/mcp` serves the live session;
+`/mcp/<session-id>` pins that specific id (a `/new` replacement mints a new
+id). Following the Streamable HTTP spec, each client that POSTs an
+`initialize` request gets its own MCP session (routed by the `Mcp-Session-Id`
+header), so any number of clients can connect, reconnect, and terminate
+sessions independently.
+
+Conductor speaks both remote MCP transports, so connector platforms that
+probe or only implement the legacy 2024-11-05 HTTP+SSE transport connect too:
+a `GET /sse` — or a `GET /mcp` with an SSE `Accept` and no `Mcp-Session-Id`,
+which is the spec's transport-fallback probe — opens the old handshake
+(`endpoint` event, messages POSTed to `/messages?sessionId=...`, keepalive
+pings so free tunnels do not idle the stream out). Common URL misconfigurations
+stay routable instead of dead-ending in 404s: the bare tunnel origin `/` is an
+alias for `/mcp`, and a plain browser/curl GET on `/`, `/mcp`, or
+`/.well-known/mcp.json` returns a small server card describing the endpoints
+and auth mode (the card and `/.well-known` stay readable without the bearer
+token; everything else remains gated). When no ctc session is live, MCP
+endpoints answer `503` rather than `404`, so clients report a temporarily
+unavailable server instead of a wrong URL.
 
 ## M5 Surface
 
@@ -153,3 +238,101 @@ The adapter uses standard MCP Apps metadata (`_meta.ui.resourceUri`) plus
 ChatGPT compatibility aliases such as `_meta["openai/outputTemplate"]`. It is a
 host-specific presentation layer; the model-facing tool names and core tool
 results stay unchanged.
+
+## M6 Surface
+
+Conductor now aggregates additional third-party MCP servers (GitHub MCP,
+Playwright MCP, remote Streamable HTTP servers, …) behind the same
+model-facing endpoint. The primary `coding-tools-mcp` backend is unchanged and
+stays authoritative: its tools remain unprefixed, `open_workspace`, review
+checkpoints, baton files, and `request_permissions` bind to it exclusively,
+and a primary connection failure still fails startup. Extra servers are
+tools-only: each of their tools is exposed as `<server>__<tool>`
+(`github__create_issue`, `playwright__browser_click`), and calls are routed
+back to the owning server.
+
+Configuration lives in two merged places:
+
+- the workspace profile (`~/.ctc/profiles/<repo-hash>.json`) under a new
+  `mcpServers` record — personal, implicitly trusted;
+- a shareable `<repo>/.ctc/mcp.json` committed with the repository.
+
+```json
+{ "mcpServers": {
+    "github":     { "command": "docker", "args": ["run", "-i", "--rm", "ghcr.io/github/github-mcp-server"],
+                    "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "env:GITHUB_TOKEN" } },
+    "playwright": { "command": "npx", "args": ["@playwright/mcp@latest"] },
+    "remote":     { "url": "https://example.com/mcp", "headers": { "Authorization": "env:REMOTE_AUTH" } } } }
+```
+
+Entries are stdio (`command`, `args`, `env`) or Streamable HTTP (`url`,
+`headers`), plus optional `disabled` and per-server `allow`/`deny` tool
+policies (unprefixed names). Server names must match `[A-Za-z0-9_-]+` so the
+prefixed tool names stay MCP-safe; keep third-party tool names within your
+host's length limits. `env` and `headers` values support `env:<NAME>`
+references, resolved at connect time — recommended over literals so
+`.ctc/mcp.json` never carries secrets. Extra stdio servers spawn with a
+minimal default environment plus the configured `env` only; secrets must be
+passed intentionally. On a name collision the profile entry replaces the
+workspace entry wholesale (personal over shared), and exposed tool names
+resolve conductor > primary > extras, with shadowed names reported per server.
+
+Workspace-declared servers are a trust boundary: a cloned repository could
+ship a malicious stdio command, so they start `disabled (untrusted)` until
+approved with `/mcp trust <name>` (records a fingerprint of the entry in the
+profile; if the repo later edits the entry, trust resets) or per-session with
+`ctc start --trust-workspace-mcp`. Profile-declared servers are trusted as
+your own configuration.
+
+Failure semantics: extra servers never block startup. A broken command or
+unreachable URL becomes a per-server `error` status with background reconnect
+(250ms → 5s backoff, 8s connect timeout) while the session keeps serving.
+Config parse problems surface as `server_status` error events instead of
+aborting `ctc start`. The conductor now advertises `tools.listChanged` and
+broadcasts `notifications/tools/list_changed` when an extra server connects,
+drops, or is toggled, so clients pick up tool changes mid-session. Config
+files are read once at session start; edit them and open a new session (or
+use `/mcp reconnect` for connection-level retries).
+
+TUI:
+
+- `/mcp` opens a live status panel (name, state, tool count, source, detail);
+  `mcp k/n` appears in the status bar whenever extra servers are configured.
+- `/mcp enable|disable|reconnect <name>` manage the active TUI-hosted session
+  (session-only — persistent opt-out is `"disabled": true` in config); with no
+  name a picker opens. `/mcp trust <name>` is the only subcommand that writes
+  the profile. External `ctc start` sessions render as read-only status.
+- Connect/disconnect/error transitions stream into the transcript as
+  `server_status` events, and audit `tool_call` events carry a `server` field
+  for extra-server calls.
+
+`ctc doctor` gains one `mcp:<name>` check per configured server: untrusted or
+config-disabled servers warn, reachable servers report their tool count, and
+connection or `env:` resolution failures fail the check. Note for mixed
+versions: older ctc builds rewrite profiles through a stricter schema and drop
+the new `mcpServers`/`trustedWorkspaceMcp` fields on their next profile write.
+
+## Runtime Environment And Shutdown
+
+Backend environment: the conductor resolves the user's login-shell `PATH` once
+per process (bash/zsh: `$SHELL -ilc`; fish and csh get their own probe; 5s
+timeout, cached, `CTC_RESOLVING_LOGIN_SHELL=1` set during the probe) and
+spawns the primary stdio backend with `process.env` plus that merged `PATH`.
+This keeps nvm/pyenv/asdf-selected toolchains working when the MCP host that
+launched ctc came from a GUI with a minimal `PATH` — the same approach VS
+Code's shell-environment resolution uses. If the current `PATH` carries custom
+entries, they stay in front; login-shell entries are appended. Extra stdio MCP
+servers get the same `PATH` widening on top of their minimal default env. Set
+`CTC_NO_LOGIN_SHELL_PATH=1` to disable the probe.
+
+Backend request budgets: control-plane calls (`initialize`, `tools/list`)
+time out after 30s, tool calls after 10 minutes; a timeout marks the backend
+disconnected and starts the reconnect loop instead of hanging the session.
+Override with `CTC_BACKEND_CONTROL_TIMEOUT_MS` / `CTC_BACKEND_TOOL_TIMEOUT_MS`.
+
+Shutdown: `ctc start` exits when its host hangs up (stdin EOF, SIGINT, or
+SIGTERM) and tears the spawned lower backend down with it — stdin EOF first
+(clean MCP stdio shutdown; lets a `docker run --rm -i` backend stop and
+auto-remove), then SIGTERM, then SIGKILL after a 3s grace. Quitting the TUI
+closes the hosted workspace and stops the runtime the same way, so no
+background `coding-tools-mcp` process outlives ctc.

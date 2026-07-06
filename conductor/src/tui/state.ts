@@ -6,6 +6,8 @@ import { ctcHome } from "../profiles/config.js";
 import { listPendingApprovals, type PermissionApprovalRequest } from "../shared/approvals.js";
 import type {
   ConductorEvent,
+  ExtraServerState,
+  McpServerSource,
   ReviewCheckpointEvent,
   SessionStartedEvent,
   ToolCallEvent,
@@ -17,7 +19,7 @@ export interface TuiSnapshot {
   sessionId?: string;
   logPath?: string;
   initialWorkspacePath?: string;
-  sessions: TuiSessionSummary[];
+  label?: string;
   events: ConductorEvent[];
   toolCalls: ToolCallEvent[];
   checkpoints: ReviewCheckpointEvent[];
@@ -25,20 +27,18 @@ export interface TuiSnapshot {
   workspace?: WorkspaceState;
   baton?: BatonBundle;
   pendingApprovals: PermissionApprovalRequest[];
-  allPendingApprovals: PermissionApprovalRequest[];
+  mcpServers: McpServerStatusSnapshot[];
 }
 
-export interface TuiSessionSummary {
-  sessionId: string;
-  label: string;
-  logPath: string;
-  mtimeMs: number;
-  owner: "stdio" | "tui";
-  mode?: string;
-  workspacePath?: string;
-  backendConnected?: boolean;
-  pendingApprovalCount: number;
-  attached: boolean;
+export interface McpServerStatusSnapshot {
+  name: string;
+  state: ExtraServerState;
+  source?: McpServerSource;
+  toolCount?: number;
+  lastError?: string;
+  untrusted?: boolean;
+  droppedTools?: string[];
+  lastChangedTs?: string;
 }
 
 export interface LoadTuiSnapshotOptions {
@@ -47,33 +47,29 @@ export interface LoadTuiSnapshotOptions {
 }
 
 export async function loadTuiSnapshot(options: LoadTuiSnapshotOptions = {}): Promise<TuiSnapshot> {
-  const sessions = await listTuiSessions();
-  const requestedSessionId = options.requestedSessionId;
-  const logPath = findSessionLog(sessions, requestedSessionId);
-  const allPendingApprovals = await listAllPendingApprovals(sessions);
-  if (!logPath) {
+  const sessionId = options.requestedSessionId;
+  if (!sessionId) {
     return {
       initialWorkspacePath: options.initialWorkspacePath,
-      sessions,
       events: [],
       toolCalls: [],
       checkpoints: [],
       pendingApprovals: [],
-      allPendingApprovals,
+      mcpServers: [],
     };
   }
-  const sessionId = sessionIdFromLogPath(logPath);
+  const logPath = join(ctcHome(), "logs", `${sessionId}.jsonl`);
   const events = await readEventLog(logPath);
   const session = lastOfType(events, "session_started");
-  const workspace = sessionId ? await readWorkspaceSession(sessionId) : undefined;
+  const workspace = await readWorkspaceSession(sessionId);
   const root = workspace?.activePath ?? session?.workspacePath;
   const baton = root ? await readBatonBundle(root).catch(() => undefined) : undefined;
-  const pendingApprovals = sessionId ? await listPendingApprovals(sessionId).catch(() => []) : [];
+  const pendingApprovals = await listPendingApprovals(sessionId).catch(() => []);
   return {
     sessionId,
     logPath,
     initialWorkspacePath: options.initialWorkspacePath,
-    sessions,
+    label: labelForSession(sessionId, workspace?.activePath ?? session?.workspacePath),
     events,
     toolCalls: events.filter((event): event is ToolCallEvent => event.type === "tool_call"),
     checkpoints: events.filter((event): event is ReviewCheckpointEvent => event.type === "review_checkpoint"),
@@ -81,50 +77,63 @@ export async function loadTuiSnapshot(options: LoadTuiSnapshotOptions = {}): Pro
     workspace,
     baton,
     pendingApprovals,
-    allPendingApprovals,
+    mcpServers: deriveMcpServers(events),
   };
 }
 
-export async function listTuiSessions(): Promise<TuiSessionSummary[]> {
+/** Newest session log id by mtime — one-shot startup helper for bare `ctc tui`. */
+export async function latestSessionLogId(): Promise<string | undefined> {
   const dir = join(ctcHome(), "logs");
-  if (!existsSync(dir)) return [];
+  if (!existsSync(dir)) return undefined;
   const entries = await Promise.all(
     (await readdir(dir))
       .filter((name) => name.endsWith(".jsonl"))
-      .map(async (name) => summarizeSessionLog(join(dir, name), (await stat(join(dir, name))).mtimeMs)),
+      .map(async (name) => ({ name, mtimeMs: (await stat(join(dir, name))).mtimeMs })),
   );
-  return entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const newest = entries.sort((a, b) => b.mtimeMs - a.mtimeMs)[0];
+  return newest ? basename(newest.name, ".jsonl") : undefined;
 }
 
-function findSessionLog(sessions: TuiSessionSummary[], sessionId?: string): string | undefined {
-  if (sessionId) return sessions.find((session) => session.sessionId === sessionId)?.logPath;
-  return sessions[0]?.logPath;
-}
-
-async function summarizeSessionLog(logPath: string, mtimeMs: number): Promise<TuiSessionSummary> {
-  const sessionId = sessionIdFromLogPath(logPath);
-  const events = await readEventLog(logPath);
-  const session = lastOfType(events, "session_started");
-  const workspace = await readWorkspaceSession(sessionId).catch(() => undefined);
-  const workspacePath = workspace?.activePath ?? session?.workspacePath;
-  const pendingApprovalCount = await listPendingApprovals(sessionId).then((requests) => requests.length, () => 0);
-  return {
-    sessionId,
-    label: labelForSession(sessionId, workspacePath),
-    logPath,
-    mtimeMs,
-    mode: workspace?.mode ?? session?.defaultMode,
-    workspacePath,
-    backendConnected: session?.backendStatus.connected,
-    pendingApprovalCount,
-    owner: session?.owner ?? "stdio",
-    attached: session?.owner !== "tui",
-  };
-}
-
-async function listAllPendingApprovals(sessions: TuiSessionSummary[]): Promise<PermissionApprovalRequest[]> {
-  const pending = await Promise.all(sessions.map((session) => listPendingApprovals(session.sessionId).catch(() => [])));
-  return pending.flat().sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+/**
+ * Fold the session's mcp server history into one row per server: the last
+ * session_started summary is the baseline, later server_status events update
+ * it. Dropped tools only mean something for a connected server, so they are
+ * restored from the baseline, replaced (empty array included) on every
+ * connected update, and cleared on any other state so a reconnect never shows
+ * a stale shadow list. Exported for tests.
+ */
+export function deriveMcpServers(events: ConductorEvent[]): McpServerStatusSnapshot[] {
+  const servers = new Map<string, McpServerStatusSnapshot>();
+  for (const event of events) {
+    if (event.type === "session_started") {
+      servers.clear();
+      for (const summary of event.mcpServers ?? []) {
+        servers.set(summary.name, {
+          name: summary.name,
+          state: summary.state,
+          source: summary.source,
+          toolCount: summary.toolCount,
+          lastError: summary.error,
+          untrusted: summary.untrusted,
+          droppedTools: summary.state === "connected" ? (summary.droppedTools ?? []) : undefined,
+        });
+      }
+      continue;
+    }
+    if (event.type !== "server_status") continue;
+    const previous = servers.get(event.server);
+    servers.set(event.server, {
+      name: event.server,
+      state: event.state,
+      source: event.source ?? previous?.source,
+      toolCount: event.toolCount ?? (event.state === "connected" ? previous?.toolCount : undefined),
+      lastError: event.error,
+      untrusted: event.untrusted,
+      droppedTools: event.state === "connected" ? (event.droppedTools ?? []) : undefined,
+      lastChangedTs: event.ts,
+    });
+  }
+  return [...servers.values()];
 }
 
 interface LogCacheEntry {
@@ -204,7 +213,8 @@ function parseEvent(line: string): ConductorEvent | undefined {
       type === "tool_call" ||
       type === "review_checkpoint" ||
       type === "session_started" ||
-      type === "permission_request"
+      type === "permission_request" ||
+      type === "server_status"
     ) {
       return parsed as unknown as ConductorEvent;
     }
@@ -223,10 +233,6 @@ function lastOfType<T extends ConductorEvent["type"]>(
     if (event?.type === type) return event as Extract<ConductorEvent, { type: T }>;
   }
   return undefined;
-}
-
-function sessionIdFromLogPath(path: string): string {
-  return basename(path, ".jsonl");
 }
 
 function labelForSession(sessionId: string, workspacePath?: string): string {

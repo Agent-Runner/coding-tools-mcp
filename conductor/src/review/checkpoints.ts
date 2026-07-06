@@ -56,9 +56,9 @@ export class ReviewManager {
 
   async initializeBaseline(activePath: string): Promise<ReviewBaselineResult> {
     this.activePath = activePath;
-    const snapshot = await this.createSnapshot(activePath, "workspace-open");
-    await this.updateRef(activePath, this.baselineRef(), snapshot);
-    await this.updateRef(activePath, this.lastShownRef(), snapshot);
+    const snapshot = await this.createSnapshot("workspace-open");
+    await this.updateRef(this.baselineRef(), snapshot);
+    await this.updateRef(this.lastShownRef(), snapshot);
     return { baselineRef: this.baselineRef(), lastShownRef: this.lastShownRef(), snapshot };
   }
 
@@ -66,21 +66,21 @@ export class ReviewManager {
     if (!this.activePath) throw new Error("No workspace has been opened for review checkpoints.");
     const args = showChangesSchema.parse(input);
     const since = args.since ?? "last_shown";
-    const snapshot = await this.createSnapshot(this.activePath, "show-changes");
+    const snapshot = await this.createSnapshot("show-changes");
     const base = this.baseForSince(since);
     const pathArgs = diffPathArgs(args.paths);
-    const stat = await this.git(["diff", "--stat", "--find-renames", base, snapshot, ...pathArgs], this.activePath);
+    const stat = await this.git(["diff", "--stat", "--find-renames", base, snapshot, ...pathArgs]);
 
     let diff: string | undefined;
     let truncated = false;
     if (!args.stat_only) {
-      const fullDiff = await this.git(["diff", "--find-renames", base, snapshot, ...pathArgs], this.activePath, {
+      const fullDiff = await this.git(["diff", "--find-renames", base, snapshot, ...pathArgs], {
         trim: false,
       });
       ({ text: diff, truncated } = truncateDiff(fullDiff));
     }
 
-    await this.updateRef(this.activePath, this.lastShownRef(), snapshot);
+    await this.updateRef(this.lastShownRef(), snapshot);
     return {
       since,
       base,
@@ -94,31 +94,31 @@ export class ReviewManager {
 
   async clearRefs(): Promise<void> {
     if (!this.activePath) return;
-    await this.git(["update-ref", "-d", this.baselineRef()], this.activePath, { allowFailure: true });
-    await this.git(["update-ref", "-d", this.lastShownRef()], this.activePath, { allowFailure: true });
+    await this.git(["update-ref", "-d", this.baselineRef()], { allowFailure: true });
+    await this.git(["update-ref", "-d", this.lastShownRef()], { allowFailure: true });
   }
 
-  private async createSnapshot(activePath: string, label: string): Promise<string> {
-    const indexFile = await this.git(["rev-parse", "--git-path", `ctc-index-${randomUUID()}`], activePath);
+  private async createSnapshot(label: string): Promise<string> {
+    const indexFile = await this.git(["rev-parse", "--git-path", `ctc-index-${randomUUID()}`]);
     const indexEnv = { GIT_INDEX_FILE: indexFile };
     try {
-      await this.git(["read-tree", "HEAD"], activePath, { env: indexEnv });
-      await this.git(["add", "-A"], activePath, { env: indexEnv });
-      const tree = requireCommitHash(await this.git(["write-tree"], activePath, { env: indexEnv }), "snapshot tree");
+      await this.git(["read-tree", "HEAD"], { env: indexEnv });
+      await this.git(["add", "-A"], { env: indexEnv });
+      const tree = requireCommitHash(await this.git(["write-tree"], { env: indexEnv }), "snapshot tree");
       const snapshot = requireCommitHash(
-        await this.git(["commit-tree", tree, "-p", "HEAD", "-m", `ctc review ${label}`], activePath, {
+        await this.git(["commit-tree", tree, "-p", "HEAD", "-m", `ctc review ${label}`], {
           env: { ...indexEnv, ...gitIdentityEnv },
         }),
         "review snapshot",
       );
       return snapshot;
     } finally {
-      await this.command(["rm", "-f", indexFile], activePath, { allowFailure: true });
+      await this.command(["rm", "-f", indexFile], { allowFailure: true });
     }
   }
 
-  private async updateRef(activePath: string, ref: string, commit: string): Promise<void> {
-    await this.git(["update-ref", ref, commit], activePath);
+  private async updateRef(ref: string, commit: string): Promise<void> {
+    await this.git(["update-ref", ref, commit]);
   }
 
   private baseForSince(since: "last_shown" | "workspace_open" | "head"): string {
@@ -135,15 +135,17 @@ export class ReviewManager {
     return `refs/ctc/review/${this.sessionId}/last-shown`;
   }
 
-  private git(args: string[], workdir: string, options: CommandOptions = {}): Promise<string> {
-    return this.command(["git", ...args], workdir, options);
+  private git(args: string[], options: CommandOptions = {}): Promise<string> {
+    return this.command(["git", ...args], options);
   }
 
-  private async command(argv: string[], workdir: string, options: CommandOptions = {}): Promise<string> {
+  private async command(argv: string[], options: CommandOptions = {}): Promise<string> {
     const cmd = argv.map(shellQuote).join(" ");
+    // The backend denies absolute workdir paths; its default cwd already points at the
+    // active workspace whenever review checkpoints run, so "." is the right directory.
     const result = await this.backend.callTool("exec_command", {
       cmd,
-      workdir,
+      workdir: ".",
       env: options.env,
       verbosity: "full",
     });

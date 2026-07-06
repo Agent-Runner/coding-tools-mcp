@@ -18,6 +18,62 @@ export interface ToolPolicy {
   deny?: string[];
 }
 
+export type McpServerTransport =
+  | {
+      type: "stdio";
+      command: string;
+      args?: string[];
+      env?: Record<string, string>;
+    }
+  | {
+      type: "http";
+      url: string;
+      headers?: Record<string, string>;
+    };
+
+/** Raw profile/.ctc/mcp.json entry, Claude Code .mcp.json style (shape-discriminated). */
+export interface McpServerConfigInput {
+  type?: "stdio" | "http";
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+  disabled?: boolean;
+  allow?: string[];
+  deny?: string[];
+}
+
+export type McpServerSource = "profile" | "workspace";
+
+/** Normalized, merged extra-server entry carried on RuntimeOptions. */
+export interface ResolvedMcpServer {
+  name: string;
+  source: McpServerSource;
+  transport: McpServerTransport;
+  enabled: boolean;
+  untrusted?: boolean;
+  allow?: string[];
+  deny?: string[];
+}
+
+export type ExtraServerState = "connecting" | "connected" | "disconnected" | "error" | "disabled";
+
+export interface ExtraServerStatus {
+  name: string;
+  source: McpServerSource;
+  state: ExtraServerState;
+  toolCount: number;
+  lastError?: string;
+  untrusted?: boolean;
+  droppedTools?: string[];
+}
+
+export interface McpConfigIssue {
+  name?: string;
+  message: string;
+}
+
 export interface WorkspaceProfile {
   repoPath: string;
   backend: BackendConfig;
@@ -31,6 +87,8 @@ export interface WorkspaceProfile {
     enabled?: boolean;
   };
   adapters?: string[];
+  mcpServers?: Record<string, McpServerConfigInput>;
+  trustedWorkspaceMcp?: Record<string, string>;
 }
 
 export interface RuntimeOptions {
@@ -42,6 +100,8 @@ export interface RuntimeOptions {
   adapters: string[];
   logPath: string;
   conciseLogs: boolean;
+  mcpServers: ResolvedMcpServer[];
+  mcpConfigIssues: McpConfigIssue[];
 }
 
 export interface WorkspaceState {
@@ -91,6 +151,7 @@ export interface ToolCallEvent {
   resultSummary?: string;
   durationMs: number;
   error?: string;
+  server?: string;
 }
 
 export interface ReviewCheckpointEvent {
@@ -115,6 +176,30 @@ export interface SessionStartedEvent {
   backendType: BackendConfig["type"];
   backendStatus: BackendStatus;
   logPath: string;
+  mcpServers?: SessionMcpServerSummary[];
+}
+
+export interface SessionMcpServerSummary {
+  name: string;
+  source: McpServerSource;
+  state: ServerStatusEvent["state"];
+  toolCount?: number;
+  error?: string;
+  untrusted?: boolean;
+  droppedTools?: string[];
+}
+
+export interface ServerStatusEvent {
+  ts: string;
+  sessionId: string;
+  type: "server_status";
+  server: string;
+  state: "connected" | "disconnected" | "error" | "disabled";
+  source?: McpServerSource;
+  toolCount?: number;
+  error?: string;
+  untrusted?: boolean;
+  droppedTools?: string[];
 }
 
 export interface PermissionRequestEvent {
@@ -126,7 +211,12 @@ export interface PermissionRequestEvent {
   argsSummary: string;
 }
 
-export type ConductorEvent = ToolCallEvent | ReviewCheckpointEvent | SessionStartedEvent | PermissionRequestEvent;
+export type ConductorEvent =
+  | ToolCallEvent
+  | ReviewCheckpointEvent
+  | SessionStartedEvent
+  | PermissionRequestEvent
+  | ServerStatusEvent;
 
 export interface BackendStatus {
   connected: boolean;

@@ -1,8 +1,8 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { execa } from "execa";
 import { z } from "zod";
@@ -43,6 +43,8 @@ export interface WorkspaceCleanResult {
   removed: string[];
   skippedDirty: string[];
   missing: string[];
+  /** Closed session records whose json/log/approvals were deleted. */
+  prunedRecords: string[];
 }
 
 export interface WorkspaceMergeResult {
@@ -63,6 +65,7 @@ export class WorkspaceManager {
   private readonly defaultWorkspacePath: string;
   private readonly defaultMode: WorkspaceMode;
   private state?: WorkspaceState;
+  private backendRootPromise?: Promise<string>;
 
   constructor(options: {
     backend: ToolCaller;
@@ -159,7 +162,10 @@ export class WorkspaceManager {
   private async openWorktree(sourcePath: string, baseRef: string, openedAt: string): Promise<WorkspaceState> {
     const repoRoot = await gitOutput(sourcePath, ["rev-parse", "--show-toplevel"]);
     const baseCommit = await gitOutput(repoRoot, ["rev-parse", "--verify", `${baseRef}^{commit}`]);
-    const worktreePath = join(ctcHome(), "worktrees", repoHash(repoRoot), this.sessionId);
+    // Managed worktrees live inside the repository so the workspace-confined backend can
+    // reach them with relative paths; info/exclude keeps them out of source-repo status.
+    const worktreePath = join(repoRoot, ".ctc", "worktrees", this.sessionId);
+    await ensureLocalExclude(repoRoot, ".ctc/worktrees/");
     await mkdir(dirname(worktreePath), { recursive: true });
     await execa("git", ["-C", repoRoot, "worktree", "add", "--detach", worktreePath, baseCommit]);
     try {
@@ -182,8 +188,45 @@ export class WorkspaceManager {
   }
 
   private async setBackendCwd(path: string): Promise<void> {
-    const result = await this.backend.callTool("set_default_cwd", { path });
-    if (result.isError) throw new Error(resultText(result) || `set_default_cwd failed for ${path}`);
+    const relativePath = await this.backendRelativePath(path);
+    const result = await this.backend.callTool("set_default_cwd", { path: relativePath });
+    if (result.isError) {
+      const detail = backendErrorMessage(result) || resultText(result);
+      throw new Error(detail ? `set_default_cwd failed for ${path}: ${detail}` : `set_default_cwd failed for ${path}`);
+    }
+  }
+
+  /**
+   * The lower coding-tools-mcp server accepts only workspace-relative paths (it denies
+   * absolute paths outright), so translate against its workspace root before calling it.
+   */
+  private async backendRelativePath(path: string): Promise<string> {
+    const root = await this.backendWorkspaceRoot();
+    const [rootReal, targetReal] = await Promise.all([realpath(root), realpath(path)]);
+    const relativePath = relative(rootReal, targetReal);
+    if (!relativePath) return ".";
+    if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
+      throw new Error(
+        `Workspace path ${path} is outside the backend workspace root ${root}. ` +
+          "The backend only reaches paths inside its workspace root; start ctc from that root " +
+          "or point the profile backend command at a directory that contains this path.",
+      );
+    }
+    return relativePath.split(sep).join("/");
+  }
+
+  private backendWorkspaceRoot(): Promise<string> {
+    this.backendRootPromise ??= (async () => {
+      try {
+        const result = await this.backend.callTool("get_default_cwd", {});
+        const workspace = (result.structuredContent as { workspace?: unknown } | undefined)?.workspace;
+        if (!result.isError && typeof workspace === "string" && workspace) return workspace;
+      } catch {
+        // Backends without get_default_cwd fall back to the configured workspace path.
+      }
+      return this.defaultWorkspacePath;
+    })();
+    return this.backendRootPromise;
   }
 }
 
@@ -230,8 +273,10 @@ export async function closeWorkspaceSession(sessionId: string, input: CloseWorks
   return { closed: true, workspace: closed, dirty, message: "Worktree workspace closed and removed." };
 }
 
-export async function cleanWorkspaceSessions(options: { force?: boolean } = {}): Promise<WorkspaceCleanResult> {
-  const result: WorkspaceCleanResult = { removed: [], skippedDirty: [], missing: [] };
+export async function cleanWorkspaceSessions(
+  options: { force?: boolean; keepSessionId?: string } = {},
+): Promise<WorkspaceCleanResult> {
+  const result: WorkspaceCleanResult = { removed: [], skippedDirty: [], missing: [], prunedRecords: [] };
   for (const state of await listWorkspaceSessions()) {
     if (state.mode !== "worktree" || state.closedAt) continue;
     const worktreePath = state.worktreePath;
@@ -249,6 +294,16 @@ export async function cleanWorkspaceSessions(options: { force?: boolean } = {}):
     result.removed.push(state.sessionId);
   }
   await pruneKnownWorktreeRepos();
+  // Phase 2: bound ~/.ctc growth — drop the record, log, and approvals of every
+  // closed session (the caller's active session is exempt via keepSessionId).
+  for (const state of await listWorkspaceSessions()) {
+    if (!state.closedAt) continue;
+    if (state.sessionId === options.keepSessionId) continue;
+    await rm(sessionStatePath(state.sessionId), { force: true });
+    await rm(join(ctcHome(), "logs", `${state.sessionId}.jsonl`), { force: true });
+    await rm(join(ctcHome(), "approvals", state.sessionId), { recursive: true, force: true });
+    result.prunedRecords.push(state.sessionId);
+  }
   return result;
 }
 
@@ -347,6 +402,9 @@ async function gitOutput(
   const { stdout } = await execa("git", ["-C", cwd, ...args], {
     env: options.env,
     maxBuffer: 10 * 1024 * 1024,
+    // execa strips the final newline by default, which corrupts diff --binary
+    // patches consumed by git apply; trimmed callers trim below anyway.
+    stripFinalNewline: false,
   });
   return options.trim === false ? stdout : stdout.trim();
 }
@@ -361,8 +419,21 @@ function contextRoot(state: WorkspaceState): string {
   return state.repoRoot ?? state.activePath;
 }
 
-function repoHash(repoPath: string): string {
-  return createHash("sha256").update(resolve(repoPath)).digest("hex").slice(0, 16);
+async function ensureLocalExclude(repoRoot: string, pattern: string): Promise<void> {
+  const excludePath = resolve(repoRoot, await gitOutput(repoRoot, ["rev-parse", "--git-path", "info/exclude"]));
+  const existing = await readFile(excludePath, "utf8").catch(() => "");
+  if (existing.split(/\r?\n/).includes(pattern)) return;
+  await mkdir(dirname(excludePath), { recursive: true });
+  const prefix = existing && !existing.endsWith("\n") ? `${existing}\n` : existing;
+  await writeFile(excludePath, `${prefix}${pattern}\n`, "utf8");
+}
+
+function backendErrorMessage(result: CallToolResult): string | undefined {
+  const error = (result.structuredContent as { error?: unknown } | undefined)?.error;
+  if (!error || typeof error !== "object") return undefined;
+  const { code, message } = error as { code?: unknown; message?: unknown };
+  if (typeof message !== "string" || !message) return undefined;
+  return typeof code === "string" && code ? `${code}: ${message}` : message;
 }
 
 function resultText(result: CallToolResult): string {
