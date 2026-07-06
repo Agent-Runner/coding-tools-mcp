@@ -1,34 +1,21 @@
 import React, { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Box, Text, useApp, useInput, useStdout } from "ink";
-import { runDoctor } from "../cli/doctor.js";
 import { markTuiAttached } from "../shared/approvals.js";
 import type { ExtraServerStatus } from "../shared/types.js";
-import {
-  findSlashCommand,
-  parseCleanCommand,
-  parseCloseCommand,
-  parseMcpCommand,
-  parseNewCommand,
-  parseSlashCommand,
-  parseTunnelCommand,
-  suggestSlashCommands,
-} from "./commands/registry.js";
+import { dispatchInput, executeClean, runMcpAction, startTunnelWith, type CommandContext, type McpPickRequest } from "./commands/handlers.js";
+import { parseSlashCommand, suggestSlashCommands } from "./commands/registry.js";
 import { ApprovalPrompt } from "./components/ApprovalPrompt.js";
 import { ChoicePrompt } from "./components/ChoicePrompt.js";
 import { Composer, SlashMenu } from "./components/Composer.js";
 import { OnboardingView, optionsForStep } from "./components/OnboardingView.js";
-import {
-  ScrollPanel,
-  approvalPanelLines,
-  batonPanelLines,
-  doctorLines,
-  helpLines,
-  inspectLines,
-  mcpPanelLines,
-} from "./components/Panels.js";
+import { PANEL_TITLES, panelContentLines, ScrollPanel, type PanelState } from "./components/Panels.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { Transcript } from "./components/Transcript.js";
-import { diffDisplayLines, errorMessage, formatElapsedSeconds, textDisplayLines } from "./format.js";
+import { errorMessage, formatElapsedSeconds } from "./format.js";
+import { useBusy } from "./hooks/use-busy.js";
+import { useComposer } from "./hooks/use-composer.js";
+import { usePicker } from "./hooks/use-picker.js";
+import { useTerminalSize } from "./hooks/use-terminal-size.js";
 import {
   advanceOnboarding,
   loadOnboardingState,
@@ -37,41 +24,22 @@ import {
 } from "./onboarding.js";
 import { TuiSessionController, type TunnelMethod } from "./session-controller.js";
 import { TuiSnapshotStore } from "./store.js";
-import type { WorkspaceCleanResult } from "../workspace/manager.js";
-import { glyphs, palette, spinnerFrames, type DisplayLine } from "./theme.js";
+import { glyphs, palette, spinnerFrames } from "./theme.js";
 import { TranscriptBuilder, type NoteKind, type TranscriptItem } from "./transcript.js";
 
 const CTC_VERSION = "0.1.0";
-const HISTORY_LIMIT = 50;
 const CTRL_C_WINDOW_MS = 1500;
 
-type PanelKind = "help" | "diff" | "baton" | "approvals" | "config" | "inspect" | "doctor" | "mcp";
-
-interface PanelState {
-  kind: PanelKind;
-  lines?: DisplayLine[];
-}
-
-interface BusyState {
+interface CleanChoice {
   label: string;
-  startedAt: number;
+  hint: string;
+  force: boolean;
 }
 
-const PANEL_TITLES: Record<PanelKind, string> = {
-  help: "Help",
-  diff: "Recent Changes",
-  baton: "Baton",
-  approvals: "Pending Approvals",
-  config: "Profile",
-  inspect: "Event Inspector",
-  doctor: "Doctor",
-  mcp: "MCP Servers",
-};
-
-interface McpPickState {
-  action: "enable" | "disable" | "reconnect";
-  options: ExtraServerStatus[];
-}
+const CLEAN_CHOICES: CleanChoice[] = [
+  { label: "Clean", hint: "remove clean worktrees, skip dirty ones", force: false },
+  { label: "Force clean", hint: "also remove worktrees with uncommitted changes", force: true },
+];
 
 export function TuiApp({
   requestedSessionId,
@@ -105,7 +73,7 @@ export function TuiApp({
   const activeRepoPath = (): string | undefined =>
     snapshot.workspace?.sourcePath ?? snapshot.session?.workspacePath ?? initialWorkspacePath;
 
-  const [size, setSize] = useState(() => ({ columns: stdout.columns || 80, rows: stdout.rows || 24 }));
+  const size = useTerminalSize();
   const textWidth = Math.max(40, Math.min(size.columns - 2, 120));
   // Menu rows fit within the live region even on short terminals; a counter
   // footer appears when the full command list overflows this budget.
@@ -125,25 +93,11 @@ export function TuiApp({
   ]);
   const [epoch, setEpoch] = useState(0);
 
-  const [input, setInput] = useState("");
-  const [composerEpoch, setComposerEpoch] = useState(0);
-  const [menuIndex, setMenuIndex] = useState(0);
-  const [history, setHistory] = useState<string[]>([]);
-  const [historyIndex, setHistoryIndex] = useState<number | undefined>(undefined);
-  const historyDraft = useRef("");
-
-  // Programmatic replacements (Tab completion, history) remount the text input via
-  // composerEpoch so the cursor lands at the end instead of staying mid-string.
-  const replaceInput = (value: string): void => {
-    setInput(value);
-    setComposerEpoch((epoch) => epoch + 1);
-  };
+  const composer = useComposer();
+  const { input, menuIndex } = composer;
 
   const [panel, setPanel] = useState<PanelState | undefined>(undefined);
   const [scroll, setScroll] = useState(0);
-
-  const [busy, setBusy] = useState<BusyState | undefined>(undefined);
-  const [spinnerFrame, setSpinnerFrame] = useState(0);
 
   const [onboarding, setOnboarding] = useState<OnboardingState | undefined>(undefined);
   const [onboardingChoice, setOnboardingChoice] = useState(0);
@@ -155,15 +109,60 @@ export function TuiApp({
   const ctrlCTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const [tunnelMessage, setTunnelMessage] = useState(() => controller.tunnelStatus().message);
-  const [tunnelMethods, setTunnelMethods] = useState<TunnelMethod[] | undefined>(undefined);
-  const [tunnelChoice, setTunnelChoice] = useState(0);
-
-  const [mcpPick, setMcpPick] = useState<McpPickState | undefined>(undefined);
-  const [mcpChoice, setMcpChoice] = useState(0);
+  const tunnelPicker = usePicker<TunnelMethod>();
+  const mcpPicker = usePicker<ExtraServerStatus, McpPickRequest["action"]>();
+  const cleanPicker = usePicker<CleanChoice, string[]>();
   const untrustedNoticeFor = useRef<string | undefined>(undefined);
 
-  const [cleanPick, setCleanPick] = useState<{ candidates: string[] } | undefined>(undefined);
-  const [cleanChoice, setCleanChoice] = useState(0);
+  const appendItems = (added: TranscriptItem[]): void => {
+    if (added.length) setItems((previous) => [...previous, ...added]);
+  };
+
+  const appendNote = (text: string, kind: NoteKind = "info"): void => {
+    appendItems([builder.note(text, kind, textWidth)]);
+  };
+
+  const { busy, spinnerFrame, runWithBusy, setBusy } = useBusy((error) => {
+    appendNote(errorMessage(error), "error");
+  });
+
+  const clearTranscript = (): void => {
+    stdout.write("\u001B[2J\u001B[3J\u001B[H");
+    setItems([]);
+    setEpoch((value) => value + 1);
+    appendNote("Transcript cleared.", "hint");
+  };
+
+  const switchToSession = (sessionId: string): void => {
+    store.setRequestedSession(sessionId);
+    setPanel(undefined);
+  };
+
+  /** Adapters the extracted command handlers use to reach TUI state. */
+  const commandContext = (): CommandContext => ({
+    controller,
+    store,
+    snapshot,
+    initialWorkspacePath,
+    activeRepoPath,
+    isBusy: () => Boolean(busy),
+    appendNote,
+    runWithBusy,
+    setPanel,
+    setTunnelMessage,
+    switchToSession,
+    openTunnelPicker: (methods) => {
+      tunnelPicker.open(methods);
+    },
+    openMcpPicker: (request) => {
+      mcpPicker.open(request.options, request.action);
+    },
+    openCleanPicker: (candidates) => {
+      cleanPicker.open(CLEAN_CHOICES, candidates);
+    },
+    clearTranscript,
+    exit,
+  });
 
   // The menu is a command picker: it opens on "/name" and closes once you type a
   // space and move on to arguments (matching Codex CLI / OpenCode).
@@ -175,19 +174,12 @@ export function TuiApp({
   const approvalQueue = snapshot.pendingApprovals;
   const approvalVisible = approvalQueue.length > 0 && !onboarding;
   const activeApproval = approvalQueue[Math.min(approvalCursor, Math.max(approvalQueue.length - 1, 0))];
-  const tunnelPickVisible = Boolean(tunnelMethods?.length) && !onboarding && !approvalVisible;
-  const mcpPickVisible = Boolean(mcpPick?.options.length) && !onboarding && !approvalVisible && !tunnelPickVisible;
-  const cleanPickVisible = Boolean(cleanPick) && !onboarding && !approvalVisible && !tunnelPickVisible && !mcpPickVisible;
+  const tunnelPickVisible = Boolean(tunnelPicker.items?.length) && !onboarding && !approvalVisible;
+  const mcpPickVisible = Boolean(mcpPicker.items?.length) && !onboarding && !approvalVisible && !tunnelPickVisible;
+  const cleanPickVisible =
+    Boolean(cleanPicker.items) && !onboarding && !approvalVisible && !tunnelPickVisible && !mcpPickVisible;
 
   const onboardingOptions = useMemo(() => (onboarding ? optionsForStep(onboarding) : []), [onboarding]);
-
-  const appendItems = (added: TranscriptItem[]): void => {
-    if (added.length) setItems((previous) => [...previous, ...added]);
-  };
-
-  const appendNote = (text: string, kind: NoteKind = "info"): void => {
-    appendItems([builder.note(text, kind, textWidth)]);
-  };
 
   // Store lifecycle: watch ~/.ctc/logs and poll as a fallback.
   useEffect(() => {
@@ -276,26 +268,6 @@ export function TuiApp({
   }, [attachMode, snapshot.sessionId]);
 
   useEffect(() => {
-    if (!busy) return undefined;
-    const interval = setInterval(() => {
-      setSpinnerFrame((frame) => (frame + 1) % spinnerFrames.length);
-    }, 120);
-    return () => {
-      clearInterval(interval);
-    };
-  }, [busy]);
-
-  useEffect(() => {
-    const onResize = (): void => {
-      setSize({ columns: stdout.columns, rows: stdout.rows });
-    };
-    stdout.on("resize", onResize);
-    return () => {
-      stdout.off("resize", onResize);
-    };
-  }, [stdout]);
-
-  useEffect(() => {
     setApprovalCursor((cursor) => Math.min(cursor, Math.max(approvalQueue.length - 1, 0)));
   }, [approvalQueue.length]);
 
@@ -312,11 +284,6 @@ export function TuiApp({
       if (ctrlCTimer.current) clearTimeout(ctrlCTimer.current);
     };
   }, []);
-
-  const switchToSession = (sessionId: string): void => {
-    store.setRequestedSession(sessionId);
-    setPanel(undefined);
-  };
 
   const autoStartSession = async (): Promise<void> => {
     await runWithBusy("Starting session", async () => {
@@ -342,46 +309,13 @@ export function TuiApp({
     store.requestRefresh();
   };
 
-  const navigateHistory = (direction: -1 | 1): void => {
-    if (!history.length) return;
-    if (historyIndex === undefined) {
-      if (direction === 1) return;
-      historyDraft.current = input;
-      const index = history.length - 1;
-      setHistoryIndex(index);
-      replaceInput(history[index] ?? "");
-      return;
-    }
-    const next = historyIndex + direction;
-    if (next < 0) return;
-    if (next >= history.length) {
-      setHistoryIndex(undefined);
-      replaceInput(historyDraft.current);
-      return;
-    }
-    setHistoryIndex(next);
-    replaceInput(history[next] ?? "");
-  };
-
   const completeSelected = (): void => {
     const selected = suggestions[Math.min(menuIndex, suggestions.length - 1)];
     if (!selected) return;
     const parsed = safeParse(input);
     if (parsed && parsed.name === selected.name && parsed.args.length) return;
-    replaceInput(`/${selected.name} `);
-    setMenuIndex(0);
-  };
-
-  const handleInputChange = (value: string): void => {
-    setHistoryIndex(undefined);
-    setMenuIndex(0);
-    setInput(value);
-  };
-
-  const clearInput = (): void => {
-    setInput("");
-    setMenuIndex(0);
-    setHistoryIndex(undefined);
+    composer.replaceInput(`/${selected.name} `);
+    composer.setMenuIndex(0);
   };
 
   const handleCtrlC = (): void => {
@@ -389,7 +323,7 @@ export function TuiApp({
       exit();
       return;
     }
-    clearInput();
+    composer.clearInput();
     setCtrlCArmed(true);
     if (ctrlCTimer.current) clearTimeout(ctrlCTimer.current);
     ctrlCTimer.current = setTimeout(() => {
@@ -397,39 +331,14 @@ export function TuiApp({
     }, CTRL_C_WINDOW_MS);
   };
 
-  const clearTranscript = (): void => {
-    stdout.write("\u001B[2J\u001B[3J\u001B[H");
-    setItems([]);
-    setEpoch((value) => value + 1);
-    appendNote("Transcript cleared.", "hint");
-  };
-
-  const pushHistory = (entry: string): void => {
-    setHistory((entries) => {
-      const next = entries.filter((item) => item !== entry);
-      return [...next, entry].slice(-HISTORY_LIMIT);
-    });
-  };
-
-  const runWithBusy = async (label: string, task: () => Promise<void>): Promise<void> => {
-    setBusy({ label, startedAt: Date.now() });
-    try {
-      await task();
-    } catch (error) {
-      appendNote(errorMessage(error), "error");
-    } finally {
-      setBusy(undefined);
-    }
-  };
-
   const submitInput = (value: string): void => {
-    setHistoryIndex(undefined);
+    composer.resetHistoryCursor();
     if (onboarding) {
       void submitOnboarding(value);
       return;
     }
     const trimmed = value.trim();
-    clearInput();
+    composer.clearInput();
     if (!trimmed) return;
 
     let commandText = trimmed;
@@ -441,7 +350,8 @@ export function TuiApp({
         commandText = `/${selected.name}`;
       }
     }
-    void runCommand(commandText);
+    composer.pushHistory(commandText);
+    void dispatchInput(commandContext(), commandText);
   };
 
   const submitOnboarding = async (value: string): Promise<void> => {
@@ -453,7 +363,7 @@ export function TuiApp({
       return;
     }
     const answer = typed || option?.value || "";
-    clearInput();
+    composer.clearInput();
     setBusy({ label: "Saving profile", startedAt: Date.now() });
     let completed = false;
     try {
@@ -474,334 +384,13 @@ export function TuiApp({
     if (completed) await autoStartSession();
   };
 
-  const runCommand = async (trimmed: string): Promise<void> => {
-    pushHistory(trimmed);
-    if (!trimmed.startsWith("/")) {
-      appendNote("The transcript mirrors model-driven sessions; type / to browse TUI commands.", "hint");
-      return;
-    }
-    let parsed;
-    try {
-      parsed = parseSlashCommand(trimmed);
-    } catch (error) {
-      appendNote(errorMessage(error), "error");
-      return;
-    }
-    if (!parsed) return;
-    const command = findSlashCommand(parsed.name);
-    if (!command) {
-      appendNote(`Unknown command ${parsed.raw}. Type /help to see available commands.`, "error");
-      return;
-    }
-    if (busy && command.name !== "quit") {
-      appendNote("A TUI command is already running.", "hint");
-      return;
-    }
-
-    setPanel(undefined);
-    switch (command.name) {
-      case "help":
-        setPanel({ kind: "help" });
-        break;
-      case "diff":
-        setPanel({ kind: "diff" });
-        break;
-      case "baton":
-        setPanel({ kind: "baton" });
-        break;
-      case "approvals":
-        setPanel({ kind: "approvals" });
-        break;
-      case "inspect":
-        setPanel({ kind: "inspect" });
-        break;
-      case "clear":
-        clearTranscript();
-        break;
-      case "new":
-        await runNewCommand(parsed.args);
-        break;
-      case "close":
-        await runCloseCommand(parsed.args);
-        break;
-      case "clean":
-        await runCleanCommand(parsed.args);
-        break;
-      case "merge":
-        await runMergeCommand();
-        break;
-      case "tunnel":
-        await runTunnelCommand(parsed.args);
-        break;
-      case "config":
-        await runConfigCommand(parsed.args);
-        break;
-      case "mcp":
-        await runMcpCommand(parsed.args);
-        break;
-      case "doctor":
-        await runDoctorCommand();
-        break;
-      case "quit":
-        exit();
-        break;
-      default:
-        // Tripwire for a future registry entry added without a case above.
-        appendNote(`${command.usage} has no TUI handler.`, "error");
-    }
-  };
-
-  const runNewCommand = async (args: string[]): Promise<void> => {
-    await runWithBusy("Opening session", async () => {
-      const parsedNew = parseNewCommand(args);
-      const path = parsedNew.path ?? activeRepoPath();
-      const result = await controller.replace({ path, mode: parsedNew.mode, resume: parsedNew.resume });
-      switchToSession(result.sessionId);
-      appendNote(result.message, "success");
-      store.requestRefresh();
-    });
-  };
-
-  const runCloseCommand = async (args: string[]): Promise<void> => {
-    const sessionId = snapshot.sessionId;
-    if (!sessionId) {
-      appendNote("No active session to close.", "hint");
-      return;
-    }
-    await runWithBusy("Closing workspace", async () => {
-      const parsedClose = parseCloseCommand(args);
-      const result = await controller.close(sessionId, { force: parsedClose.force });
-      appendNote(result.message, result.closed ? "success" : "hint");
-      if (result.closed) {
-        store.setRequestedSession(undefined);
-        appendNote("No active session — /new reopens one.", "hint");
-      }
-      store.requestRefresh();
-    });
-  };
-
-  const runMergeCommand = async (): Promise<void> => {
-    const sessionId = snapshot.sessionId;
-    if (!sessionId) {
-      appendNote("No active session to merge.", "hint");
-      return;
-    }
-    await runWithBusy("Merging worktree", async () => {
-      const result = await controller.merge(sessionId);
-      appendNote(result.message, result.applied ? "success" : "hint");
-      store.requestRefresh();
-    });
-  };
-
-  const runCleanCommand = async (args: string[]): Promise<void> => {
-    let parsedClean;
-    try {
-      parsedClean = parseCleanCommand(args);
-    } catch (error) {
-      appendNote(errorMessage(error), "error");
-      return;
-    }
-    if (parsedClean.force || parsedClean.yes) {
-      await executeClean(parsedClean.force);
-      return;
-    }
-    const candidates = await controller.cleanCandidates();
-    if (!candidates.length) {
-      appendNote("No recorded worktrees to clean.", "hint");
-      return;
-    }
-    setCleanChoice(0);
-    setCleanPick({ candidates });
-  };
-
-  const executeClean = async (force: boolean): Promise<void> => {
-    await runWithBusy("Cleaning worktrees", async () => {
-      const result = await controller.clean({ force, sessionId: snapshot.sessionId });
-      appendNote(formatCleanResult(result), result.removed.length ? "success" : "info");
-      if (result.skippedDirty.length) {
-        appendNote(`Dirty worktrees skipped: ${result.skippedDirty.join(", ")} — /clean --force removes them.`, "hint");
-      }
-      if (snapshot.sessionId && result.removed.includes(snapshot.sessionId)) store.setRequestedSession(undefined);
-      store.requestRefresh();
-    });
-  };
-
-  const pickCleanMode = (force: boolean | undefined): void => {
-    setCleanPick(undefined);
-    setCleanChoice(0);
-    if (force === undefined) {
-      appendNote("Clean canceled.", "hint");
-      return;
-    }
-    void executeClean(force);
-  };
-
-  const startTunnelWith = async (method: TunnelMethod): Promise<void> => {
-    await runWithBusy(method.kind === "install" ? "Installing cloudflared" : `Starting tunnel via ${method.label}`, async () => {
-      if (method.note) appendNote(method.note, "hint");
-      const command =
-        method.kind === "install"
-          ? await controller.installCloudflaredProvider(method.plan, (line) => {
-              appendNote(line, "info");
-            })
-          : method.command;
-      const result = await controller.startTunnel(command);
-      setTunnelMessage(result.state.message);
-      appendNote(result.message, "success");
-      store.requestRefresh();
-    });
-  };
-
-  const pickTunnelMethod = (method: TunnelMethod | undefined): void => {
-    setTunnelMethods(undefined);
-    setTunnelChoice(0);
-    if (!method) {
-      appendNote("Tunnel canceled. Run /tunnel start to try again, or /config tunnel none.", "hint");
-      return;
-    }
-    void startTunnelWith(method);
-  };
-
-  const runTunnelCommand = async (args: string[]): Promise<void> => {
-    let parsedTunnel;
-    try {
-      parsedTunnel = parseTunnelCommand(args);
-    } catch (error) {
-      appendNote(errorMessage(error), "error");
-      return;
-    }
-    if (parsedTunnel.action === "start") {
-      // startTunnelWith owns its own busy spinner, so don't nest one here.
-      const methods = controller.tunnelMethods();
-      const ready = methods.find((method) => method.id === "cloudflared");
-      if (ready) {
-        await startTunnelWith(ready); // cloudflared already installed — no prompt
-      } else if (methods.length) {
-        setTunnelChoice(0);
-        setTunnelMethods(methods);
-      } else {
-        appendNote("No tunnel provider available. Install cloudflared or Node's npx, then retry.", "error");
-      }
-      return;
-    }
-    await runWithBusy("Updating tunnel", async () => {
-      if (parsedTunnel.action === "stop") {
-        const result = await controller.stopTunnel();
-        setTunnelMessage(result.state.message);
-        appendNote(result.message, "info");
-      } else {
-        const state = controller.tunnelStatus();
-        setTunnelMessage(state.message);
-        appendNote(state.publicUrl ? `Tunnel: ${state.publicUrl}` : state.message, "info");
-      }
-    });
-  };
-
-  const runConfigCommand = async (args: string[]): Promise<void> => {
-    await runWithBusy("Loading profile", async () => {
-      const result = await controller.configure(activeRepoPath(), args);
-      setPanel({ kind: "config", lines: textDisplayLines(result.text) });
-      if (result.changed) appendNote("Profile updated.", "success");
-    });
-  };
-
-  const runMcpCommand = async (args: string[]): Promise<void> => {
-    let parsedMcp;
-    try {
-      parsedMcp = parseMcpCommand(args);
-    } catch (error) {
-      appendNote(errorMessage(error), "error");
-      return;
-    }
-    if (parsedMcp.action === "status") {
-      setPanel({ kind: "mcp" });
-      return;
-    }
-    const hosted = controller.mcpStatuses(snapshot.sessionId);
-    // Trust only writes the profile, so it works without a hosted session too.
-    if (!hosted && parsedMcp.action !== "trust") {
-      appendNote(
-        "/mcp changes apply to TUI-owned sessions; this session is external and read-only. Run /new to host one.",
-        "hint",
-      );
-      return;
-    }
-    if (parsedMcp.server) {
-      await runMcpAction(parsedMcp.action, parsedMcp.server);
-      return;
-    }
-    const action = parsedMcp.action;
-    if (action === "trust") return; // parser guarantees trust always carries a server name
-    const options = (hosted ?? []).filter((server) =>
-      action === "enable" ? server.state === "disabled" && !server.untrusted : server.state !== "disabled",
-    );
-    if (!options.length) {
-      appendNote(`No MCP servers available to ${action}. /mcp shows the current list.`, "hint");
-      return;
-    }
-    setMcpChoice(0);
-    setMcpPick({ action, options });
-  };
-
-  const runMcpAction = async (action: "enable" | "disable" | "reconnect" | "trust", server: string): Promise<void> => {
-    const labels = { enable: "Enabling", disable: "Disabling", reconnect: "Reconnecting", trust: "Trusting" } as const;
-    await runWithBusy(`${labels[action]} mcp ${server}`, async () => {
-      let status: ExtraServerStatus | undefined;
-      if (action === "trust") {
-        status = await controller.mcpTrust(activeRepoPath(), snapshot.sessionId, server);
-        if (!status) {
-          appendNote(`Trusted workspace MCP server ${server}; it connects when a hosted session starts.`, "success");
-          return;
-        }
-      } else if (action === "reconnect") {
-        status = await controller.mcpReconnect(snapshot.sessionId, server);
-      } else {
-        status = await controller.mcpSetEnabled(snapshot.sessionId, server, action === "enable");
-      }
-      appendNote(describeMcpStatus(status), status.state === "connected" || status.state === "disabled" ? "success" : "error");
-      store.requestRefresh();
-    });
-  };
-
-  const pickMcpServer = (status: ExtraServerStatus | undefined): void => {
-    const action = mcpPick?.action;
-    setMcpPick(undefined);
-    setMcpChoice(0);
-    if (!status || !action) {
-      appendNote("MCP action canceled.", "hint");
-      return;
-    }
-    void runMcpAction(action, status.name);
-  };
-
-  const runDoctorCommand = async (): Promise<void> => {
-    await runWithBusy("Running doctor checks", async () => {
-      const root = snapshot.workspace?.activePath ?? snapshot.session?.workspacePath ?? initialWorkspacePath;
-      const checks = await runDoctor(root);
-      setPanel({ kind: "doctor", lines: doctorLines(checks) });
-      if (checks.some((check) => check.status === "fail")) appendNote("Doctor found failing checks.", "error");
-    });
-  };
-
-  const panelLines = useMemo((): DisplayLine[] => {
-    if (!panel) return [];
-    switch (panel.kind) {
-      case "diff":
-        return diffDisplayLines(snapshot.checkpoints.at(-1));
-      case "baton":
-        return batonPanelLines(snapshot);
-      case "help":
-        return helpLines();
-      case "approvals":
-        return approvalPanelLines(approvalQueue);
-      case "inspect":
-        return inspectLines(snapshot.events);
-      case "mcp":
-        return mcpPanelLines(snapshot.mcpServers, { hosted: controller.mcpStatuses(snapshot.sessionId) !== undefined });
-      default:
-        return panel.lines ?? [];
-    }
-  }, [panel, snapshot, approvalQueue, controller]);
+  const panelLines = useMemo(
+    () =>
+      panel
+        ? panelContentLines(panel, snapshot, approvalQueue, controller.mcpStatuses(snapshot.sessionId) !== undefined)
+        : [],
+    [panel, snapshot, approvalQueue, controller],
+  );
 
   const panelHeight = Math.max(8, Math.min(size.rows - 9, panelLines.length + 3));
   const pageSize = Math.max(1, panelHeight - 3);
@@ -816,7 +405,7 @@ export function TuiApp({
       if (key.upArrow && !input) setOnboardingChoice((choice) => Math.max(0, choice - 1));
       else if (key.downArrow && !input)
         setOnboardingChoice((choice) => Math.min(Math.max(onboardingOptions.length - 1, 0), choice + 1));
-      else if (key.escape) clearInput();
+      else if (key.escape) composer.clearInput();
       return;
     }
     if (approvalVisible && activeApproval) {
@@ -829,33 +418,35 @@ export function TuiApp({
       else if (key.rightArrow) setApprovalCursor((cursor) => Math.min(approvalQueue.length - 1, cursor + 1));
       return;
     }
-    if (tunnelPickVisible && tunnelMethods) {
-      const count = tunnelMethods.length;
-      const digit = Number.parseInt(inputChar, 10);
-      if (key.escape || inputChar === "n" || inputChar === "N") pickTunnelMethod(undefined);
-      else if (Number.isInteger(digit) && digit >= 1 && digit <= count) pickTunnelMethod(tunnelMethods[digit - 1]);
-      else if (key.upArrow) setTunnelChoice((choice) => Math.max(0, choice - 1));
-      else if (key.downArrow) setTunnelChoice((choice) => Math.min(count - 1, choice + 1));
-      else if (key.return) pickTunnelMethod(tunnelMethods[Math.min(tunnelChoice, count - 1)]);
+    if (tunnelPickVisible) {
+      tunnelPicker.handleKey(inputChar, key, (method) => {
+        if (!method) {
+          appendNote("Tunnel canceled. Run /tunnel start to try again, or /config tunnel none.", "hint");
+          return;
+        }
+        void startTunnelWith(commandContext(), method);
+      });
       return;
     }
-    if (mcpPickVisible && mcpPick) {
-      const count = mcpPick.options.length;
-      const digit = Number.parseInt(inputChar, 10);
-      if (key.escape || inputChar === "n" || inputChar === "N") pickMcpServer(undefined);
-      else if (Number.isInteger(digit) && digit >= 1 && digit <= count) pickMcpServer(mcpPick.options[digit - 1]);
-      else if (key.upArrow) setMcpChoice((choice) => Math.max(0, choice - 1));
-      else if (key.downArrow) setMcpChoice((choice) => Math.min(count - 1, choice + 1));
-      else if (key.return) pickMcpServer(mcpPick.options[Math.min(mcpChoice, count - 1)]);
+    if (mcpPickVisible) {
+      const action = mcpPicker.meta;
+      mcpPicker.handleKey(inputChar, key, (status) => {
+        if (!status || !action) {
+          appendNote("MCP action canceled.", "hint");
+          return;
+        }
+        void runMcpAction(commandContext(), action, status.name);
+      });
       return;
     }
-    if (cleanPickVisible && cleanPick) {
-      const digit = Number.parseInt(inputChar, 10);
-      if (key.escape || inputChar === "n" || inputChar === "N") pickCleanMode(undefined);
-      else if (digit === 1 || digit === 2) pickCleanMode(digit === 2);
-      else if (key.upArrow) setCleanChoice(0);
-      else if (key.downArrow) setCleanChoice(1);
-      else if (key.return) pickCleanMode(cleanChoice === 1);
+    if (cleanPickVisible) {
+      cleanPicker.handleKey(inputChar, key, (choice) => {
+        if (!choice) {
+          appendNote("Clean canceled.", "hint");
+          return;
+        }
+        void executeClean(commandContext(), choice.force);
+      });
       return;
     }
     if (key.ctrl && (inputChar === "o" || inputChar === "O" || inputChar === "\u000F")) {
@@ -863,7 +454,7 @@ export function TuiApp({
       return;
     }
     if (key.escape) {
-      if (input) clearInput();
+      if (input) composer.clearInput();
       else if (panel) setPanel(undefined);
       return;
     }
@@ -873,16 +464,16 @@ export function TuiApp({
     }
     if (key.upArrow) {
       if (menuVisible) {
-        if (suggestions.length) setMenuIndex((index) => (index - 1 + suggestions.length) % suggestions.length);
+        if (suggestions.length) composer.setMenuIndex((index) => (index - 1 + suggestions.length) % suggestions.length);
       } else if (panel) setScroll((value) => Math.max(0, value - 1));
-      else navigateHistory(-1);
+      else composer.navigateHistory(-1);
       return;
     }
     if (key.downArrow) {
       if (menuVisible) {
-        if (suggestions.length) setMenuIndex((index) => (index + 1) % suggestions.length);
+        if (suggestions.length) composer.setMenuIndex((index) => (index + 1) % suggestions.length);
       } else if (panel) setScroll((value) => value + 1);
-      else navigateHistory(1);
+      else composer.navigateHistory(1);
       return;
     }
     // ←/→ page open panels while the composer is empty (Mac keyboards have no
@@ -936,36 +527,33 @@ export function TuiApp({
             choice={approvalChoice}
             width={textWidth}
           />
-        ) : tunnelPickVisible && tunnelMethods ? (
+        ) : tunnelPickVisible && tunnelPicker.items ? (
           <ChoicePrompt
             title="Start a public tunnel with…"
             body="cloudflared was not found. Pick how to expose this MCP server."
-            options={tunnelMethods.map((method) => ({ label: method.label, hint: method.note }))}
-            selected={Math.min(tunnelChoice, tunnelMethods.length - 1)}
+            options={tunnelPicker.items.map((method) => ({ label: method.label, hint: method.note }))}
+            selected={Math.min(tunnelPicker.choice, tunnelPicker.items.length - 1)}
           />
-        ) : mcpPickVisible && mcpPick ? (
+        ) : mcpPickVisible && mcpPicker.items ? (
           <ChoicePrompt
-            title={`Which MCP server do you want to ${mcpPick.action}?`}
-            body={`Pick a server; /mcp ${mcpPick.action} <name> skips this prompt.`}
-            options={mcpPick.options.map((server) => ({
+            title={`Which MCP server do you want to ${mcpPicker.meta ?? "change"}?`}
+            body={`Pick a server; /mcp ${mcpPicker.meta ?? ""} <name> skips this prompt.`}
+            options={mcpPicker.items.map((server) => ({
               label: server.name,
               hint: `${server.state}${server.state === "connected" ? ` ${glyphs.dot} ${String(server.toolCount)} tools` : ""}`,
             }))}
-            selected={Math.min(mcpChoice, mcpPick.options.length - 1)}
+            selected={Math.min(mcpPicker.choice, mcpPicker.items.length - 1)}
           />
-        ) : cleanPickVisible && cleanPick ? (
+        ) : cleanPickVisible && cleanPicker.items ? (
           <ChoicePrompt
-            title={`Clean ${String(cleanPick.candidates.length)} recorded worktree(s)?`}
+            title={`Clean ${String(cleanPicker.meta?.length ?? 0)} recorded worktree(s)?`}
             body={`Removes worktrees with no uncommitted changes and prunes closed session records and logs; dirty worktrees are skipped unless forced.${
-              snapshot.sessionId && cleanPick.candidates.includes(snapshot.sessionId)
+              snapshot.sessionId && cleanPicker.meta?.includes(snapshot.sessionId)
                 ? " Includes the ACTIVE session's worktree — it will close if it has no uncommitted changes."
                 : ""
             }`}
-            options={[
-              { label: "Clean", hint: "remove clean worktrees, skip dirty ones" },
-              { label: "Force clean", hint: "also remove worktrees with uncommitted changes" },
-            ]}
-            selected={Math.min(cleanChoice, 1)}
+            options={cleanPicker.items.map((choice) => ({ label: choice.label, hint: choice.hint }))}
+            selected={Math.min(cleanPicker.choice, cleanPicker.items.length - 1)}
           />
         ) : panel ? (
           <ScrollPanel title={PANEL_TITLES[panel.kind]} lines={panelLines} scroll={scroll} height={panelHeight} />
@@ -978,8 +566,8 @@ export function TuiApp({
         ) : null}
         <Composer
           value={input}
-          inputKey={composerEpoch}
-          onChange={handleInputChange}
+          inputKey={composer.composerEpoch}
+          onChange={composer.handleInputChange}
           onSubmit={submitInput}
           placeholder={onboarding ? onboardingDefault(onboarding) : "/ for commands"}
           focus={!approvalVisible && !tunnelPickVisible && !mcpPickVisible && !cleanPickVisible}
@@ -1004,14 +592,4 @@ function safeParse(value: string): { name: string; args: string[] } | undefined 
   } catch {
     return undefined;
   }
-}
-
-function describeMcpStatus(status: ExtraServerStatus): string {
-  if (status.state === "connected") return `mcp ${status.name} connected ${glyphs.dot} ${String(status.toolCount)} tools`;
-  if (status.state === "disabled") return `mcp ${status.name} disabled for this session`;
-  return `mcp ${status.name} ${status.state}${status.lastError ? `: ${status.lastError}` : ""}`;
-}
-
-function formatCleanResult(result: WorkspaceCleanResult): string {
-  return `Cleaned worktrees: removed ${String(result.removed.length)} ${glyphs.dot} skipped dirty ${String(result.skippedDirty.length)} ${glyphs.dot} missing ${String(result.missing.length)} ${glyphs.dot} pruned ${String(result.prunedRecords.length)} records`;
 }

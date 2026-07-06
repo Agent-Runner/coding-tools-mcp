@@ -4,6 +4,7 @@ import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotoc
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ToolListChangedNotificationSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { resolveConfigValueMap } from "../profiles/mcp.js";
+import { mergePathWithLoginShell, loginShellPath } from "../shared/shell-env.js";
 import type { CachedTool, ExtraServerState, ExtraServerStatus, ResolvedMcpServer } from "../shared/types.js";
 import { BackendDisconnectedError } from "./client.js";
 
@@ -164,7 +165,7 @@ export class ExtraMcpClient {
   private async connectOnce(): Promise<void> {
     await this.closeClient();
     this.stderrTail = "";
-    const transport = this.createTransport();
+    const transport = await this.createTransport();
     const client = new Client({ name: `ctc-extra-${this.server.name}`, version: "0.1.0" }, { capabilities: {} });
     await client.connect(transport, { timeout: CONNECT_TIMEOUT_MS });
     client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
@@ -180,15 +181,20 @@ export class ExtraMcpClient {
     await this.refreshToolCache();
   }
 
-  private createTransport(): StdioClientTransport | StreamableHTTPClientTransport {
+  private async createTransport(): Promise<StdioClientTransport | StreamableHTTPClientTransport> {
     const transport = this.server.transport;
     if (transport.type === "stdio") {
       // Extras spawn with the SDK's minimal default environment plus the
-      // configured env only; secrets must be passed intentionally.
+      // configured env only; secrets must be passed intentionally. PATH is
+      // widened to the login shell's so `npx`-style servers resolve the same
+      // toolchain as the user's terminal.
+      const env = { ...getDefaultEnvironment(), ...resolveConfigValueMap(transport.env) };
+      const mergedPath = mergePathWithLoginShell(env.PATH, await loginShellPath());
+      if (mergedPath) env.PATH = mergedPath;
       const stdio = new StdioClientTransport({
         command: transport.command,
         args: transport.args ?? [],
-        env: { ...getDefaultEnvironment(), ...resolveConfigValueMap(transport.env) },
+        env,
         stderr: "pipe",
       });
       stdio.stderr?.on("data", (chunk: Buffer) => {
@@ -207,9 +213,9 @@ export class ExtraMcpClient {
     if (!client) return;
     const response = await client.listTools();
     const filtered = response.tools.filter((tool) => this.isToolExposed(tool.name));
-    const changed =
-      filtered.length !== this.cachedTools.length ||
-      filtered.some((tool, index) => tool.name !== this.cachedTools[index]?.name);
+    // Full-definition comparison: a server that keeps a tool's name but changes
+    // its schema/description must still reach clients as tools/list_changed.
+    const changed = toolsSignature(filtered) !== toolsSignature(this.cachedTools);
     this.cachedTools = filtered;
     if (changed && this.state === "connected") this.hooks.onToolsChanged?.();
   }
@@ -258,4 +264,8 @@ export class ExtraMcpClient {
     }
     return message.slice(0, 800);
   }
+}
+
+function toolsSignature(tools: CachedTool[]): string {
+  return JSON.stringify(tools.map((tool) => [tool.name, tool.description, tool.inputSchema, tool.outputSchema, tool.annotations]));
 }

@@ -8,7 +8,52 @@ import type { ConductorEvent } from "../../shared/types.js";
 import { slashCommandGroups } from "../commands/registry.js";
 import { formatDuration, pad, timeOf, wrapText } from "../format.js";
 import type { McpServerStatusSnapshot, TuiSnapshot } from "../state.js";
+import { diffDisplayLines } from "../format.js";
 import { glyphs, palette, USAGE_COLUMN, type DisplayLine } from "../theme.js";
+
+export type PanelKind = "help" | "diff" | "baton" | "approvals" | "config" | "inspect" | "doctor" | "mcp";
+
+export interface PanelState {
+  kind: PanelKind;
+  /** Pre-rendered content for one-shot panels (config, doctor). */
+  lines?: DisplayLine[];
+}
+
+export const PANEL_TITLES: Record<PanelKind, string> = {
+  help: "Help",
+  diff: "Recent Changes",
+  baton: "Baton",
+  approvals: "Pending Approvals",
+  config: "Profile",
+  inspect: "Event Inspector",
+  doctor: "Doctor",
+  mcp: "MCP Servers",
+};
+
+/** Lines for the open panel; live panels derive from the snapshot on every render. */
+export function panelContentLines(
+  panel: PanelState,
+  snapshot: TuiSnapshot,
+  approvals: PermissionApprovalRequest[],
+  hosted: boolean,
+): DisplayLine[] {
+  switch (panel.kind) {
+    case "diff":
+      return diffDisplayLines(snapshot.checkpoints.at(-1));
+    case "baton":
+      return batonPanelLines(snapshot);
+    case "help":
+      return helpLines();
+    case "approvals":
+      return approvalPanelLines(approvals);
+    case "inspect":
+      return inspectLines(snapshot.events);
+    case "mcp":
+      return mcpPanelLines(snapshot.mcpServers, { hosted });
+    default:
+      return panel.lines ?? [];
+  }
+}
 
 /**
  * Bounded scrollable panel shown in the live region (diff, help, inspector…).

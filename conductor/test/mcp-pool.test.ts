@@ -60,6 +60,27 @@ describe("McpServerPool", () => {
     expect(pool.resolve("a__")).toBeUndefined();
   });
 
+  it("resolves a colliding exposed name to the same server the tool list shows", async () => {
+    // a's tool `b__x` and a__b's tool `x` both expose as `a__b__x`; naive
+    // longest-prefix parsing would call a__b while the list showed a's tool.
+    const pool = trackedPool([
+      stdioServer("a", ["--tools", "b__x", "--label", "a"]),
+      stdioServer("a__b", ["--tools", "x", "--label", "a__b"]),
+    ]);
+    await pool.start();
+
+    expect(pool.tools().map((tool) => tool.name)).toEqual(["a__b__x", "a__b__x"]);
+    expect(pool.resolve("a__b__x")).toEqual({ server: "a", tool: "b__x" });
+    expect(pool.entries().map((entry) => [entry.name, entry.server])).toEqual([
+      ["a__b__x", "a"],
+      ["a__b__x", "a__b"],
+    ]);
+
+    const winner = pool.resolve("a__b__x");
+    const result = await pool.callTool(winner?.server ?? "", winner?.tool ?? "", {});
+    expect(result.content).toEqual([{ type: "text", text: "a:b__x:ok" }]);
+  });
+
   it("keeps healthy siblings serving when one server fails to start", async () => {
     const pool = trackedPool([
       stdioServer("alpha", ["--tools", "echo", "--label", "alpha"]),
@@ -97,6 +118,28 @@ describe("McpServerPool", () => {
     const status = await pool.reconnect("alpha");
     expect(status.state).toBe("connected");
     expect(status.toolCount).toBe(1);
+  });
+
+  it("signals tool changes when only a description/schema changes, and stays quiet otherwise", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ctc-extra-"));
+    const changed: string[] = [];
+    const pool = trackedPool(
+      [
+        stdioServer("stable", ["--tools", "echo", "--label", "stable"]),
+        stdioServer("mutating", ["--tools", "echo", "--label", "mutating", "--rev-file", join(dir, "rev")]),
+      ],
+      { onToolsChanged: (server) => changed.push(server) },
+    );
+    await pool.start();
+
+    // Reconnect re-lists; identical definitions must not re-broadcast.
+    changed.length = 0;
+    await pool.reconnect("stable");
+    expect(changed).toEqual([]);
+
+    // Same tool names but a revved description is still a tool-list change.
+    await pool.reconnect("mutating");
+    expect(changed).toEqual(["mutating"]);
   });
 
   it("disable hides tools and re-enable reconnects", async () => {

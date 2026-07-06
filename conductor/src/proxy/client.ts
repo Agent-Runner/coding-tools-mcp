@@ -4,7 +4,22 @@ import { createInterface, type Interface } from "node:readline";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { spawnEnvWithLoginShellPath } from "../shared/shell-env.js";
 import type { BackendConfig, BackendStatus, CachedTool } from "../shared/types.js";
+
+// Handshake and list calls answer from memory on a healthy backend; tool calls
+// may legitimately run a long build (exec_command yields up to minutes), so
+// they get a far larger budget. A backend that blows either budget is treated
+// as disconnected and the reconnect loop takes over.
+const controlRequestTimeoutMs = (): number => envMs("CTC_BACKEND_CONTROL_TIMEOUT_MS", 30_000);
+const toolCallTimeoutMs = (): number => envMs("CTC_BACKEND_TOOL_TIMEOUT_MS", 10 * 60_000);
+// Grace between SIGTERM and SIGKILL when closing the stdio child.
+const KILL_GRACE_MS = 3_000;
+
+function envMs(name: string, fallback: number): number {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 export class BackendDisconnectedError extends Error {
   constructor(message: string) {
@@ -185,7 +200,7 @@ class LineDelimitedStdioBackendConnection implements BackendConnection {
   async connect(): Promise<void> {
     const [command, ...args] = this.command;
     if (!command) throw new Error("stdio backend command is empty");
-    const child = spawn(command, args, { stdio: "pipe", env: process.env });
+    const child = spawn(command, args, { stdio: "pipe", env: await spawnEnvWithLoginShellPath() });
     this.process = child;
     this.closedError = undefined;
     this.lines = createInterface({ input: child.stdout });
@@ -194,6 +209,12 @@ class LineDelimitedStdioBackendConnection implements BackendConnection {
     });
     child.stderr.on("data", (chunk: Buffer) => {
       this.stderrTail = `${this.stderrTail}${chunk.toString("utf8")}`.slice(-4000);
+    });
+    // A backend that exits before reading its stdin (ctc doctor against a
+    // broken command) surfaces as an async EPIPE on the stdin stream; without
+    // a listener Node turns that into an uncaught exception.
+    child.stdin.on("error", () => {
+      this.markClosed(new BackendDisconnectedError(this.closeMessage()));
     });
     child.once("error", (error) => {
       this.markClosed(new BackendDisconnectedError(`stdio backend failed to start: ${errorMessage(error)}`));
@@ -219,7 +240,7 @@ class LineDelimitedStdioBackendConnection implements BackendConnection {
   }
 
   async callTool(name: string, args: Record<string, unknown>): Promise<CallToolResult> {
-    return (await this.request("tools/call", { name, arguments: args })) as CallToolResult;
+    return (await this.request("tools/call", { name, arguments: args }, toolCallTimeoutMs())) as CallToolResult;
   }
 
   close(): Promise<void> {
@@ -228,27 +249,67 @@ class LineDelimitedStdioBackendConnection implements BackendConnection {
     const child = this.process;
     this.process = undefined;
     this.markClosed(new BackendDisconnectedError("stdio backend connection closed"));
-    if (child && child.exitCode === null && child.signalCode === null) child.kill();
+    if (child && child.exitCode === null && child.signalCode === null) {
+      // MCP stdio shutdown order: EOF lets the server exit cleanly (and a
+      // `docker run` backend stop + auto-remove), SIGTERM covers servers that
+      // ignore EOF, SIGKILL is the last resort for a wedged process.
+      child.stdin.end();
+      child.kill();
+      const hardKill = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      }, KILL_GRACE_MS);
+      hardKill.unref();
+      child.once("exit", () => {
+        clearTimeout(hardKill);
+      });
+    }
     return Promise.resolve();
   }
 
-  private request(method: string, params: Record<string, unknown>): Promise<unknown> {
+  private request(
+    method: string,
+    params: Record<string, unknown>,
+    timeoutMs = controlRequestTimeoutMs(),
+  ): Promise<unknown> {
     const child = this.process;
     if (this.closedError) return Promise.reject(this.closedError);
     if (!child?.stdin.writable) return Promise.reject(new BackendDisconnectedError(this.closeMessage()));
     const id = this.nextId++;
     const request = { jsonrpc: "2.0", id, method, params };
     const promise = new Promise<unknown>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        this.settle(id)?.reject(
+          new BackendDisconnectedError(`stdio backend did not answer ${method} within ${String(timeoutMs)}ms`),
+        );
+      }, timeoutMs);
+      timer.unref();
+      this.pending.set(id, { resolve, reject, timer });
     });
-    child.stdin.write(`${JSON.stringify(request)}\n`);
+    this.write(`${JSON.stringify(request)}\n`);
     return promise;
   }
 
   private notify(method: string, params: Record<string, unknown>): void {
-    const child = this.process;
-    if (!child?.stdin.writable) return;
-    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
+    if (!this.process?.stdin.writable) return;
+    this.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
+  }
+
+  /** Failed writes surface through the stdin error/exit handlers; never throw. */
+  private write(line: string): void {
+    try {
+      this.process?.stdin.write(line);
+    } catch {
+      // markClosed rejects the pending requests.
+    }
+  }
+
+  /** Remove and return a pending request with its timeout cleared. */
+  private settle(id: number): PendingRequest | undefined {
+    const pending = this.pending.get(id);
+    if (!pending) return undefined;
+    this.pending.delete(id);
+    clearTimeout(pending.timer);
+    return pending;
   }
 
   private handleLine(line: string): void {
@@ -261,9 +322,8 @@ class LineDelimitedStdioBackendConnection implements BackendConnection {
       return;
     }
     if (typeof message.id !== "number") return;
-    const pending = this.pending.get(message.id);
+    const pending = this.settle(message.id);
     if (!pending) return;
-    this.pending.delete(message.id);
     if (message.error) {
       pending.reject(new Error(message.error.message));
     } else {
@@ -272,7 +332,10 @@ class LineDelimitedStdioBackendConnection implements BackendConnection {
   }
 
   private rejectAll(error: Error): void {
-    for (const pending of this.pending.values()) pending.reject(error);
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
     this.pending.clear();
   }
 
@@ -289,6 +352,7 @@ class LineDelimitedStdioBackendConnection implements BackendConnection {
 interface PendingRequest {
   resolve(value: unknown): void;
   reject(error: Error): void;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 interface JsonRpcResponse {
