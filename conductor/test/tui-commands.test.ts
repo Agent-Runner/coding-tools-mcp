@@ -2,10 +2,14 @@ import { describe, expect, it } from "vitest";
 import {
   findSlashCommand,
   fuzzyMatch,
+  parseCleanCommand,
   parseCloseCommand,
+  parseMcpCommand,
   parseNewCommand,
   parseSlashCommand,
   parseTunnelCommand,
+  slashCommandGroups,
+  slashCommands,
   suggestSlashCommands,
 } from "../src/tui/commands/registry.js";
 
@@ -35,10 +39,52 @@ describe("TUI slash command registry", () => {
     expect(() => parseTunnelCommand(["restart"])).toThrow(/action must be/);
   });
 
+  it("parses /mcp actions with optional server names", () => {
+    expect(parseMcpCommand([])).toEqual({ action: "status" });
+    expect(parseMcpCommand(["enable"])).toEqual({ action: "enable", server: undefined });
+    expect(parseMcpCommand(["disable", "github"])).toEqual({ action: "disable", server: "github" });
+    expect(parseMcpCommand(["reconnect", "playwright"])).toEqual({ action: "reconnect", server: "playwright" });
+    expect(parseMcpCommand(["trust", "docs"])).toEqual({ action: "trust", server: "docs" });
+    expect(() => parseMcpCommand(["trust"])).toThrow(/requires a server name/);
+    expect(() => parseMcpCommand(["restart"])).toThrow(/action must be/);
+    expect(() => parseMcpCommand(["enable", "a", "b"])).toThrow(/at most/);
+    expect(suggestSlashCommands("/mc")[0]?.name).toBe("mcp");
+    expect(findSlashCommand("mcp")?.name).toBe("mcp");
+  });
+
   it("resolves aliases and suggestions", () => {
     expect(findSlashCommand("?")?.name).toBe("help");
-    expect(findSlashCommand("tunnel")?.stage).toBe("available");
+    expect(findSlashCommand("tunnel")?.name).toBe("tunnel");
     expect(suggestSlashCommands("/sw").map((command) => command.name)).toContain("switch");
+  });
+
+  it("suggests every registered command for an empty query, in registry order", () => {
+    const names = suggestSlashCommands("/").map((command) => command.name);
+    expect(names).toEqual(slashCommands.map((command) => command.name));
+    expect(names).toHaveLength(16);
+    expect(names.slice(0, 5)).toEqual(["new", "close", "merge", "clean", "switch"]);
+  });
+
+  it("keeps groups and the flat list in sync with truthful strings", () => {
+    expect(slashCommandGroups.map((group) => group.title)).toEqual(["Sessions", "Review", "Configure", "Interface"]);
+    expect(slashCommandGroups.flatMap((group) => group.commands)).toEqual(slashCommands);
+    for (const command of slashCommands) {
+      expect(command.usage.startsWith(`/${command.name}`)).toBe(true);
+      expect(command.description).not.toMatch(/planned|not wired/i);
+    }
+    expect(findSlashCommand("clean")?.usage).toBe("/clean [--force|--yes]");
+    expect(findSlashCommand("diff")?.usage).toBe("/diff");
+    expect(findSlashCommand("tunnel")?.usage).toContain("status");
+    expect(findSlashCommand("mcp")?.usage).toContain("status");
+  });
+
+  it("parses /clean options", () => {
+    expect(parseCleanCommand([])).toEqual({ force: false, yes: false });
+    expect(parseCleanCommand(["--force"])).toEqual({ force: true, yes: false });
+    expect(parseCleanCommand(["-f"])).toEqual({ force: true, yes: false });
+    expect(parseCleanCommand(["--yes"])).toEqual({ force: false, yes: true });
+    expect(parseCleanCommand(["-y"])).toEqual({ force: false, yes: true });
+    expect(() => parseCleanCommand(["--bogus"])).toThrow(/Unknown \/clean option/);
   });
 
   it("fuzzy-matches non-contiguous queries and ranks the best command first", () => {

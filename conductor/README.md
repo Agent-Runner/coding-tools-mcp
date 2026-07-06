@@ -28,8 +28,9 @@ wizard.
     CLI supplied command.
   - `http`: connect to a Streamable HTTP MCP endpoint with an optional bearer
     token read from an environment variable.
-- Backend tools are re-exposed without prefixes, subject to profile allow/deny
-  policy.
+- Primary backend tools are re-exposed without prefixes, subject to profile
+  allow/deny policy; additional MCP servers (see M6) are re-exposed with a
+  `<server>__` prefix.
 - Every proxied tool call emits a JSONL audit event under `~/.ctc/logs/`.
 
 Example:
@@ -62,6 +63,9 @@ ctc ws clean --yes
 ctc ws clean --force --yes
 ctc ws merge <session-id>
 ```
+
+Inside the TUI, `/clean [--force|--yes]` mirrors `ctc ws clean` with an
+in-terminal confirmation prompt instead of a stdin one.
 
 Worktree creation and cleanup are the only direct git operations in the core
 runtime. Review checkpoints run git through the lower `exec_command` tool so the
@@ -135,9 +139,11 @@ repainting on a timer — so external stdio sessions stream in near real time
 without flicker.
 
 Interaction is input-first: printable keys always go to the composer, and
-typing `/` opens a navigable command menu that fuzzy-matches as you type
-(e.g. `/dr` finds `doctor`), highlights the matched characters, and wraps at
-the ends — arrows to choose, Tab to complete, Enter to run. The composer
+typing `/` opens a navigable command menu that lists every command grouped by
+area (Sessions, Review, Configure, Interface) in a scrolling window with a
+`3/16 · ↑/↓` count footer when the list overflows. It fuzzy-matches as you
+type (e.g. `/dr` finds `doctor`), highlights the matched characters, and
+wraps at the ends — arrows to choose, Tab to complete, Enter to run. The composer
 supports the usual readline editing keys (Ctrl+A/E to jump to line
 start/end, Ctrl+W/U/K to delete by word or to the line edges, Ctrl+←/→ and
 Alt+←/→ to move by word). Bounded panels open over the live region for `/diff`,
@@ -222,3 +228,76 @@ The adapter uses standard MCP Apps metadata (`_meta.ui.resourceUri`) plus
 ChatGPT compatibility aliases such as `_meta["openai/outputTemplate"]`. It is a
 host-specific presentation layer; the model-facing tool names and core tool
 results stay unchanged.
+
+## M6 Surface
+
+Conductor now aggregates additional third-party MCP servers (GitHub MCP,
+Playwright MCP, remote Streamable HTTP servers, …) behind the same
+model-facing endpoint. The primary `coding-tools-mcp` backend is unchanged and
+stays authoritative: its tools remain unprefixed, `open_workspace`, review
+checkpoints, baton files, and `request_permissions` bind to it exclusively,
+and a primary connection failure still fails startup. Extra servers are
+tools-only: each of their tools is exposed as `<server>__<tool>`
+(`github__create_issue`, `playwright__browser_click`), and calls are routed
+back to the owning server.
+
+Configuration lives in two merged places:
+
+- the workspace profile (`~/.ctc/profiles/<repo-hash>.json`) under a new
+  `mcpServers` record — personal, implicitly trusted;
+- a shareable `<repo>/.ctc/mcp.json` committed with the repository.
+
+```json
+{ "mcpServers": {
+    "github":     { "command": "docker", "args": ["run", "-i", "--rm", "ghcr.io/github/github-mcp-server"],
+                    "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "env:GITHUB_TOKEN" } },
+    "playwright": { "command": "npx", "args": ["@playwright/mcp@latest"] },
+    "remote":     { "url": "https://example.com/mcp", "headers": { "Authorization": "env:REMOTE_AUTH" } } } }
+```
+
+Entries are stdio (`command`, `args`, `env`) or Streamable HTTP (`url`,
+`headers`), plus optional `disabled` and per-server `allow`/`deny` tool
+policies (unprefixed names). Server names must match `[A-Za-z0-9_-]+` so the
+prefixed tool names stay MCP-safe; keep third-party tool names within your
+host's length limits. `env` and `headers` values support `env:<NAME>`
+references, resolved at connect time — recommended over literals so
+`.ctc/mcp.json` never carries secrets. Extra stdio servers spawn with a
+minimal default environment plus the configured `env` only; secrets must be
+passed intentionally. On a name collision the profile entry replaces the
+workspace entry wholesale (personal over shared), and exposed tool names
+resolve conductor > primary > extras, with shadowed names reported per server.
+
+Workspace-declared servers are a trust boundary: a cloned repository could
+ship a malicious stdio command, so they start `disabled (untrusted)` until
+approved with `/mcp trust <name>` (records a fingerprint of the entry in the
+profile; if the repo later edits the entry, trust resets) or per-session with
+`ctc start --trust-workspace-mcp`. Profile-declared servers are trusted as
+your own configuration.
+
+Failure semantics: extra servers never block startup. A broken command or
+unreachable URL becomes a per-server `error` status with background reconnect
+(250ms → 5s backoff, 8s connect timeout) while the session keeps serving.
+Config parse problems surface as `server_status` error events instead of
+aborting `ctc start`. The conductor now advertises `tools.listChanged` and
+broadcasts `notifications/tools/list_changed` when an extra server connects,
+drops, or is toggled, so clients pick up tool changes mid-session. Config
+files are read once at session start; edit them and open a new session (or
+use `/mcp reconnect` for connection-level retries).
+
+TUI:
+
+- `/mcp` opens a live status panel (name, state, tool count, source, detail);
+  `mcp k/n` appears in the status bar whenever extra servers are configured.
+- `/mcp enable|disable|reconnect <name>` manage the active TUI-hosted session
+  (session-only — persistent opt-out is `"disabled": true` in config); with no
+  name a picker opens. `/mcp trust <name>` is the only subcommand that writes
+  the profile. External `ctc start` sessions render as read-only status.
+- Connect/disconnect/error transitions stream into the transcript as
+  `server_status` events, and audit `tool_call` events carry a `server` field
+  for extra-server calls.
+
+`ctc doctor` gains one `mcp:<name>` check per configured server: untrusted or
+config-disabled servers warn, reachable servers report their tool count, and
+connection or `env:` resolution failures fail the check. Note for mixed
+versions: older ctc builds rewrite profiles through a stricter schema and drop
+the new `mcpServers`/`trustedWorkspaceMcp` fields on their next profile write.

@@ -3,7 +3,11 @@ export interface SlashCommand {
   usage: string;
   description: string;
   aliases?: string[];
-  stage: "available" | "planned";
+}
+
+export interface SlashCommandGroup {
+  title: string;
+  commands: SlashCommand[];
 }
 
 export interface ParsedSlashCommand {
@@ -22,104 +26,128 @@ export interface ParsedCloseCommand {
   force: boolean;
 }
 
+export interface ParsedCleanCommand {
+  /** Remove dirty worktrees too; implies no confirmation prompt. */
+  force: boolean;
+  /** Skip the confirmation prompt but still skip dirty worktrees. */
+  yes: boolean;
+}
+
 export interface ParsedTunnelCommand {
   action: "start" | "stop" | "status";
 }
 
-export const slashCommands: SlashCommand[] = [
+export interface ParsedMcpCommand {
+  action: "status" | "enable" | "disable" | "reconnect" | "trust";
+  server?: string;
+}
+
+export const slashCommandGroups: SlashCommandGroup[] = [
   {
-    name: "help",
-    usage: "/help",
-    description: "Show TUI commands and key bindings.",
-    aliases: ["?"],
-    stage: "available",
+    title: "Sessions",
+    commands: [
+      {
+        name: "new",
+        usage: "/new [path] [--direct|--worktree] [--resume <wt>]",
+        description: "Open a workspace session for model clients.",
+      },
+      {
+        name: "close",
+        usage: "/close [--force]",
+        description: "Close the current workspace session.",
+      },
+      {
+        name: "merge",
+        usage: "/merge",
+        description: "Merge worktree changes back into the source repo.",
+      },
+      {
+        name: "clean",
+        usage: "/clean [--force|--yes]",
+        description: "Remove idle managed worktrees and stale records.",
+      },
+      {
+        name: "switch",
+        usage: "/switch [n|session]",
+        description: "Switch to another attached session tab.",
+      },
+    ],
   },
   {
-    name: "switch",
-    usage: "/switch [n|session]",
-    description: "Switch to another attached session tab.",
-    stage: "available",
+    title: "Review",
+    commands: [
+      {
+        name: "diff",
+        usage: "/diff",
+        description: "Show the latest review checkpoint for this session.",
+      },
+      {
+        name: "baton",
+        usage: "/baton",
+        description: "Show the session baton plan, status, and report.",
+      },
+      {
+        name: "approvals",
+        usage: "/approvals",
+        description: "List pending approvals across attached sessions.",
+      },
+    ],
   },
   {
-    name: "diff",
-    usage: "/diff [rev]",
-    description: "Show the latest recorded review checkpoint for this session.",
-    stage: "available",
+    title: "Configure",
+    commands: [
+      {
+        name: "mcp",
+        usage: "/mcp [status|enable|disable|reconnect|trust <name>]",
+        description: "Show and manage extra MCP servers for the session.",
+      },
+      {
+        name: "tunnel",
+        usage: "/tunnel [start|stop|status]",
+        description: "Manage the public MCP tunnel (cloudflared/wrangler).",
+      },
+      {
+        name: "config",
+        usage: "/config [mode|permission|tunnel] ...",
+        description: "View or update the current repo profile.",
+      },
+      {
+        name: "doctor",
+        usage: "/doctor",
+        description: "Run profile, git, worktree, and backend checks.",
+      },
+    ],
   },
   {
-    name: "approvals",
-    usage: "/approvals",
-    description: "List pending approvals across attached sessions.",
-    stage: "available",
-  },
-  {
-    name: "baton",
-    usage: "/baton",
-    description: "Show the active session baton plan, status, and report.",
-    stage: "available",
-  },
-  {
-    name: "inspect",
-    usage: "/inspect",
-    description: "Open the event inspector with full arguments and results (Ctrl+O).",
-    stage: "available",
-  },
-  {
-    name: "doctor",
-    usage: "/doctor",
-    description: "Run profile, git, worktree, and backend checks for this repo.",
-    stage: "available",
-  },
-  {
-    name: "clear",
-    usage: "/clear",
-    description: "Clear the transcript and start a fresh screen.",
-    stage: "available",
-  },
-  {
-    name: "clean",
-    usage: "/clean",
-    description: "Clean managed workspace records. Not wired into the TUI yet - run: ctc ws clean",
-    stage: "planned",
-  },
-  {
-    name: "quit",
-    usage: "/quit",
-    description: "Exit the TUI.",
-    aliases: ["q"],
-    stage: "available",
-  },
-  {
-    name: "new",
-    usage: "/new [path] [--direct|--worktree] [--resume <wt>]",
-    description: "Create a TUI-owned workspace session.",
-    stage: "available",
-  },
-  {
-    name: "close",
-    usage: "/close [--force]",
-    description: "Close the current workspace session.",
-    stage: "available",
-  },
-  {
-    name: "merge",
-    usage: "/merge",
-    description: "Merge a managed worktree back to the source repo.",
-    stage: "available",
-  },
-  {
-    name: "tunnel",
-    usage: "/tunnel [start|stop]",
-    description: "Manage a public MCP tunnel via cloudflared or npx wrangler.",
-    stage: "available",
-  },
-  {
-    name: "config",
-    usage: "/config [mode|permission|tunnel] ...",
-    description: "View or update the current repo profile.",
-    stage: "available",
+    title: "Interface",
+    commands: [
+      {
+        name: "help",
+        usage: "/help",
+        description: "Show TUI commands and key bindings.",
+        aliases: ["?"],
+      },
+      {
+        name: "inspect",
+        usage: "/inspect",
+        description: "Open the event inspector (Ctrl+O).",
+      },
+      {
+        name: "clear",
+        usage: "/clear",
+        description: "Clear the transcript and start a fresh screen.",
+      },
+      {
+        name: "quit",
+        usage: "/quit",
+        description: "Exit the TUI.",
+        aliases: ["q"],
+      },
+    ],
   },
 ];
+
+export const slashCommands: SlashCommand[] = slashCommandGroups.flatMap((group) => group.commands);
 
 export function parseSlashCommand(input: string): ParsedSlashCommand | undefined {
   const trimmed = input.trim();
@@ -164,6 +192,16 @@ export function parseCloseCommand(args: string[]): ParsedCloseCommand {
   return parsed;
 }
 
+export function parseCleanCommand(args: string[]): ParsedCleanCommand {
+  const parsed: ParsedCleanCommand = { force: false, yes: false };
+  for (const arg of args) {
+    if (arg === "--force" || arg === "-f") parsed.force = true;
+    else if (arg === "--yes" || arg === "-y") parsed.yes = true;
+    else throw new Error(`Unknown /clean option ${arg}.`);
+  }
+  return parsed;
+}
+
 export function parseTunnelCommand(args: string[]): ParsedTunnelCommand {
   const action = args[0] ?? "status";
   if (args.length > 1) throw new Error("/tunnel accepts at most one action.");
@@ -171,6 +209,21 @@ export function parseTunnelCommand(args: string[]): ParsedTunnelCommand {
     throw new Error("/tunnel action must be start, stop, or status.");
   }
   return { action };
+}
+
+export function parseMcpCommand(args: string[]): ParsedMcpCommand {
+  const action = args[0] ?? "status";
+  if (args.length > 2) throw new Error("/mcp accepts an action and a server name at most.");
+  if (action === "status") {
+    if (args.length > 1) throw new Error("/mcp status takes no server name.");
+    return { action };
+  }
+  if (action !== "enable" && action !== "disable" && action !== "reconnect" && action !== "trust") {
+    throw new Error("/mcp action must be enable, disable, reconnect, or trust.");
+  }
+  const server = args[1];
+  if (action === "trust" && !server) throw new Error("/mcp trust requires a server name.");
+  return { action, server };
 }
 
 export function findSlashCommand(name: string): SlashCommand | undefined {
@@ -220,16 +273,15 @@ function commandScore(query: string, command: SlashCommand): number | undefined 
   return best;
 }
 
-export function suggestSlashCommands(input: string, limit = 8): SlashCommand[] {
+export function suggestSlashCommands(input: string): SlashCommand[] {
   if (!input.startsWith("/")) return [];
   const parsed = parseSlashCommand(input);
   const query = (parsed?.name ?? input.slice(1)).toLowerCase();
-  if (!query) return slashCommands.slice(0, limit);
+  if (!query) return slashCommands;
   return slashCommands
     .map((command, index) => ({ command, index, score: commandScore(query, command) }))
     .filter((entry): entry is { command: SlashCommand; index: number; score: number } => entry.score !== undefined)
     .sort((a, b) => b.score - a.score || a.index - b.index)
-    .slice(0, limit)
     .map((entry) => entry.command);
 }
 

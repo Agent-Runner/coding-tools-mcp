@@ -81,4 +81,13 @@ describe("TuiSnapshotStore", () => {
     const three = fingerprintSnapshot({ ...base, sessions: [sessionA, { ...sessionB, pendingApprovalCount: 1 }] });
     expect(three).not.toBe(one);
   });
+
+  it("fingerprints track mcp server state changes", () => {
+    const base = snapshotWithEvents([toolCall("read_file")]);
+    const connected = { ...base, mcpServers: [{ name: "github", state: "connected" as const, toolCount: 12 }] };
+    const errored = { ...base, mcpServers: [{ name: "github", state: "error" as const, toolCount: 0 }] };
+    expect(fingerprintSnapshot(connected)).not.toBe(fingerprintSnapshot(base));
+    expect(fingerprintSnapshot(connected)).not.toBe(fingerprintSnapshot(errored));
+    expect(fingerprintSnapshot(connected)).toBe(fingerprintSnapshot({ ...connected }));
+  });
 });
