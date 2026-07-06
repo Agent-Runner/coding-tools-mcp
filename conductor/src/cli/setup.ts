@@ -44,7 +44,7 @@ export async function runSetupCli(path: string | undefined, options: SetupOption
   if (!options.skipSmoke) await smokeBackend(profile.backend);
   const file = await writeProfileForPath(profile.repoPath, profile);
   process.stdout.write(`Profile written to ${file}.\n`);
-  process.stdout.write(`Next: ctc start ${profile.repoPath}\n`);
+  process.stdout.write(`Next: ctc ${profile.repoPath}\n`);
 }
 
 function buildProfile(answers: SetupAnswers): WorkspaceProfile {
@@ -67,7 +67,7 @@ async function promptForAnswers(repoPath: string, options: SetupOptions): Promis
     const finalRepo = await resolveProfileTargetPath(confirmedRepo);
     const backendType = await choose(rl, "Backend", ["stdio", "http"], options.backend ?? "stdio");
     const backend = backendType === "http" ? await promptHttpBackend(rl, options) : await promptStdioBackend(rl, finalRepo, options);
-    const defaultMode = await choose(rl, "Default workspace mode", ["worktree", "direct"], options.defaultMode ?? "worktree");
+    const defaultMode = await choose(rl, "Default workspace mode", ["direct", "worktree"], options.defaultMode ?? "direct");
     const tunnelProvider = await choose(rl, "Tunnel provider", ["none", "cloudflared"], options.tunnel ?? "none");
     const hostname = tunnelProvider === "cloudflared" ? await ask(rl, "Tunnel hostname", options.hostname ?? "") : undefined;
     const adapterText = await ask(rl, "Adapters (comma-separated, blank for none)", options.adapter?.join(",") ?? "");
@@ -90,7 +90,7 @@ function answersFromOptions(repoPath: string, options: SetupOptions): SetupAnswe
   return {
     repoPath,
     backend,
-    defaultMode: options.defaultMode ?? "worktree",
+    defaultMode: options.defaultMode ?? "direct",
     toolPolicy: policyFromOptions(options),
     tunnel: { provider: options.tunnel ?? "none", hostname: options.hostname },
     adapters: options.adapter ?? [],

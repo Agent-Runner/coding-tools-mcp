@@ -22,12 +22,6 @@ export function optionsForStep(state: OnboardingState): OnboardingOption[] {
       },
     ];
   }
-  if (state.step === "workspace") {
-    return [
-      { label: "worktree (default)", value: "worktree", hint: "Isolated git worktree per session; merge back when done." },
-      { label: "direct", value: "direct", hint: "Edit the repository in place." },
-    ];
-  }
   return [
     { label: "safe (default)", value: "safe", hint: "Ask in this TUI before risky operations." },
     { label: "trusted", value: "trusted", hint: "Skip approval prompts for this repo." },
@@ -43,12 +37,12 @@ export function OnboardingView({
   options: OnboardingOption[];
   choice: number;
 }): React.ReactElement {
-  const steps: OnboardingState["step"][] = ["backend", "workspace", "permissions"];
+  const steps: OnboardingState["step"][] = ["backend", "permissions"];
   const stepNumber = steps.indexOf(state.step) + 1;
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={palette.accent} paddingX={1}>
       <Text bold>
-        Set up this repo <Text dimColor>{glyphs.dot} step {String(stepNumber)}/3</Text>
+        Set up this repo <Text dimColor>{glyphs.dot} step {String(stepNumber)}/2</Text>
       </Text>
       <Text dimColor>{state.repoPath}</Text>
       <Text> </Text>

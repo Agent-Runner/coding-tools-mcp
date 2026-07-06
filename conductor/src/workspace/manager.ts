@@ -43,6 +43,8 @@ export interface WorkspaceCleanResult {
   removed: string[];
   skippedDirty: string[];
   missing: string[];
+  /** Closed session records whose json/log/approvals were deleted. */
+  prunedRecords: string[];
 }
 
 export interface WorkspaceMergeResult {
@@ -271,8 +273,10 @@ export async function closeWorkspaceSession(sessionId: string, input: CloseWorks
   return { closed: true, workspace: closed, dirty, message: "Worktree workspace closed and removed." };
 }
 
-export async function cleanWorkspaceSessions(options: { force?: boolean } = {}): Promise<WorkspaceCleanResult> {
-  const result: WorkspaceCleanResult = { removed: [], skippedDirty: [], missing: [] };
+export async function cleanWorkspaceSessions(
+  options: { force?: boolean; keepSessionId?: string } = {},
+): Promise<WorkspaceCleanResult> {
+  const result: WorkspaceCleanResult = { removed: [], skippedDirty: [], missing: [], prunedRecords: [] };
   for (const state of await listWorkspaceSessions()) {
     if (state.mode !== "worktree" || state.closedAt) continue;
     const worktreePath = state.worktreePath;
@@ -290,6 +294,16 @@ export async function cleanWorkspaceSessions(options: { force?: boolean } = {}):
     result.removed.push(state.sessionId);
   }
   await pruneKnownWorktreeRepos();
+  // Phase 2: bound ~/.ctc growth — drop the record, log, and approvals of every
+  // closed session (the caller's active session is exempt via keepSessionId).
+  for (const state of await listWorkspaceSessions()) {
+    if (!state.closedAt) continue;
+    if (state.sessionId === options.keepSessionId) continue;
+    await rm(sessionStatePath(state.sessionId), { force: true });
+    await rm(join(ctcHome(), "logs", `${state.sessionId}.jsonl`), { force: true });
+    await rm(join(ctcHome(), "approvals", state.sessionId), { recursive: true, force: true });
+    result.prunedRecords.push(state.sessionId);
+  }
   return result;
 }
 

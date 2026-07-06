@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Box, Text, useApp, useInput, useStdout } from "ink";
 import { runDoctor } from "../cli/doctor.js";
-import { markTuiAttached, type PermissionApprovalRequest } from "../shared/approvals.js";
+import { markTuiAttached } from "../shared/approvals.js";
 import type { ExtraServerStatus } from "../shared/types.js";
 import {
   findSlashCommand,
@@ -97,6 +97,14 @@ export function TuiApp({
 
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot);
 
+  // ctc tui <id> observes an external session; plain ctc hosts its own.
+  const attachMode = Boolean(requestedSessionId);
+  const bootRef = useRef(false);
+  // Repo of the ACTIVE session; sourcePath (never the worktree checkout) so
+  // profile operations and /new re-target the repository itself.
+  const activeRepoPath = (): string | undefined =>
+    snapshot.workspace?.sourcePath ?? snapshot.session?.workspacePath ?? initialWorkspacePath;
+
   const [size, setSize] = useState(() => ({ columns: stdout.columns || 80, rows: stdout.rows || 24 }));
   const textWidth = Math.max(40, Math.min(size.columns - 2, 120));
   // Menu rows fit within the live region even on short terminals; a counter
@@ -109,9 +117,9 @@ export function TuiApp({
       version: CTC_VERSION,
       workspace: initialWorkspacePath ?? process.cwd(),
       tips: [
-        "/new opens a workspace session for model clients",
-        "/help lists commands and keys",
-        `Tab cycles sessions ${glyphs.dot} Ctrl+O inspects recent events`,
+        "The session for this repo starts automatically",
+        "/new switches repo or isolation (--worktree)",
+        `/help lists commands ${glyphs.dot} Ctrl+O inspects recent events`,
       ],
     }),
   ]);
@@ -164,21 +172,7 @@ export function TuiApp({
   const menuQuery = input.startsWith("/") ? input.slice(1) : "";
   const menuVisible = menuOpen;
 
-  const orderedSessions = useMemo(
-    () => [...snapshot.sessions].sort((a, b) => a.sessionId.localeCompare(b.sessionId)),
-    [snapshot.sessions],
-  );
-
-  const approvalQueue = useMemo(() => {
-    const seen = new Set<string>();
-    const queue: PermissionApprovalRequest[] = [];
-    for (const approval of [...snapshot.pendingApprovals, ...snapshot.allPendingApprovals]) {
-      if (seen.has(approval.id)) continue;
-      seen.add(approval.id);
-      queue.push(approval);
-    }
-    return queue;
-  }, [snapshot.pendingApprovals, snapshot.allPendingApprovals]);
+  const approvalQueue = snapshot.pendingApprovals;
   const approvalVisible = approvalQueue.length > 0 && !onboarding;
   const activeApproval = approvalQueue[Math.min(approvalCursor, Math.max(approvalQueue.length - 1, 0))];
   const tunnelPickVisible = Boolean(tunnelMethods?.length) && !onboarding && !approvalVisible;
@@ -210,40 +204,49 @@ export function TuiApp({
     });
   }, [controller, store]);
 
+  // Auto-stop: quitting the TUI closes the workspace (never force) and stops
+  // the runtime; the shutdown promise keeps the process alive until done.
   useEffect(() => {
     return () => {
-      void controller.closeClients();
+      void controller.shutdown();
     };
   }, [controller]);
 
   // Append newly observed session events to the committed transcript.
   useEffect(() => {
     if (!snapshot.sessionId) return;
-    if (!store.requestedSession()) store.setRequestedSession(snapshot.sessionId);
-    const summary = snapshot.sessions.find((session) => session.sessionId === snapshot.sessionId);
     appendItems(
       builder.syncSession({
         sessionId: snapshot.sessionId,
-        label: summary?.label ?? snapshot.sessionId,
+        label: snapshot.label ?? snapshot.sessionId,
         events: snapshot.events,
         width: textWidth,
       }),
     );
   }, [snapshot, textWidth]);
 
-  // Onboarding kicks in when the initial workspace has no profile yet.
+  // Boot: launching ctc IS the session. First run detours through onboarding,
+  // then starts; attach mode (ctc tui <id>) only observes and never auto-starts.
+  // Mount-once by design: the guard ref flips before any await, and
+  // controller.create() hard-rejects a second live session as backstop.
   useEffect(() => {
-    if (requestedSessionId) return undefined;
+    if (attachMode) return undefined;
+    if (bootRef.current) return undefined;
+    bootRef.current = true;
     let cancelled = false;
-    void loadOnboardingState(initialWorkspacePath).then((state) => {
+    void loadOnboardingState(initialWorkspacePath).then(async (state) => {
       if (cancelled) return;
-      setOnboarding(state);
-      if (state) appendNote("No profile found for this repo — answer three quick questions, then run /new.", "hint");
+      if (state) {
+        setOnboarding(state);
+        appendNote("No profile found for this repo — answer two quick questions to get started.", "hint");
+        return;
+      }
+      await autoStartSession();
     });
     return () => {
       cancelled = true;
     };
-  }, [requestedSessionId, initialWorkspacePath]);
+  }, []);
 
   // One-time nudge per session when workspace-declared MCP servers await trust.
   useEffect(() => {
@@ -257,9 +260,11 @@ export function TuiApp({
     );
   }, [snapshot.sessionId, snapshot.mcpServers]);
 
-  // Heartbeat that routes lower-level permission requests to this TUI.
+  // Heartbeat that routes an EXTERNAL session's permission requests to this
+  // TUI. Hosted sessions use the in-process approval broker instead, so the
+  // attached-marker only matters in attach mode.
   useEffect(() => {
-    if (!snapshot.sessionId) return undefined;
+    if (!attachMode || !snapshot.sessionId) return undefined;
     const sessionId = snapshot.sessionId;
     void markTuiAttached(sessionId);
     const interval = setInterval(() => {
@@ -268,7 +273,7 @@ export function TuiApp({
     return () => {
       clearInterval(interval);
     };
-  }, [snapshot.sessionId]);
+  }, [attachMode, snapshot.sessionId]);
 
   useEffect(() => {
     if (!busy) return undefined;
@@ -313,14 +318,18 @@ export function TuiApp({
     setPanel(undefined);
   };
 
-  const cycleSession = (offset: number): void => {
-    if (!orderedSessions.length) return;
-    const currentIndex = Math.max(
-      0,
-      orderedSessions.findIndex((session) => session.sessionId === snapshot.sessionId),
-    );
-    const next = orderedSessions[(currentIndex + offset + orderedSessions.length) % orderedSessions.length];
-    if (next && next.sessionId !== snapshot.sessionId) switchToSession(next.sessionId);
+  const autoStartSession = async (): Promise<void> => {
+    await runWithBusy("Starting session", async () => {
+      try {
+        const result = await controller.create({ path: initialWorkspacePath });
+        switchToSession(result.sessionId);
+        appendNote(result.message, "success");
+        store.requestRefresh();
+      } catch (error) {
+        appendNote(errorMessage(error), "error");
+        appendNote("No active session — fix the issue above, then /new to retry.", "hint");
+      }
+    });
   };
 
   const respondToApproval = (approved: boolean): void => {
@@ -446,12 +455,14 @@ export function TuiApp({
     const answer = typed || option?.value || "";
     clearInput();
     setBusy({ label: "Saving profile", startedAt: Date.now() });
+    let completed = false;
     try {
       const next = await advanceOnboarding(onboarding, answer);
       setOnboardingChoice(0);
       if (next.complete) {
         setOnboarding(undefined);
-        appendNote(`Profile written for ${next.repoPath}. Run /new to open a workspace session.`, "success");
+        appendNote(`Profile written for ${next.repoPath}.`, "success");
+        completed = true;
       } else {
         setOnboarding(next);
       }
@@ -460,6 +471,7 @@ export function TuiApp({
     } finally {
       setBusy(undefined);
     }
+    if (completed) await autoStartSession();
   };
 
   const runCommand = async (trimmed: string): Promise<void> => {
@@ -506,9 +518,6 @@ export function TuiApp({
       case "clear":
         clearTranscript();
         break;
-      case "switch":
-        runSwitchCommand(parsed.args);
-        break;
       case "new":
         await runNewCommand(parsed.args);
         break;
@@ -542,32 +551,11 @@ export function TuiApp({
     }
   };
 
-  const runSwitchCommand = (args: string[]): void => {
-    if (!orderedSessions.length) {
-      appendNote("No sessions found yet — /new opens one.", "hint");
-      return;
-    }
-    const target = args[0];
-    if (!target) {
-      cycleSession(1);
-      return;
-    }
-    const numeric = Number.parseInt(target, 10);
-    const session = Number.isInteger(numeric)
-      ? orderedSessions[numeric - 1]
-      : orderedSessions.find((item) => item.sessionId.includes(target) || item.label.includes(target));
-    if (!session) {
-      appendNote(`No session matched ${target}.`, "error");
-      return;
-    }
-    switchToSession(session.sessionId);
-  };
-
   const runNewCommand = async (args: string[]): Promise<void> => {
-    await runWithBusy("Opening workspace", async () => {
+    await runWithBusy("Opening session", async () => {
       const parsedNew = parseNewCommand(args);
-      const path = parsedNew.path ?? initialWorkspacePath;
-      const result = await controller.create({ path, mode: parsedNew.mode, resume: parsedNew.resume });
+      const path = parsedNew.path ?? activeRepoPath();
+      const result = await controller.replace({ path, mode: parsedNew.mode, resume: parsedNew.resume });
       switchToSession(result.sessionId);
       appendNote(result.message, "success");
       store.requestRefresh();
@@ -584,7 +572,10 @@ export function TuiApp({
       const parsedClose = parseCloseCommand(args);
       const result = await controller.close(sessionId, { force: parsedClose.force });
       appendNote(result.message, result.closed ? "success" : "hint");
-      if (result.closed) store.setRequestedSession(undefined);
+      if (result.closed) {
+        store.setRequestedSession(undefined);
+        appendNote("No active session — /new reopens one.", "hint");
+      }
       store.requestRefresh();
     });
   };
@@ -708,7 +699,7 @@ export function TuiApp({
 
   const runConfigCommand = async (args: string[]): Promise<void> => {
     await runWithBusy("Loading profile", async () => {
-      const result = await controller.configure(initialWorkspacePath, args);
+      const result = await controller.configure(activeRepoPath(), args);
       setPanel({ kind: "config", lines: textDisplayLines(result.text) });
       if (result.changed) appendNote("Profile updated.", "success");
     });
@@ -757,7 +748,7 @@ export function TuiApp({
     await runWithBusy(`${labels[action]} mcp ${server}`, async () => {
       let status: ExtraServerStatus | undefined;
       if (action === "trust") {
-        status = await controller.mcpTrust(initialWorkspacePath, snapshot.sessionId, server);
+        status = await controller.mcpTrust(activeRepoPath(), snapshot.sessionId, server);
         if (!status) {
           appendNote(`Trusted workspace MCP server ${server}; it connects when a hosted session starts.`, "success");
           return;
@@ -876,13 +867,8 @@ export function TuiApp({
       else if (panel) setPanel(undefined);
       return;
     }
-    if (key.tab && key.shift) {
-      if (!input) cycleSession(-1);
-      return;
-    }
     if (key.tab) {
       if (menuVisible) completeSelected();
-      else if (!input) cycleSession(1);
       return;
     }
     if (key.upArrow) {
@@ -934,7 +920,7 @@ export function TuiApp({
           ? `↑/↓ scroll ${glyphs.dot} ←/→ page ${glyphs.dot} Esc close`
           : menuVisible
             ? `↑/↓ choose ${glyphs.dot} Tab complete ${glyphs.dot} Enter run ${glyphs.dot} Esc clear`
-            : `/ commands ${glyphs.dot} Tab sessions ${glyphs.dot} Ctrl+O inspector ${glyphs.dot} Ctrl+C twice to quit`;
+            : `/ commands ${glyphs.dot} Ctrl+O inspector ${glyphs.dot} Ctrl+C twice to quit`;
 
   return (
     <Box flexDirection="column">
@@ -970,7 +956,7 @@ export function TuiApp({
         ) : cleanPickVisible && cleanPick ? (
           <ChoicePrompt
             title={`Clean ${String(cleanPick.candidates.length)} recorded worktree(s)?`}
-            body={`Removes worktrees with no uncommitted changes and marks their sessions closed; dirty ones are skipped unless forced.${
+            body={`Removes worktrees with no uncommitted changes and prunes closed session records and logs; dirty worktrees are skipped unless forced.${
               snapshot.sessionId && cleanPick.candidates.includes(snapshot.sessionId)
                 ? " Includes the ACTIVE session's worktree — it will close if it has no uncommitted changes."
                 : ""
@@ -1006,7 +992,7 @@ export function TuiApp({
             maxVisible={menuMaxVisible}
           />
         ) : null}
-        <StatusBar snapshot={snapshot} sessions={orderedSessions} tunnelMessage={tunnelMessage} hint={hint} />
+        <StatusBar snapshot={snapshot} tunnelMessage={tunnelMessage} hint={hint} />
       </Box>
     </Box>
   );
@@ -1027,5 +1013,5 @@ function describeMcpStatus(status: ExtraServerStatus): string {
 }
 
 function formatCleanResult(result: WorkspaceCleanResult): string {
-  return `Cleaned worktrees: removed ${String(result.removed.length)} ${glyphs.dot} skipped dirty ${String(result.skippedDirty.length)} ${glyphs.dot} missing ${String(result.missing.length)}`;
+  return `Cleaned worktrees: removed ${String(result.removed.length)} ${glyphs.dot} skipped dirty ${String(result.skippedDirty.length)} ${glyphs.dot} missing ${String(result.missing.length)} ${glyphs.dot} pruned ${String(result.prunedRecords.length)} records`;
 }
