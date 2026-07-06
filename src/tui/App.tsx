@@ -5,6 +5,7 @@ import { markTuiAttached, type PermissionApprovalRequest } from "../shared/appro
 import type { ExtraServerStatus } from "../shared/types.js";
 import {
   findSlashCommand,
+  parseCleanCommand,
   parseCloseCommand,
   parseMcpCommand,
   parseNewCommand,
@@ -36,6 +37,7 @@ import {
 } from "./onboarding.js";
 import { TuiSessionController, type TunnelMethod } from "./session-controller.js";
 import { TuiSnapshotStore } from "./store.js";
+import type { WorkspaceCleanResult } from "../workspace/manager.js";
 import { glyphs, palette, spinnerFrames, type DisplayLine } from "./theme.js";
 import { TranscriptBuilder, type NoteKind, type TranscriptItem } from "./transcript.js";
 
@@ -97,6 +99,9 @@ export function TuiApp({
 
   const [size, setSize] = useState(() => ({ columns: stdout.columns || 80, rows: stdout.rows || 24 }));
   const textWidth = Math.max(40, Math.min(size.columns - 2, 120));
+  // Menu rows fit within the live region even on short terminals; a counter
+  // footer appears when the full command list overflows this budget.
+  const menuMaxVisible = Math.max(4, Math.min(10, size.rows - 12));
 
   const [items, setItems] = useState<TranscriptItem[]>(() => [
     builder.banner({
@@ -149,6 +154,9 @@ export function TuiApp({
   const [mcpChoice, setMcpChoice] = useState(0);
   const untrustedNoticeFor = useRef<string | undefined>(undefined);
 
+  const [cleanPick, setCleanPick] = useState<{ candidates: string[] } | undefined>(undefined);
+  const [cleanChoice, setCleanChoice] = useState(0);
+
   // The menu is a command picker: it opens on "/name" and closes once you type a
   // space and move on to arguments (matching Codex CLI / OpenCode).
   const menuOpen = !onboarding && /^\/\S*$/.test(input);
@@ -175,6 +183,7 @@ export function TuiApp({
   const activeApproval = approvalQueue[Math.min(approvalCursor, Math.max(approvalQueue.length - 1, 0))];
   const tunnelPickVisible = Boolean(tunnelMethods?.length) && !onboarding && !approvalVisible;
   const mcpPickVisible = Boolean(mcpPick?.options.length) && !onboarding && !approvalVisible && !tunnelPickVisible;
+  const cleanPickVisible = Boolean(cleanPick) && !onboarding && !approvalVisible && !tunnelPickVisible && !mcpPickVisible;
 
   const onboardingOptions = useMemo(() => (onboarding ? optionsForStep(onboarding) : []), [onboarding]);
 
@@ -472,10 +481,6 @@ export function TuiApp({
       appendNote(`Unknown command ${parsed.raw}. Type /help to see available commands.`, "error");
       return;
     }
-    if (command.stage === "planned") {
-      appendNote(`${command.usage} is not wired into the TUI yet. ${command.description}`, "hint");
-      return;
-    }
     if (busy && command.name !== "quit") {
       appendNote("A TUI command is already running.", "hint");
       return;
@@ -510,6 +515,9 @@ export function TuiApp({
       case "close":
         await runCloseCommand(parsed.args);
         break;
+      case "clean":
+        await runCleanCommand(parsed.args);
+        break;
       case "merge":
         await runMergeCommand();
         break;
@@ -529,7 +537,8 @@ export function TuiApp({
         exit();
         break;
       default:
-        appendNote(`${command.usage} is registered but not wired yet.`, "hint");
+        // Tripwire for a future registry entry added without a case above.
+        appendNote(`${command.usage} has no TUI handler.`, "error");
     }
   };
 
@@ -591,6 +600,49 @@ export function TuiApp({
       appendNote(result.message, result.applied ? "success" : "hint");
       store.requestRefresh();
     });
+  };
+
+  const runCleanCommand = async (args: string[]): Promise<void> => {
+    let parsedClean;
+    try {
+      parsedClean = parseCleanCommand(args);
+    } catch (error) {
+      appendNote(errorMessage(error), "error");
+      return;
+    }
+    if (parsedClean.force || parsedClean.yes) {
+      await executeClean(parsedClean.force);
+      return;
+    }
+    const candidates = await controller.cleanCandidates();
+    if (!candidates.length) {
+      appendNote("No recorded worktrees to clean.", "hint");
+      return;
+    }
+    setCleanChoice(0);
+    setCleanPick({ candidates });
+  };
+
+  const executeClean = async (force: boolean): Promise<void> => {
+    await runWithBusy("Cleaning worktrees", async () => {
+      const result = await controller.clean({ force, sessionId: snapshot.sessionId });
+      appendNote(formatCleanResult(result), result.removed.length ? "success" : "info");
+      if (result.skippedDirty.length) {
+        appendNote(`Dirty worktrees skipped: ${result.skippedDirty.join(", ")} — /clean --force removes them.`, "hint");
+      }
+      if (snapshot.sessionId && result.removed.includes(snapshot.sessionId)) store.setRequestedSession(undefined);
+      store.requestRefresh();
+    });
+  };
+
+  const pickCleanMode = (force: boolean | undefined): void => {
+    setCleanPick(undefined);
+    setCleanChoice(0);
+    if (force === undefined) {
+      appendNote("Clean canceled.", "hint");
+      return;
+    }
+    void executeClean(force);
   };
 
   const startTunnelWith = async (method: TunnelMethod): Promise<void> => {
@@ -806,6 +858,15 @@ export function TuiApp({
       else if (key.return) pickMcpServer(mcpPick.options[Math.min(mcpChoice, count - 1)]);
       return;
     }
+    if (cleanPickVisible && cleanPick) {
+      const digit = Number.parseInt(inputChar, 10);
+      if (key.escape || inputChar === "n" || inputChar === "N") pickCleanMode(undefined);
+      else if (digit === 1 || digit === 2) pickCleanMode(digit === 2);
+      else if (key.upArrow) setCleanChoice(0);
+      else if (key.downArrow) setCleanChoice(1);
+      else if (key.return) pickCleanMode(cleanChoice === 1);
+      return;
+    }
     if (key.ctrl && (inputChar === "o" || inputChar === "O" || inputChar === "\u000F")) {
       setPanel((current) => (current?.kind === "inspect" ? undefined : { kind: "inspect" }));
       return;
@@ -864,9 +925,11 @@ export function TuiApp({
       : approvalVisible
         ? "Answer the permission request above"
         : tunnelPickVisible
-          ? "Pick a tunnel provider above · Esc cancels"
+          ? `Pick a tunnel provider above ${glyphs.dot} Esc cancels`
           : mcpPickVisible
-            ? "Pick an MCP server above · Esc cancels"
+            ? `Pick an MCP server above ${glyphs.dot} Esc cancels`
+            : cleanPickVisible
+              ? `Pick a clean option above ${glyphs.dot} Esc cancels`
           : panel
           ? `↑/↓ scroll ${glyphs.dot} ←/→ page ${glyphs.dot} Esc close`
           : menuVisible
@@ -904,6 +967,20 @@ export function TuiApp({
             }))}
             selected={Math.min(mcpChoice, mcpPick.options.length - 1)}
           />
+        ) : cleanPickVisible && cleanPick ? (
+          <ChoicePrompt
+            title={`Clean ${String(cleanPick.candidates.length)} recorded worktree(s)?`}
+            body={`Removes worktrees with no uncommitted changes and marks their sessions closed; dirty ones are skipped unless forced.${
+              snapshot.sessionId && cleanPick.candidates.includes(snapshot.sessionId)
+                ? " Includes the ACTIVE session's worktree — it will close if it has no uncommitted changes."
+                : ""
+            }`}
+            options={[
+              { label: "Clean", hint: "remove clean worktrees, skip dirty ones" },
+              { label: "Force clean", hint: "also remove worktrees with uncommitted changes" },
+            ]}
+            selected={Math.min(cleanChoice, 1)}
+          />
         ) : panel ? (
           <ScrollPanel title={PANEL_TITLES[panel.kind]} lines={panelLines} scroll={scroll} height={panelHeight} />
         ) : null}
@@ -919,13 +996,14 @@ export function TuiApp({
           onChange={handleInputChange}
           onSubmit={submitInput}
           placeholder={onboarding ? onboardingDefault(onboarding) : "/ for commands"}
-          focus={!approvalVisible && !tunnelPickVisible && !mcpPickVisible}
+          focus={!approvalVisible && !tunnelPickVisible && !mcpPickVisible && !cleanPickVisible}
         />
-        {menuVisible && !approvalVisible && !tunnelPickVisible && !mcpPickVisible ? (
+        {menuVisible && !approvalVisible && !tunnelPickVisible && !mcpPickVisible && !cleanPickVisible ? (
           <SlashMenu
             suggestions={suggestions}
             selected={Math.min(menuIndex, Math.max(suggestions.length - 1, 0))}
             query={menuQuery}
+            maxVisible={menuMaxVisible}
           />
         ) : null}
         <StatusBar snapshot={snapshot} sessions={orderedSessions} tunnelMessage={tunnelMessage} hint={hint} />
@@ -946,4 +1024,8 @@ function describeMcpStatus(status: ExtraServerStatus): string {
   if (status.state === "connected") return `mcp ${status.name} connected ${glyphs.dot} ${String(status.toolCount)} tools`;
   if (status.state === "disabled") return `mcp ${status.name} disabled for this session`;
   return `mcp ${status.name} ${status.state}${status.lastError ? `: ${status.lastError}` : ""}`;
+}
+
+function formatCleanResult(result: WorkspaceCleanResult): string {
+  return `Cleaned worktrees: removed ${String(result.removed.length)} ${glyphs.dot} skipped dirty ${String(result.skippedDirty.length)} ${glyphs.dot} missing ${String(result.missing.length)}`;
 }

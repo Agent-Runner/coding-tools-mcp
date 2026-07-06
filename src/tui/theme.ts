@@ -20,13 +20,15 @@ export const palette = {
   ok: "green",
   error: "red",
   warn: "yellow",
-  info: "blue",
+  border: "gray",
 } as const;
+
+/** Column where command descriptions start in the slash menu and /help. */
+export const USAGE_COLUMN = 42;
 
 export interface DisplayLine {
   text: string;
   color?: string;
   dim?: boolean;
   bold?: boolean;
-  inverse?: boolean;
 }

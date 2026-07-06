@@ -5,10 +5,10 @@ import { formatBatonBundle } from "../../baton/protocol.js";
 import type { PermissionApprovalRequest } from "../../shared/approvals.js";
 import { WORKSPACE_MCP_FILE } from "../../profiles/mcp.js";
 import type { ConductorEvent } from "../../shared/types.js";
-import { slashCommands } from "../commands/registry.js";
+import { slashCommandGroups } from "../commands/registry.js";
 import { formatDuration, pad, timeOf, wrapText } from "../format.js";
 import type { McpServerStatusSnapshot, TuiSnapshot } from "../state.js";
-import { glyphs, palette, type DisplayLine } from "../theme.js";
+import { glyphs, palette, USAGE_COLUMN, type DisplayLine } from "../theme.js";
 
 /**
  * Bounded scrollable panel shown in the live region (diff, help, inspector…).
@@ -35,7 +35,7 @@ export function ScrollPanel({
       ? `  ${String(start + 1)}-${String(start + visible.length)} of ${String(lines.length)} ${glyphs.dot} ↑/↓ scroll ${glyphs.dot} ←/→ page ${glyphs.dot} Esc close`
       : `  Esc close`;
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} height={height}>
+    <Box flexDirection="column" borderStyle="round" borderColor={palette.border} paddingX={1} height={height}>
       <Text bold>
         {title}
         <Text dimColor>{scrollInfo}</Text>
@@ -54,14 +54,13 @@ export function ScrollPanel({
 }
 
 export function helpLines(): DisplayLine[] {
-  const available = slashCommands.filter((command) => command.stage === "available");
-  const planned = slashCommands.filter((command) => command.stage === "planned");
-  const lines: DisplayLine[] = [{ text: "Commands", bold: true }];
-  for (const command of available) lines.push({ text: `  ${pad(command.usage, 42)} ${command.description}` });
-  if (planned.length) {
-    lines.push({ text: "" });
-    lines.push({ text: "Planned", bold: true });
-    for (const command of planned) lines.push({ text: `  ${pad(command.usage, 42)} ${command.description}`, dim: true });
+  const lines: DisplayLine[] = [];
+  for (const group of slashCommandGroups) {
+    if (lines.length) lines.push({ text: "" });
+    lines.push({ text: group.title, bold: true });
+    for (const command of group.commands) {
+      lines.push({ text: `  ${pad(command.usage, USAGE_COLUMN)} ${command.description}` });
+    }
   }
   lines.push({ text: "" });
   lines.push({ text: "Keys", bold: true });
@@ -74,7 +73,7 @@ export function helpLines(): DisplayLine[] {
   lines.push({ text: "  Ctrl+W / Ctrl+U / Ctrl+K  delete the previous word / to line start / to line end" });
   lines.push({ text: "  Ctrl+←/→, Alt+←/→   move the cursor by word" });
   lines.push({ text: "  Ctrl+O              open the event inspector" });
-  lines.push({ text: "  Esc                 clear input / close panel / deny the pending approval" });
+  lines.push({ text: "  Esc                 clear input / close panel / cancel pickers / deny the pending approval" });
   lines.push({ text: "  y n 1 2 ←/→         answer permission prompts" });
   lines.push({ text: "  Ctrl+C (twice)      quit" });
   return lines;

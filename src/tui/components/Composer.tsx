@@ -1,7 +1,8 @@
 import React from "react";
 import { Box, Text } from "ink";
 import { fuzzyMatch, type SlashCommand } from "../commands/registry.js";
-import { glyphs, palette } from "../theme.js";
+import { menuWindow } from "../menu.js";
+import { glyphs, palette, USAGE_COLUMN } from "../theme.js";
 import { TextField } from "./TextField.js";
 
 export function Composer({
@@ -21,7 +22,7 @@ export function Composer({
   focus: boolean;
 }): React.ReactElement {
   return (
-    <Box borderStyle="round" borderColor={focus ? palette.accent : "gray"} paddingX={1}>
+    <Box borderStyle="round" borderColor={focus ? palette.accent : palette.border} paddingX={1}>
       <Text color={palette.accent}>{glyphs.prompt} </Text>
       {/* Remounting on programmatic replacements (completion, history) puts the
           cursor at the end of the new value. */}
@@ -37,21 +38,26 @@ export function Composer({
   );
 }
 
-const COMMAND_COLUMN = 40;
-
 /**
  * Slash command menu below the composer; ArrowUp/Down moves the selection
  * (wrapping at the ends), Tab completes it, Enter runs it. Characters that the
  * typed query matched are highlighted, the way Codex CLI and OpenCode do it.
+ *
+ * `suggestions` is always the FULL ranked list and `selected` an index into
+ * it; only rendering is windowed to `maxVisible` rows. Slicing here (and not
+ * in the caller) keeps the highlighted row and the command Enter runs in
+ * lockstep.
  */
 export function SlashMenu({
   suggestions,
   selected,
   query,
+  maxVisible,
 }: {
   suggestions: SlashCommand[];
   selected: number;
   query: string;
+  maxVisible: number;
 }): React.ReactElement | null {
   if (!suggestions.length) {
     if (!query) return null;
@@ -61,20 +67,20 @@ export function SlashMenu({
       </Box>
     );
   }
+  const { start, end } = menuWindow(suggestions.length, selected, maxVisible);
   return (
     <Box flexDirection="column" paddingX={2}>
-      {suggestions.map((command, index) => {
-        const active = index === selected;
-        const planned = command.stage === "planned";
+      {suggestions.slice(start, end).map((command, sliceIndex) => {
+        const active = start + sliceIndex === selected;
         const matched = new Set(fuzzyMatch(query, command.name)?.positions ?? []);
         // usage is always "/" + name + optional args; keep the args tail dim and
         // pad so descriptions line up in a column.
         const argsTail = command.usage.slice(1 + command.name.length);
-        const tailPad = Math.max(1, COMMAND_COLUMN - 1 - command.name.length - argsTail.length);
-        const nameColor = active ? palette.accent : planned ? "gray" : undefined;
+        const tailPad = Math.max(1, USAGE_COLUMN - command.usage.length);
+        const nameColor = active ? palette.accent : undefined;
         return (
           <Text key={command.name} bold={active} wrap="truncate-end">
-            <Text color={active ? palette.accent : undefined}>{active ? `${glyphs.pointer} ` : "  "}</Text>
+            <Text color={nameColor}>{active ? `${glyphs.pointer} ` : "  "}</Text>
             <Text color={nameColor}>/</Text>
             {Array.from(command.name, (char, charIndex) => (
               <Text
@@ -86,13 +92,15 @@ export function SlashMenu({
               </Text>
             ))}
             <Text dimColor>{`${argsTail}${" ".repeat(tailPad)}`}</Text>
-            <Text color={active ? palette.accent : undefined} dimColor={!active}>
+            <Text color={nameColor} dimColor={!active}>
               {command.description}
-              {planned ? " (planned)" : ""}
             </Text>
           </Text>
         );
       })}
+      {suggestions.length > maxVisible ? (
+        <Text dimColor>{`  ${String(selected + 1)}/${String(suggestions.length)} ${glyphs.dot} ↑/↓`}</Text>
+      ) : null}
     </Box>
   );
 }
