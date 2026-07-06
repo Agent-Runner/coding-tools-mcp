@@ -1,0 +1,28 @@
+{
+  "name": "run-ctc",
+  "version": "0.1.0",
+  "description": "ctc command alias for coding-tools-conductor, the Coding Tools Conductor CLI/TUI. Run with npx run-ctc.",
+  "type": "module",
+  "license": "SEE LICENSE IN LICENSE",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "ctc": "bin/ctc.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "dependencies": {
+    "coding-tools-conductor": "^0.1.0-beta.1"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "coding-agent",
+    "cli",
+    "conductor",
+    "ctc"
+  ]
+}

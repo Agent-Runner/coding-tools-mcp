@@ -1,0 +1,47 @@
+name: Publish to npm
+
+# Manual publish. Requires an NPM_TOKEN repository secret (npm automation
+# token with publish rights on coding-tools-conductor and run-ctc).
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Package to publish
+        type: choice
+        options: [conductor, run-ctc]
+        default: conductor
+      dist_tag:
+        description: npm dist-tag
+        default: beta
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Test the canonical package before it ships
+        if: inputs.package == 'conductor'
+        run: |
+          npm ci
+          npm run typecheck
+          npm run lint
+          npm test
+      - name: Leak guard — tarball must contain no sourcemaps or src/
+        working-directory: ${{ inputs.package == 'run-ctc' && 'run-ctc' || '.' }}
+        run: |
+          npm pack --dry-run --json > /tmp/pack.json
+          node -e "
+            const files = require('/tmp/pack.json')[0].files.map(f => f.path);
+            const bad = files.filter(p => p.endsWith('.map') || p.startsWith('src/'));
+            if (bad.length) { console.error('forbidden files in tarball:', bad); process.exit(1); }
+            console.log('tarball clean:', files.join(', '));
+          "
+      - name: Publish
+        working-directory: ${{ inputs.package == 'run-ctc' && 'run-ctc' || '.' }}
+        run: npm publish --tag ${{ inputs.dist_tag }} --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

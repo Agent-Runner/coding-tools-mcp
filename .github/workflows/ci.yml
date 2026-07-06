@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      - name: Leak guard — tarball must contain no sourcemaps or src/
+        run: |
+          npm pack --dry-run --json > /tmp/pack.json
+          node -e "
+            const files = require('/tmp/pack.json')[0].files.map(f => f.path);
+            const bad = files.filter(p => p.endsWith('.map') || p.startsWith('src/'));
+            if (bad.length) { console.error('forbidden files in tarball:', bad); process.exit(1); }
+            console.log('tarball clean:', files.join(', '));
+          "
