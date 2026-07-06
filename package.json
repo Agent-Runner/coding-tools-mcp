@@ -1,6 +1,6 @@
 {
   "name": "coding-tools-conductor",
-  "version": "0.1.0",
+  "version": "0.1.0-beta.2",
   "description": "A TypeScript orchestration layer for coding-tools-mcp.",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",
@@ -12,6 +12,7 @@
   },
   "files": [
     "dist",
+    "!dist/**/*.map",
     "README.md"
   ],
   "keywords": [
@@ -23,17 +24,8 @@
     "conductor",
     "ctc"
   ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/xyTom/coding-tools-mcp.git",
-    "directory": "conductor"
-  },
-  "homepage": "https://github.com/xyTom/coding-tools-mcp/tree/main/conductor#readme",
-  "bugs": {
-    "url": "https://github.com/xyTom/coding-tools-mcp/issues"
-  },
   "scripts": {
-    "build": "tsup src/cli/index.ts --format esm --dts --clean --splitting false",
+    "build": "tsup",
     "dev": "tsx src/cli/index.ts",
     "lint": "eslint .",
     "prepack": "npm run build",
