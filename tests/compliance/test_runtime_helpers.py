@@ -742,8 +742,9 @@ Maven home: /usr/share/maven
     def test_read_output_uses_absolute_stream_offsets_after_buffer_drop(self) -> None:
         with TemporaryDirectory() as tmp:
             runtime = Runtime(Path(tmp), permission_mode="trusted")
-            process = subprocess.Popen([sys.executable, "-c", ""], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            try:
+            # The context manager closes the stdout/stderr pipes and waits, so
+            # the test does not leak pipe file objects (ResourceWarning).
+            with subprocess.Popen([sys.executable, "-c", ""], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
                 session = server_module.ExecSession(session_id="manual-output", process=process, buffer_limit=4)
                 session.append_stdout(b"abcdef")
                 runtime._remember_output_session(session)
@@ -754,8 +755,6 @@ Maven home: /usr/share/maven
                 self.assertEqual(page.get("content"), "cdef")
                 self.assertEqual(page.get("omitted_bytes"), 2)
                 self.assertEqual(page.get("retained_start_offset"), 2)
-            finally:
-                process.wait(timeout=5)
 
     def test_default_cwd_and_git_convenience_tools(self) -> None:
         if server_module.shutil.which("git") is None:
