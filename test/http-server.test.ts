@@ -214,6 +214,35 @@ describe("ConductorHttpServer", () => {
     await reader.cancel();
   });
 
+  it("binds session-scoped legacy messages paths to their own ctc session", async () => {
+    http = new ConductorHttpServer();
+    const origin = await http.listen();
+    await http.registerSession("session-a", () => createListToolsServer("server-a"));
+    await http.registerSession("session-b", () => createListToolsServer("server-b"));
+
+    // Open a legacy SSE stream against session-a and capture its transport id.
+    const probe = await fetch(`${origin}/mcp/session-a/sse`, { headers: { Accept: "text/event-stream" } });
+    expect(probe.status).toBe(200);
+    const reader = probe.body?.getReader();
+    if (!reader) throw new Error("SSE probe returned no body.");
+    const handshake = await readSse(reader, (text) => text.includes("\n\n"));
+    const transportSessionId = /sessionId=(\S+)/.exec(handshake)?.[1];
+    expect(transportSessionId).toBeTruthy();
+
+    const post = (path: string) =>
+      fetch(`${origin}${path}?sessionId=${transportSessionId ?? ""}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: initializeBody,
+      });
+
+    // The transport belongs to session-a: the scoped session-b path must not reach it.
+    expect((await post("/mcp/session-b/messages")).status).toBe(404);
+    expect((await post("/mcp/session-a/messages")).status).toBe(202);
+    expect((await post("/messages")).status).toBe(202);
+    await reader.cancel();
+  });
+
   it("serves a routable server card on /, plain GET /mcp, and /.well-known/mcp.json", async () => {
     http = new ConductorHttpServer();
     const origin = await http.listen();

@@ -113,6 +113,51 @@ describe("deriveMcpServers", () => {
     expect(servers.find((server) => server.name === "github")).toMatchObject({ state: "connected", toolCount: 4 });
     expect(servers.find((server) => server.name === "docs")).toMatchObject({ state: "connected", toolCount: 1 });
   });
+
+  it("restores droppedTools from the baseline and keeps them only while connected", () => {
+    const startedAt = (mcpServers: object[]): ConductorEvent => ({
+      ts: "1",
+      sessionId: "s",
+      type: "session_started",
+      workspacePath: "/w",
+      defaultMode: "direct",
+      backendType: "stdio",
+      backendStatus: { connected: true, reconnecting: false },
+      logPath: "l",
+      mcpServers: mcpServers as never,
+    });
+    const baseline = startedAt([
+      { name: "github", source: "profile", state: "connected", toolCount: 3, droppedTools: ["github__ping"] },
+    ]);
+
+    // Startup-time drops survive the session_started baseline.
+    expect(deriveMcpServers([baseline])[0]?.droppedTools).toEqual(["github__ping"]);
+
+    // Disconnect/error/disabled clear the list — it only describes a live connection.
+    expect(
+      deriveMcpServers([
+        baseline,
+        { ts: "2", sessionId: "s", type: "server_status", server: "github", state: "disconnected", error: "closed" },
+      ])[0]?.droppedTools,
+    ).toBeUndefined();
+
+    // A reconnect without drops resets to an empty list instead of reviving the old one.
+    expect(
+      deriveMcpServers([
+        baseline,
+        { ts: "2", sessionId: "s", type: "server_status", server: "github", state: "disconnected", error: "closed" },
+        { ts: "3", sessionId: "s", type: "server_status", server: "github", state: "connected", toolCount: 3 },
+      ])[0]?.droppedTools,
+    ).toEqual([]);
+
+    // A connected update that reports drops replaces the baseline's list.
+    expect(
+      deriveMcpServers([
+        baseline,
+        { ts: "2", sessionId: "s", type: "server_status", server: "github", state: "connected", toolCount: 3, droppedTools: ["github__echo"] },
+      ])[0]?.droppedTools,
+    ).toEqual(["github__echo"]);
+  });
 });
 
 async function writeSessionLog(home: string, sessionId: string, workspacePath: string, defaultMode: "direct" | "worktree") {

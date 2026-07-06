@@ -40,7 +40,7 @@ interface SessionRoute {
 type RouteTarget =
   | { kind: "mcp"; sessionId?: string; isRoot?: boolean }
   | { kind: "sse"; sessionId?: string }
-  | { kind: "messages" }
+  | { kind: "messages"; sessionId?: string }
   | { kind: "discovery" };
 
 const MCP_SESSION_HEADER = "mcp-session-id";
@@ -199,7 +199,7 @@ export class ConductorHttpServer {
       return;
     }
     if (target.kind === "messages") {
-      await this.handleLegacyMessage(req, res, url);
+      await this.handleLegacyMessage(req, res, url, target.sessionId);
       return;
     }
     const route = target.sessionId ? this.routes.get(target.sessionId) : this.defaultRoute;
@@ -356,7 +356,12 @@ export class ConductorHttpServer {
     this.legacyTransports.set(transport.sessionId, entry);
   }
 
-  private async handleLegacyMessage(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  private async handleLegacyMessage(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+    routeSessionId?: string,
+  ): Promise<void> {
     if (req.method !== "POST") {
       sendJsonRpcError(res, 405, -32000, "Method not allowed.", { Allow: "POST, OPTIONS" });
       return;
@@ -367,7 +372,9 @@ export class ConductorHttpServer {
       return;
     }
     const entry = this.legacyTransports.get(sessionId);
-    if (!entry) {
+    // A session-scoped path (/mcp/<ctc-session>/messages) must not accept a
+    // transport that belongs to a different ctc session.
+    if (!entry || (routeSessionId !== undefined && entry.routeSessionId !== routeSessionId)) {
       sendJsonRpcError(res, 404, -32001, "Session not found. Reconnect to /sse to establish a new one.");
       return;
     }
@@ -462,7 +469,7 @@ function parseRoutePath(pathname: string): RouteTarget | undefined {
     return { kind: "mcp", sessionId: segments[1] };
   }
   if (segments.length === 3 && segments[2] === "sse") return { kind: "sse", sessionId: segments[1] };
-  if (segments.length === 3 && segments[2] === "messages") return { kind: "messages" };
+  if (segments.length === 3 && segments[2] === "messages") return { kind: "messages", sessionId: segments[1] };
   return undefined;
 }
 

@@ -97,7 +97,10 @@ export async function latestSessionLogId(): Promise<string | undefined> {
 /**
  * Fold the session's mcp server history into one row per server: the last
  * session_started summary is the baseline, later server_status events update
- * it. Exported for tests.
+ * it. Dropped tools only mean something for a connected server, so they are
+ * restored from the baseline, replaced (empty array included) on every
+ * connected update, and cleared on any other state so a reconnect never shows
+ * a stale shadow list. Exported for tests.
  */
 export function deriveMcpServers(events: ConductorEvent[]): McpServerStatusSnapshot[] {
   const servers = new Map<string, McpServerStatusSnapshot>();
@@ -112,6 +115,7 @@ export function deriveMcpServers(events: ConductorEvent[]): McpServerStatusSnaps
           toolCount: summary.toolCount,
           lastError: summary.error,
           untrusted: summary.untrusted,
+          droppedTools: summary.state === "connected" ? (summary.droppedTools ?? []) : undefined,
         });
       }
       continue;
@@ -125,7 +129,7 @@ export function deriveMcpServers(events: ConductorEvent[]): McpServerStatusSnaps
       toolCount: event.toolCount ?? (event.state === "connected" ? previous?.toolCount : undefined),
       lastError: event.error,
       untrusted: event.untrusted,
-      droppedTools: event.droppedTools ?? previous?.droppedTools,
+      droppedTools: event.state === "connected" ? (event.droppedTools ?? []) : undefined,
       lastChangedTs: event.ts,
     });
   }
