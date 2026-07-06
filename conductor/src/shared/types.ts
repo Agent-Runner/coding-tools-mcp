@@ -186,6 +186,7 @@ export interface SessionMcpServerSummary {
   toolCount?: number;
   error?: string;
   untrusted?: boolean;
+  droppedTools?: string[];
 }
 
 export interface ServerStatusEvent {

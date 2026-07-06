@@ -40,6 +40,38 @@ export async function startConductorServer(options: RuntimeOptions): Promise<voi
   await runtime.start();
   const server = runtime.createServer();
   const transport = new StdioServerTransport();
+
+  // The host owns this process's lifetime: when it closes our stdin (or sends
+  // a signal) the spawned lower backend and extra servers must go down with
+  // us, not linger in the background.
+  let stopping = false;
+  const stopAndExit = (code: number): void => {
+    if (stopping) return;
+    stopping = true;
+    void runtime.stop().finally(() => {
+      process.exit(code);
+    });
+  };
+  const previousOnClose = server.onclose;
+  server.onclose = () => {
+    previousOnClose?.();
+    stopAndExit(0);
+  };
+  // The SDK's stdio transport never closes itself on stdin EOF, so watch the
+  // host hanging up directly.
+  process.stdin.once("end", () => {
+    stopAndExit(0);
+  });
+  process.stdin.once("close", () => {
+    stopAndExit(0);
+  });
+  process.once("SIGINT", () => {
+    stopAndExit(130);
+  });
+  process.once("SIGTERM", () => {
+    stopAndExit(143);
+  });
+
   process.stderr.write(
     `[ctc] session ${options.sessionId} workspace=${options.workspacePath} backend=${options.backend.type} log=${options.logPath}\n`,
   );
@@ -111,7 +143,18 @@ export class ConductorRuntime {
       backendType: this.backendType,
       backendStatus: this.backend.status(),
       logPath: this.events.path ?? "",
-      ...(this.pool.size() ? { mcpServers: this.pool.statuses().map(toSessionMcpSummary) } : {}),
+      ...(this.pool.size()
+        ? {
+            mcpServers: this.pool
+              .statuses()
+              .map((status) =>
+                toSessionMcpSummary(
+                  status,
+                  status.state === "connected" ? this.droppedToolsFor(status.name) : undefined,
+                ),
+              ),
+          }
+        : {}),
     });
     for (const issue of this.mcpConfigIssues) {
       await this.events.append({
@@ -278,12 +321,14 @@ export class ConductorRuntime {
     const seen = new Set<string>(conductorToolNames);
     for (const tool of this.backend.tools()) seen.add(tool.name);
     const dropped: string[] = [];
-    for (const tool of this.pool.tools()) {
-      if (!seen.has(tool.name)) {
-        seen.add(tool.name);
+    // Walk the pool's exposure order so a name collision blames the actual
+    // losing server, not whichever server a reparse of the name points at.
+    for (const entry of this.pool.entries()) {
+      if (!seen.has(entry.name)) {
+        seen.add(entry.name);
         continue;
       }
-      if (this.pool.resolve(tool.name)?.server === serverName) dropped.push(tool.name);
+      if (entry.server === serverName) dropped.push(entry.name);
     }
     return dropped;
   }
@@ -405,7 +450,7 @@ export class ConductorRuntime {
   }
 }
 
-function toSessionMcpSummary(status: ExtraServerStatus): SessionMcpServerSummary {
+function toSessionMcpSummary(status: ExtraServerStatus, droppedTools: string[] | undefined): SessionMcpServerSummary {
   return {
     name: status.name,
     source: status.source,
@@ -414,6 +459,7 @@ function toSessionMcpSummary(status: ExtraServerStatus): SessionMcpServerSummary
     ...(status.state === "connected" ? { toolCount: status.toolCount } : {}),
     ...(status.lastError ? { error: status.lastError } : {}),
     ...(status.untrusted ? { untrusted: true } : {}),
+    ...(droppedTools?.length ? { droppedTools } : {}),
   };
 }
 

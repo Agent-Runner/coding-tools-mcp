@@ -142,6 +142,53 @@ describe("ConductorRuntime multi-server aggregation", () => {
     expect(statusEvents.find((event) => event.server === "alpha")?.droppedTools).toEqual(["alpha__echo"]);
   });
 
+  // Server names may contain the `__` separator, so two servers can expose the
+  // same prefixed name (a's `b__x` and a__b's `x` both surface as `a__b__x`).
+  // The listed tool and the invoked backend must be the same winner.
+  it("routes a colliding exposed name to the server that won the tool list", async () => {
+    const { runtime, events } = await startRuntime(
+      runtimeOptions({ mcpServers: [extra("a", "b__x"), extra("a__b", "x")] }),
+    );
+    const client = await connectClient(runtime);
+    const listed = (await client.listTools()).tools.filter((tool) => tool.name === "a__b__x");
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.description).toBe("fake a tool b__x");
+
+    const result = await runtime.callTool("a__b__x", {});
+    expect(result.content).toEqual([{ type: "text", text: "a:b__x:ok" }]);
+
+    // session_started summarizes after both servers settled, so the drop
+    // attribution is deterministic there: the later-registered server lost.
+    const started = events().find((event): event is SessionStartedEvent => event.type === "session_started");
+    expect(started?.mcpServers).toEqual([
+      { name: "a", source: "profile", state: "connected", toolCount: 1 },
+      { name: "a__b", source: "profile", state: "connected", toolCount: 1, droppedTools: ["a__b__x"] },
+    ]);
+  });
+
+  it("routes a colliding exposed name consistently with the registration order reversed", async () => {
+    const { runtime } = await startRuntime(
+      runtimeOptions({ mcpServers: [extra("a__b", "x"), extra("a", "b__x")] }),
+    );
+    const client = await connectClient(runtime);
+    const listed = (await client.listTools()).tools.filter((tool) => tool.name === "a__b__x");
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.description).toBe("fake a__b tool x");
+
+    const result = await runtime.callTool("a__b__x", {});
+    expect(result.content).toEqual([{ type: "text", text: "a__b:x:ok" }]);
+  });
+
+  it("carries droppedTools in the session_started summary", async () => {
+    const { events } = await startRuntime(
+      runtimeOptions({ primaryTools: "server_info,alpha__echo", mcpServers: [extra("alpha", "echo")] }),
+    );
+    const started = events().find((event): event is SessionStartedEvent => event.type === "session_started");
+    expect(started?.mcpServers).toEqual([
+      { name: "alpha", source: "profile", state: "connected", toolCount: 1, droppedTools: ["alpha__echo"] },
+    ]);
+  });
+
   it("applies the global tool policy to prefixed names", async () => {
     const { runtime } = await startRuntime(
       runtimeOptions({ mcpServers: [extra("beta", "search")], deny: ["beta__search"] }),

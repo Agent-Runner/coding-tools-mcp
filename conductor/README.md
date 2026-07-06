@@ -311,3 +311,28 @@ config-disabled servers warn, reachable servers report their tool count, and
 connection or `env:` resolution failures fail the check. Note for mixed
 versions: older ctc builds rewrite profiles through a stricter schema and drop
 the new `mcpServers`/`trustedWorkspaceMcp` fields on their next profile write.
+
+## Runtime Environment And Shutdown
+
+Backend environment: the conductor resolves the user's login-shell `PATH` once
+per process (bash/zsh: `$SHELL -ilc`; fish and csh get their own probe; 5s
+timeout, cached, `CTC_RESOLVING_LOGIN_SHELL=1` set during the probe) and
+spawns the primary stdio backend with `process.env` plus that merged `PATH`.
+This keeps nvm/pyenv/asdf-selected toolchains working when the MCP host that
+launched ctc came from a GUI with a minimal `PATH` — the same approach VS
+Code's shell-environment resolution uses. If the current `PATH` carries custom
+entries, they stay in front; login-shell entries are appended. Extra stdio MCP
+servers get the same `PATH` widening on top of their minimal default env. Set
+`CTC_NO_LOGIN_SHELL_PATH=1` to disable the probe.
+
+Backend request budgets: control-plane calls (`initialize`, `tools/list`)
+time out after 30s, tool calls after 10 minutes; a timeout marks the backend
+disconnected and starts the reconnect loop instead of hanging the session.
+Override with `CTC_BACKEND_CONTROL_TIMEOUT_MS` / `CTC_BACKEND_TOOL_TIMEOUT_MS`.
+
+Shutdown: `ctc start` exits when its host hangs up (stdin EOF, SIGINT, or
+SIGTERM) and tears the spawned lower backend down with it — stdin EOF first
+(clean MCP stdio shutdown; lets a `docker run --rm -i` backend stop and
+auto-remove), then SIGTERM, then SIGKILL after a 3s grace. Quitting the TUI
+closes the hosted workspace and stops the runtime the same way, so no
+background `coding-tools-mcp` process outlives ctc.

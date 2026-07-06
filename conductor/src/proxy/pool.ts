@@ -10,6 +10,13 @@ export interface McpPoolHooks {
 
 export const MCP_TOOL_SEPARATOR = "__";
 
+/** One connected extra tool under its exposed (prefixed) name. */
+export interface ExposedToolEntry {
+  name: string;
+  server: string;
+  tool: CachedTool;
+}
+
 /**
  * Owns one ExtraMcpClient per configured additional MCP server and exposes
  * their tools under a `<server>__` prefix. Startup is never fatal: a broken
@@ -62,23 +69,38 @@ export class McpServerPool {
     return this.clients.map((client) => client.status());
   }
 
-  /** Merged tool list of connected servers, names prefixed `<server>__<tool>`. */
-  tools(): CachedTool[] {
-    const tools: CachedTool[] = [];
+  /**
+   * Every connected extra tool in exposure order (server registration order,
+   * then the server's own tool order). This ordering is the single source of
+   * truth shared by listing, routing, and dropped-tool attribution, so a name
+   * collision always resolves to the same winner everywhere.
+   */
+  entries(): ExposedToolEntry[] {
+    const entries: ExposedToolEntry[] = [];
     for (const client of this.clients) {
       for (const tool of client.tools()) {
-        tools.push({ ...tool, name: `${client.name()}${MCP_TOOL_SEPARATOR}${tool.name}` });
+        entries.push({ name: `${client.name()}${MCP_TOOL_SEPARATOR}${tool.name}`, server: client.name(), tool });
       }
     }
-    return tools;
+    return entries;
+  }
+
+  /** Merged tool list of connected servers, names prefixed `<server>__<tool>`. */
+  tools(): CachedTool[] {
+    return this.entries().map((entry) => ({ ...entry.tool, name: entry.name }));
   }
 
   /**
-   * Map a prefixed tool name back to its owning server. Server names may
-   * themselves contain `__`, so match registered names longest-first instead
-   * of splitting on the first separator.
+   * Map a prefixed tool name back to its owning server. Live exposed tools
+   * win first (same first-writer-wins order the tool list uses). Names no
+   * live tool claims — e.g. a call to a currently disconnected server — fall
+   * back to prefix parsing; server names may themselves contain `__`, so
+   * registered names match longest-first instead of splitting on the first
+   * separator.
    */
   resolve(name: string): { server: string; tool: string } | undefined {
+    const entry = this.entries().find((candidate) => candidate.name === name);
+    if (entry) return { server: entry.server, tool: entry.tool.name };
     for (const serverName of this.namesByLengthDesc) {
       const prefix = `${serverName}${MCP_TOOL_SEPARATOR}`;
       if (name.length > prefix.length && name.startsWith(prefix)) {
