@@ -65,7 +65,11 @@ ctc ws merge <session-id>
 ```
 
 Inside the TUI, `/clean [--force|--yes]` mirrors `ctc ws clean` with an
-in-terminal confirmation prompt instead of a stdin one.
+in-terminal confirmation prompt instead of a stdin one. Cleaning also prunes
+closed session records — their `~/.ctc` json, log, and approval files are
+deleted so state stays bounded; the TUI's active session is always exempt.
+Workspace mode defaults to `direct` (the model edits the repo in place);
+worktree isolation is the explicit opt-in via `/new --worktree`.
 
 Worktree creation and cleanup are the only direct git operations in the core
 runtime. Review checkpoints run git through the lower `exec_command` tool so the
@@ -125,18 +129,25 @@ Human-side commands:
 
 ```bash
 ctc baton show /path/to/repo
-ctc            # opens the TUI (ctc tui is a deprecated alias)
-ctc tui <session-id>
+ctc [path]           # opens the TUI and starts the session for that repo
+ctc tui [session-id] # observes an external ctc start session read-only
 ```
 
-The TUI attaches to the latest session log by default and renders activity as
-an append-only transcript that flows into the terminal scrollback, in the
-style of Claude Code: each tool call is a `●` line with a dimmed `⎿` result
-(or a red error), review checkpoints render as inline diff cards, and TUI
-notices appear as `✓` / `✗` / `·` notes. Updates are event-driven — the TUI
-watches `~/.ctc/logs` with a dirty-checked snapshot store instead of
-repainting on a timer — so external stdio sessions stream in near real time
-without flicker.
+Launching `ctc` IS the session: the TUI automatically opens a workspace
+session for the repo (direct mode by default) and quitting closes it — the
+workspace record is stamped closed and the backend stops, the way Claude Code
+or Codex CLI treat a run. `/new` replaces the session (switch to another repo,
+or opt into worktree isolation with `--worktree`); `/close` ends it without
+reopening. `ctc tui <session-id>` is the separate observe mode: it renders an
+external `ctc start` session read-only and answers its permission prompts,
+without hosting a session of its own.
+
+The TUI renders activity as an append-only transcript that flows into the
+terminal scrollback, in the style of Claude Code: each tool call is a `●`
+line with a dimmed `⎿` result (or a red error), review checkpoints render as
+inline diff cards, and TUI notices appear as `✓` / `✗` / `·` notes. Updates
+are event-driven — the TUI watches the active session's log with a
+dirty-checked snapshot store instead of repainting on a timer.
 
 Interaction is input-first: printable keys always go to the composer, and
 typing `/` opens a navigable command menu that lists every command grouped by
@@ -149,9 +160,8 @@ start/end, Ctrl+W/U/K to delete by word or to the line edges, Ctrl+←/→ and
 Alt+←/→ to move by word). Bounded panels open over the live region for `/diff`,
 `/baton`, `/approvals`, `/config`, `/inspect` (also Ctrl+O), `/doctor`, and
 `/help`; ↑/↓ scroll by line, ←/→ page while the composer is empty (PgUp/PgDn
-also work), and Esc closes. Tab cycles session tabs when the
-composer is empty, `/clear` resets the transcript, and Ctrl+C must be pressed
-twice to quit so a stray interrupt cannot tear down live sessions.
+also work), and Esc closes. `/clear` resets the transcript, and Ctrl+C must be
+pressed twice to quit so a stray interrupt cannot tear down the live session.
 
 If the model calls the lower `request_permissions` tool while the TUI is
 attached, Conductor pauses the request and shows an approval prompt with
@@ -160,9 +170,9 @@ queue when several requests are pending; Esc denies). Without an attached
 TUI, the request falls back to the lower backend's existing permission flow.
 
 `/tunnel start` exposes the MCP server over a free try.cloudflare.com tunnel.
-It requires a live session (`/new`) — a tunnel in front of a session-less
-server could only answer 503, which remote connectors surface as a failed
-setup. If `cloudflared` is already installed it starts immediately. Otherwise
+It requires the live session (started automatically; `/new` restores it after
+a `/close`) — a tunnel in front of a session-less server could only answer
+503, which remote connectors surface as a failed setup. If `cloudflared` is already installed it starts immediately. Otherwise
 the TUI does not dead-end — it opens a picker (arrows/number keys, Enter, Esc)
 of the ways this host can run a tunnel:
 
@@ -180,12 +190,12 @@ cloudflared nor `npx` say so plainly instead of hanging.
 Model clients connect to the stable `/mcp` endpoint (locally
 `http://127.0.0.1:<port>/mcp`, through a tunnel `https://<tunnel-host>/mcp`).
 The port is persisted in the workspace profile, so a client configured once
-keeps working across ctc restarts. `/mcp` always serves the most recently
-opened session; `/mcp/<session-id>` remains available to pin a specific one
-when several sessions are live. Following the Streamable HTTP spec, each
-client that POSTs an `initialize` request gets its own MCP session (routed by
-the `Mcp-Session-Id` header), so any number of clients can connect, reconnect,
-and terminate sessions independently.
+keeps working across ctc restarts. `/mcp` serves the live session;
+`/mcp/<session-id>` pins that specific id (a `/new` replacement mints a new
+id). Following the Streamable HTTP spec, each client that POSTs an
+`initialize` request gets its own MCP session (routed by the `Mcp-Session-Id`
+header), so any number of clients can connect, reconnect, and terminate
+sessions independently.
 
 Conductor speaks both remote MCP transports, so connector platforms that
 probe or only implement the legacy 2024-11-05 HTTP+SSE transport connect too:

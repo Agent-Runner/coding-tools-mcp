@@ -6,7 +6,7 @@ import { readProfileForPath } from "../src/profiles/config.js";
 import { advanceOnboarding, loadOnboardingState } from "../src/tui/onboarding.js";
 
 describe("TUI onboarding", () => {
-  it("writes a default profile after accepting the three defaults", async () => {
+  it("writes a direct-mode profile after accepting the two defaults", async () => {
     const home = await mkdtemp(join(tmpdir(), "ctc-onboarding-home-"));
     const repo = await mkdtemp(join(tmpdir(), "ctc-onboarding-repo-"));
     process.env.CTC_HOME = home;
@@ -16,17 +16,14 @@ describe("TUI onboarding", () => {
     if (!first) throw new Error("Expected onboarding to be required.");
 
     const second = await advanceOnboarding(first, "");
-    expect(second.step).toBe("workspace");
+    expect(second.step).toBe("permissions");
 
-    const third = await advanceOnboarding(second, "");
-    expect(third.step).toBe("permissions");
-
-    const complete = await advanceOnboarding(third, "");
+    const complete = await advanceOnboarding(second, "");
     expect(complete.complete).toBe(true);
 
     const profile = await readProfileForPath(repo);
     expect(profile?.backend.type).toBe("stdio");
-    expect(profile?.defaultMode).toBe("worktree");
+    expect(profile?.defaultMode).toBe("direct");
     expect(profile?.permissionMode).toBe("safe");
     await expect(loadOnboardingState(repo)).resolves.toBeUndefined();
   });

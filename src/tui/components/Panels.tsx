@@ -65,8 +65,7 @@ export function helpLines(): DisplayLine[] {
   lines.push({ text: "" });
   lines.push({ text: "Keys", bold: true });
   lines.push({ text: "  Enter               run the typed command (or the selected menu entry)" });
-  lines.push({ text: "  Tab                 complete the slash command; cycle sessions when input is empty" });
-  lines.push({ text: "  Shift+Tab           cycle sessions backwards" });
+  lines.push({ text: "  Tab                 complete the selected slash command" });
   lines.push({ text: "  ↑/↓                 menu selection, panel scroll, or input history" });
   lines.push({ text: "  ←/→                 page an open panel when the input is empty" });
   lines.push({ text: "  Ctrl+A / Ctrl+E     move the cursor to the start / end of the line" });

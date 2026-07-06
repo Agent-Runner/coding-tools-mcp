@@ -144,16 +144,7 @@ export function fingerprintSnapshot(snapshot: TuiSnapshot): string {
     id: snapshot.sessionId,
     count: snapshot.events.length,
     last: last ? `${last.ts}|${last.type}` : "",
-    sessions: [...snapshot.sessions]
-      .sort((a, b) => a.sessionId.localeCompare(b.sessionId))
-      .map((session) => [
-        session.sessionId,
-        session.pendingApprovalCount,
-        session.backendConnected ?? null,
-        session.mode ?? null,
-        session.workspacePath ?? null,
-      ]),
-    approvals: snapshot.allPendingApprovals.map((approval) => approval.id),
+    approvals: snapshot.pendingApprovals.map((approval) => approval.id),
     checkpoints: snapshot.checkpoints.length,
     mcp: snapshot.mcpServers.map((server) => [server.name, server.state, server.toolCount ?? null]),
     workspace: snapshot.workspace ? [snapshot.workspace.activePath, snapshot.workspace.closedAt ?? null] : null,
@@ -166,12 +157,10 @@ export function fingerprintSnapshot(snapshot: TuiSnapshot): string {
 export function emptySnapshot(initialWorkspacePath?: string): TuiSnapshot {
   return {
     initialWorkspacePath,
-    sessions: [],
     events: [],
     toolCalls: [],
     checkpoints: [],
     pendingApprovals: [],
-    allPendingApprovals: [],
     mcpServers: [],
   };
 }

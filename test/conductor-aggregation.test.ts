@@ -6,8 +6,9 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { ConductorRuntime } from "../src/server/mcp.js";
-import { SessionEventBus } from "../src/sessions/events.js";
+import type { SessionEventSink } from "../src/sessions/events.js";
 import type {
+  ConductorEvent,
   McpConfigIssue,
   ResolvedMcpServer,
   RuntimeOptions,
@@ -15,6 +16,15 @@ import type {
   SessionStartedEvent,
   ToolCallEvent,
 } from "../src/shared/types.js";
+
+class RecordingSink implements SessionEventSink {
+  readonly appended: ConductorEvent[] = [];
+
+  append(event: ConductorEvent): Promise<void> {
+    this.appended.push(event);
+    return Promise.resolve();
+  }
+}
 
 const FIXTURE = "test/fixtures/line-extra.mjs";
 const originalCtcHome = process.env.CTC_HOME;
@@ -74,18 +84,18 @@ function runtimeOptions(input: {
 
 interface Harness {
   runtime: ConductorRuntime;
-  bus: SessionEventBus;
+  events: () => ConductorEvent[];
   sessionId: string;
 }
 
 const cleanups: (() => Promise<void>)[] = [];
 
 async function startRuntime(options: RuntimeOptions): Promise<Harness> {
-  const bus = new SessionEventBus();
-  const runtime = new ConductorRuntime(options, { owner: "stdio", events: bus });
+  const sink = new RecordingSink();
+  const runtime = new ConductorRuntime(options, { owner: "stdio", events: sink });
   cleanups.push(() => runtime.stop());
   await runtime.start();
-  return { runtime, bus, sessionId: options.sessionId };
+  return { runtime, events: () => sink.appended, sessionId: options.sessionId };
 }
 
 async function connectClient(runtime: ConductorRuntime): Promise<Client> {
@@ -118,7 +128,7 @@ describe("ConductorRuntime multi-server aggregation", () => {
   });
 
   it("lets an exact primary tool name shadow the extra copy and records the drop", async () => {
-    const { runtime, bus, sessionId } = await startRuntime(
+    const { runtime, events } = await startRuntime(
       runtimeOptions({ primaryTools: "server_info,alpha__echo", mcpServers: [extra("alpha", "echo")] }),
     );
     const client = await connectClient(runtime);
@@ -128,7 +138,7 @@ describe("ConductorRuntime multi-server aggregation", () => {
     const result = await runtime.callTool("alpha__echo", {});
     expect(result.content).toEqual([{ type: "text", text: "primary:alpha__echo:ok" }]);
 
-    const statusEvents = bus.events(sessionId).filter((event): event is ServerStatusEvent => event.type === "server_status");
+    const statusEvents = events().filter((event): event is ServerStatusEvent => event.type === "server_status");
     expect(statusEvents.find((event) => event.server === "alpha")?.droppedTools).toEqual(["alpha__echo"]);
   });
 
@@ -146,23 +156,23 @@ describe("ConductorRuntime multi-server aggregation", () => {
   });
 
   it("attributes tool_call events to the owning extra server only", async () => {
-    const { runtime, bus, sessionId } = await startRuntime(runtimeOptions({ mcpServers: [extra("beta", "search")] }));
+    const { runtime, events } = await startRuntime(runtimeOptions({ mcpServers: [extra("beta", "search")] }));
     await runtime.callTool("beta__search", {});
     await runtime.callTool("server_info", {});
 
-    const calls = bus.events(sessionId).filter((event): event is ToolCallEvent => event.type === "tool_call");
+    const calls = events().filter((event): event is ToolCallEvent => event.type === "tool_call");
     expect(calls.find((event) => event.tool === "beta__search")?.server).toBe("beta");
     expect(calls.find((event) => event.tool === "server_info")?.server).toBeUndefined();
   });
 
   it("summarizes extras in session_started and reports config issues as error events", async () => {
-    const { bus, sessionId } = await startRuntime(
+    const harness = await startRuntime(
       runtimeOptions({
         mcpServers: [extra("alpha", "echo")],
         mcpConfigIssues: [{ name: "broken", message: "Invalid MCP server entry broken." }],
       }),
     );
-    const events = bus.events(sessionId);
+    const events = harness.events();
     const started = events.find((event): event is SessionStartedEvent => event.type === "session_started");
     expect(started?.mcpServers).toEqual([{ name: "alpha", source: "profile", state: "connected", toolCount: 1 }]);
 
@@ -186,7 +196,7 @@ describe("ConductorRuntime multi-server aggregation", () => {
 
     const fatal = new ConductorRuntime(
       runtimeOptions({ primaryCommand: ["ctc-definitely-not-a-real-backend"], mcpServers: [extra("alpha", "echo")] }),
-      { owner: "stdio", events: new SessionEventBus() },
+      { owner: "stdio", events: new RecordingSink() },
     );
     cleanups.push(() => fatal.stop());
     await expect(fatal.start()).rejects.toThrow(/stdio backend failed to start/);

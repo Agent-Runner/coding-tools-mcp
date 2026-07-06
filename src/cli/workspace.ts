@@ -29,7 +29,7 @@ export async function cleanWorkspacesCli(options: { force?: boolean; yes?: boole
   }
   const result = await cleanWorkspaceSessions({ force: options.force });
   process.stdout.write(
-    `Removed ${String(result.removed.length)}; skipped dirty ${String(result.skippedDirty.length)}; missing ${String(result.missing.length)}.\n`,
+    `Removed ${String(result.removed.length)}; skipped dirty ${String(result.skippedDirty.length)}; missing ${String(result.missing.length)}; pruned ${String(result.prunedRecords.length)} closed records.\n`,
   );
   if (result.skippedDirty.length) process.stdout.write(`Dirty sessions: ${result.skippedDirty.join(", ")}\n`);
 }

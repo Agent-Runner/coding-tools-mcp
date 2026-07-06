@@ -48,13 +48,13 @@ export const slashCommandGroups: SlashCommandGroup[] = [
     commands: [
       {
         name: "new",
-        usage: "/new [path] [--direct|--worktree] [--resume <wt>]",
-        description: "Open a workspace session for model clients.",
+        usage: "/new [path] [--worktree|--direct] [--resume <wt>]",
+        description: "Replace the session: switch repo or isolation mode.",
       },
       {
         name: "close",
         usage: "/close [--force]",
-        description: "Close the current workspace session.",
+        description: "Close the session; /new reopens one.",
       },
       {
         name: "merge",
@@ -64,12 +64,7 @@ export const slashCommandGroups: SlashCommandGroup[] = [
       {
         name: "clean",
         usage: "/clean [--force|--yes]",
-        description: "Remove idle managed worktrees and stale records.",
-      },
-      {
-        name: "switch",
-        usage: "/switch [n|session]",
-        description: "Switch to another attached session tab.",
+        description: "Remove idle worktrees and prune closed session records.",
       },
     ],
   },
@@ -89,7 +84,7 @@ export const slashCommandGroups: SlashCommandGroup[] = [
       {
         name: "approvals",
         usage: "/approvals",
-        description: "List pending approvals across attached sessions.",
+        description: "List pending approvals for this session.",
       },
     ],
   },

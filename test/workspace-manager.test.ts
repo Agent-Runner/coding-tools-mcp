@@ -1,10 +1,16 @@
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "vitest";
-import { WorkspaceManager, closeWorkspaceSession, mergeWorkspaceSession, type ToolCaller } from "../src/workspace/manager.js";
+import {
+  WorkspaceManager,
+  cleanWorkspaceSessions,
+  closeWorkspaceSession,
+  mergeWorkspaceSession,
+  type ToolCaller,
+} from "../src/workspace/manager.js";
 import { createGitRepo, git } from "./git-fixtures.js";
 
 describe("WorkspaceManager", () => {
@@ -142,6 +148,33 @@ describe("WorkspaceManager", () => {
     const closed = await closeWorkspaceSession("session-close-by-id", { force: true });
     expect(closed.closed).toBe(true);
     expect(existsSync(opened.workspace.activePath)).toBe(false);
+  });
+
+  it("prunes closed session records, logs, and approvals but keeps the exempt session", async () => {
+    const repo = await createGitRepo("ctc-clean-prune-");
+    const home = await mkdtemp(join(tmpdir(), "ctc-home-"));
+    process.env.CTC_HOME = home;
+
+    for (const sessionId of ["session-pruned", "session-kept"]) {
+      const manager = new WorkspaceManager({
+        backend: new FakeBackend(repo),
+        sessionId,
+        defaultWorkspacePath: repo,
+        defaultMode: "direct",
+      });
+      await manager.open({});
+      await manager.close();
+    }
+    await mkdir(join(home, "logs"), { recursive: true });
+    await writeFile(join(home, "logs", "session-pruned.jsonl"), "{}\n", "utf8");
+    await mkdir(join(home, "approvals", "session-pruned"), { recursive: true });
+
+    const result = await cleanWorkspaceSessions({ keepSessionId: "session-kept" });
+    expect(result.prunedRecords).toEqual(["session-pruned"]);
+    expect(existsSync(join(home, "sessions", "session-pruned.json"))).toBe(false);
+    expect(existsSync(join(home, "logs", "session-pruned.jsonl"))).toBe(false);
+    expect(existsSync(join(home, "approvals", "session-pruned"))).toBe(false);
+    expect(existsSync(join(home, "sessions", "session-kept.json"))).toBe(true);
   });
 });
 
