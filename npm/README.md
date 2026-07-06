@@ -21,6 +21,11 @@ scoped, e.g. `@<your-npm-user>/ctc-cli` published with `--access public`.
 
 ## Publishing a beta
 
+Before any `npm publish`, verify the tarball leaks nothing: `npm pack
+--dry-run` must list no `*.map` file and nothing under `src/` (sourcemaps
+carry `sourcesContent` — the full TypeScript source). The conductor build
+disables sourcemaps and minifies; keep it that way.
+
 Publish the canonical package first — `run-ctc` depends on it:
 
 ```bash

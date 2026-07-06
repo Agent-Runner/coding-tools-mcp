@@ -24,14 +24,5 @@
     "cli",
     "conductor",
     "ctc"
-  ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/xyTom/coding-tools-mcp.git",
-    "directory": "npm/run-ctc"
-  },
-  "homepage": "https://github.com/xyTom/coding-tools-mcp/tree/main/conductor#readme",
-  "bugs": {
-    "url": "https://github.com/xyTom/coding-tools-mcp/issues"
-  }
+  ]
 }

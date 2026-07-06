@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "npm launcher for the coding-tools-mcp Python MCP server (PyPI). Starts the server via uvx or pipx.",
   "type": "module",
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "Apache-2.0",
   "engines": {
     "node": ">=18"
   },
