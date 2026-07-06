@@ -64,6 +64,9 @@ ctc ws clean --force --yes
 ctc ws merge <session-id>
 ```
 
+Inside the TUI, `/clean [--force|--yes]` mirrors `ctc ws clean` with an
+in-terminal confirmation prompt instead of a stdin one.
+
 Worktree creation and cleanup are the only direct git operations in the core
 runtime. Review checkpoints run git through the lower `exec_command` tool so the
 layering boundary stays intact.
@@ -136,9 +139,11 @@ repainting on a timer — so external stdio sessions stream in near real time
 without flicker.
 
 Interaction is input-first: printable keys always go to the composer, and
-typing `/` opens a navigable command menu that fuzzy-matches as you type
-(e.g. `/dr` finds `doctor`), highlights the matched characters, and wraps at
-the ends — arrows to choose, Tab to complete, Enter to run. The composer
+typing `/` opens a navigable command menu that lists every command grouped by
+area (Sessions, Review, Configure, Interface) in a scrolling window with a
+`3/16 · ↑/↓` count footer when the list overflows. It fuzzy-matches as you
+type (e.g. `/dr` finds `doctor`), highlights the matched characters, and
+wraps at the ends — arrows to choose, Tab to complete, Enter to run. The composer
 supports the usual readline editing keys (Ctrl+A/E to jump to line
 start/end, Ctrl+W/U/K to delete by word or to the line edges, Ctrl+←/→ and
 Alt+←/→ to move by word). Bounded panels open over the live region for `/diff`,

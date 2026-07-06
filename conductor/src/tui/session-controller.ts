@@ -34,11 +34,13 @@ import {
 } from "../tunnel/install.js";
 import { TunnelManager, type TunnelState } from "../tunnel/manager.js";
 import {
+  cleanWorkspaceSessions,
   closeWorkspaceSession,
   listWorkspaceSessions,
   mergeWorkspaceSession,
   readWorkspaceSession,
   type CloseWorkspaceResult,
+  type WorkspaceCleanResult,
   type WorkspaceMergeResult,
 } from "../workspace/manager.js";
 
@@ -156,6 +158,40 @@ export class TuiSessionController {
   async respondToApproval(sessionId: string, requestId: string, approved: boolean): Promise<void> {
     if (this.sessions.has(sessionId)) await this.approvals.respond(sessionId, requestId, approved);
     else await respondToFileApproval(sessionId, requestId, approved);
+  }
+
+  /** Session ids of recorded, still-open worktree workspaces (the set `ctc ws clean` sees). */
+  async cleanCandidates(): Promise<string[]> {
+    return (await listWorkspaceSessions())
+      .filter((state) => state.mode === "worktree" && !state.closedAt)
+      .map((state) => state.sessionId);
+  }
+
+  /** Remove idle managed worktrees; shuts down hosted runtimes whose worktree was removed. */
+  async clean(options: { force?: boolean; sessionId?: string } = {}): Promise<WorkspaceCleanResult> {
+    const started = performance.now();
+    const events = options.sessionId
+      ? (this.sessions.get(options.sessionId)?.events ?? jsonlSinkForSession(options.sessionId))
+      : undefined;
+    try {
+      const result = await cleanWorkspaceSessions({ force: options.force });
+      for (const removedId of result.removed) {
+        const hosted = this.sessions.get(removedId);
+        if (!hosted) continue;
+        await this.http?.unregisterSession(removedId).catch(() => undefined);
+        await hosted.runtime.stop().catch(() => undefined);
+        this.sessions.delete(removedId);
+      }
+      if (events && options.sessionId) {
+        await appendToolEvent(events, options.sessionId, "clean_workspaces", started, result, undefined);
+      }
+      return result;
+    } catch (error) {
+      if (events && options.sessionId) {
+        await appendToolEvent(events, options.sessionId, "clean_workspaces", started, undefined, error).catch(() => undefined);
+      }
+      throw error;
+    }
   }
 
   /** Ordered ways to start a tunnel on this host (run cloudflared/wrangler, or install). */
