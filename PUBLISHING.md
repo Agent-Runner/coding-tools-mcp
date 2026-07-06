@@ -36,6 +36,11 @@ npm publish --tag beta
 `npm install -g coding-tools-conductor@beta`. To promote a stable version,
 publish without `--tag` or run `npm dist-tag add <pkg>@<version> latest`.
 
+Burned version numbers — npm never allows republishing an unpublished
+version: `coding-tools-conductor@0.1.0-beta.1` (the sourcemap leak) and
+`run-ctc@0.1.0` (unpublished to release the leaked version's dependent
+lock). Skip them forever.
+
 Prefer the `Publish to npm` GitHub Actions workflow over publishing from a
 laptop: it re-runs the test suite and the leak guard in a clean environment.
 
