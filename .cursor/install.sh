@@ -45,7 +45,9 @@ fi
 {
   echo ""
   echo "$MARKER"
-  echo "export CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS=\"/exec-daemon:\${HOME}/.nvm:${PY_ETC}\${CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS:+:\$CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS}\""
+  # Fixed assignment (not self-appending) so re-sourcing ~/.bashrc in nested
+  # shells keeps the value stable instead of growing on each source.
+  echo "export CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS=\"/exec-daemon:\${HOME}/.nvm:${PY_ETC}\""
 } >> "$BASHRC"
 
 # 3. Install the package plus dev tooling (ruff, mypy, PyYAML, typing_extensions)
