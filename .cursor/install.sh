@@ -16,24 +16,37 @@ if ! command -v python >/dev/null 2>&1; then
   sudo apt-get install -y --no-install-recommends python-is-python3
 fi
 
-# 2. Grant the runtime's Landlock exec sandbox access to the Node toolchain.
-#    The safe/trusted permission modes confine exec_command to system prefixes
-#    (/usr, /bin, ...). On the Cursor image, Node/npm live under nvm
-#    (~/.nvm) and the agent's exec daemon (/exec-daemon), so the golden/e2e
-#    suites that shell out to `npm test`/`node --test` are otherwise blocked
-#    with LANDLOCK_READ_ROOT_BLOCKED. This mirrors how the project's own
-#    Dockerfile keeps the toolchain under system-readable roots.
-#    The export is placed in ~/.bashrc alongside the image's nvm init so it
-#    reaches the exec daemon that spawns the MCP server during `make test`.
+# 2. Grant the runtime's Landlock exec sandbox access to toolchain paths that
+#    live outside the system prefixes (/usr, /bin, ...) it allows by default.
+#    On the Cursor image:
+#      - Node/npm live under nvm (~/.nvm) and the agent exec daemon
+#        (/exec-daemon), so suites that shell out to `npm test` / `node --test`
+#        are otherwise blocked with LANDLOCK_READ_ROOT_BLOCKED.
+#      - Debian symlinks /usr/lib/pythonX.Y/sitecustomize.py into
+#        /etc/pythonX.Y, so on stricter Landlock kernels a sandboxed `python`
+#        fails to read it and pollutes stderr; grant the /etc python config dir.
+#    This mirrors how the project's own Dockerfile keeps the toolchain under
+#    system-readable roots. The export is placed in ~/.bashrc alongside the
+#    image's nvm init so it reaches the exec daemon that spawns the MCP server
+#    during `make test`.
 BASHRC="${HOME}/.bashrc"
-MARKER="# coding-tools-mcp: allow Landlock exec of the nvm/exec-daemon Node toolchain"
-if ! grep -qF "$MARKER" "$BASHRC" 2>/dev/null; then
-  {
-    echo ""
-    echo "$MARKER"
-    echo 'export CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS="/exec-daemon:${HOME}/.nvm${CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS:+:$CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS}"'
-  } >> "$BASHRC"
+MARKER_TAG="coding-tools-mcp: allow Landlock"
+MARKER="# ${MARKER_TAG} exec/read of the nvm + exec-daemon + python toolchain"
+PY_ETC="/etc/python$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+# Replace any previously-managed block (any marker variant) so re-runs and
+# rebuilds from an older snapshot pick up an updated value without duplicating.
+if grep -qF "$MARKER_TAG" "$BASHRC" 2>/dev/null || grep -qF 'CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS' "$BASHRC" 2>/dev/null; then
+  tmp_bashrc="$(mktemp)"
+  grep -vF "$MARKER_TAG" "$BASHRC" | grep -vF 'CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS' > "$tmp_bashrc" || true
+  # collapse any trailing blank lines left behind, then move back
+  sed -e :a -e '/^\n*$/{$d;N;ba}' "$tmp_bashrc" > "$BASHRC"
+  rm -f "$tmp_bashrc"
 fi
+{
+  echo ""
+  echo "$MARKER"
+  echo "export CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS=\"/exec-daemon:\${HOME}/.nvm:${PY_ETC}\${CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS:+:\$CODING_TOOLS_MCP_EXEC_ALLOW_ROOTS}\""
+} >> "$BASHRC"
 
 # 3. Install the package plus dev tooling (ruff, mypy, PyYAML, typing_extensions)
 #    in editable mode. Ubuntu 24.04's system interpreter is PEP 668 managed;
