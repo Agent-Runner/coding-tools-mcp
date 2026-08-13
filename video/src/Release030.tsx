@@ -103,8 +103,8 @@ const COPY = {
     patchesSub: "A retryable conflict — not a silent overwrite.",
     clientA: "Client A",
     clientB: "Client B",
-    patchOk: "apply_patch  ✓  committed",
-    patchConflict: "apply_patch  ⚠  conflict · retryable",
+    patchOk: "✓  committed",
+    patchConflict: "⚠  conflict · retryable",
     patchNote: "apply_patch also keeps the line endings it was not asked to touch.",
     errorsTitle: "Errors the model can actually see.",
     errorLine1: "PATH_NOT_FOUND  ·  retryable: false  ·  category: path",
@@ -148,8 +148,8 @@ const COPY = {
     patchesSub: "后来者拿到可重试冲突，而不是静默覆盖。",
     clientA: "客户端 A",
     clientB: "客户端 B",
-    patchOk: "apply_patch  ✓  已提交",
-    patchConflict: "apply_patch  ⚠  冲突 · 可重试",
+    patchOk: "✓  已提交",
+    patchConflict: "⚠  冲突 · 可重试",
     patchNote: "apply_patch 也不再改写它没被要求动的行结束符。",
     errorsTitle: "模型终于看得见错误。",
     errorLine1: "PATH_NOT_FOUND  ·  retryable: false  ·  category: path",
@@ -270,7 +270,7 @@ const FadeUp: React.FC<{
     <div
       style={{
         opacity: progress,
-        transform: `translateY(${interpolate(progress, [0, 1], [36, 0])}px)`,
+        transform: `translateY(${interpolate(progress, [0, 1], [18, 0])}px)`,
         ...style,
       }}
     >
@@ -387,7 +387,7 @@ const ProtocolScene: React.FC<{ locale: Locale }> = ({ locale }) => {
         style={{
           justifyContent: "center",
           alignItems: "center",
-          gap: 48,
+          gap: 36,
           fontFamily: fontStack(locale, false),
         }}
       >
@@ -445,21 +445,26 @@ const ProtocolScene: React.FC<{ locale: Locale }> = ({ locale }) => {
           })}
         </div>
         <FadeUp delay={90}>
-          <div style={{ fontSize: 40, color: TEXT }}>{t.protocolSub}</div>
-        </FadeUp>
-        <FadeUp delay={110}>
           <div
             style={{
-              fontSize: 32,
-              color: CYAN,
-              fontFamily: fontStack(locale, true),
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: 18,
             }}
           >
-            {t.protocolFlow}
+            <div style={{ fontSize: 40, color: TEXT }}>{t.protocolSub}</div>
+            <div
+              style={{
+                fontSize: 32,
+                color: CYAN,
+                fontFamily: fontStack(locale, true),
+              }}
+            >
+              {t.protocolFlow}
+            </div>
+            <div style={{ fontSize: 28, color: DIM }}>{t.protocolNote}</div>
           </div>
-        </FadeUp>
-        <FadeUp delay={130}>
-          <div style={{ fontSize: 28, color: DIM }}>{t.protocolNote}</div>
         </FadeUp>
       </AbsoluteFill>
     </SceneFade>
@@ -503,7 +508,14 @@ const StatelessScene: React.FC<{ locale: Locale }> = ({ locale }) => {
               padding: "22px 48px",
             }}
           >
-            <span style={{ position: "relative", display: "inline-block" }}>
+            <span
+              style={{
+                position: "relative",
+                display: "inline-block",
+                overflow: "hidden",
+                padding: "4px 0",
+              }}
+            >
               {t.statelessStrike}: 8e2c…f91
               <span
                 style={{
@@ -513,7 +525,7 @@ const StatelessScene: React.FC<{ locale: Locale }> = ({ locale }) => {
                   height: 6,
                   width: `${strike * 100}%`,
                   background: RED,
-                  transform: "rotate(-5deg)",
+                  transform: "rotate(-3deg)",
                   transformOrigin: "left center",
                   boxShadow: "0 0 12px rgba(248,113,113,0.6)",
                 }}
@@ -602,7 +614,14 @@ const CommandsScene: React.FC<{ locale: Locale }> = ({ locale }) => {
             </div>
           ))}
         </Panel>
-        <div style={{ display: "flex", gap: 48 }}>
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            gap: 12,
+          }}
+        >
           <FadeUp delay={108}>
             <div
               style={{
@@ -653,12 +672,12 @@ const PatchesScene: React.FC<{ locale: Locale }> = ({ locale }) => {
         </FadeUp>
         <div style={{ display: "flex", gap: 36, alignItems: "center" }}>
           <FadeUp delay={40}>
-            <Panel accent={GREEN} style={{ width: 520, height: 280 }}>
+            <Panel accent={GREEN} style={{ width: 520, minHeight: 260 }}>
               <div
                 style={{
                   fontSize: 28,
                   color: GREEN,
-                  marginBottom: 22,
+                  marginBottom: 18,
                   fontFamily: fontStack(locale, true),
                 }}
               >
@@ -666,10 +685,20 @@ const PatchesScene: React.FC<{ locale: Locale }> = ({ locale }) => {
               </div>
               <div
                 style={{
-                  fontSize: 32,
+                  fontSize: 26,
+                  color: DIM,
+                  fontFamily: fontStack(locale, true),
+                  marginBottom: 12,
+                }}
+              >
+                apply_patch
+              </div>
+              <div
+                style={{
+                  fontSize: 34,
                   color: TEXT,
                   fontFamily: fontStack(locale, true),
-                  lineHeight: 1.6,
+                  lineHeight: 1.5,
                 }}
               >
                 {t.patchOk}
@@ -700,12 +729,12 @@ const PatchesScene: React.FC<{ locale: Locale }> = ({ locale }) => {
             </div>
           </FadeUp>
           <FadeUp delay={100}>
-            <Panel accent={AMBER} style={{ width: 520, height: 280 }}>
+            <Panel accent={AMBER} style={{ width: 520, minHeight: 260 }}>
               <div
                 style={{
                   fontSize: 28,
                   color: AMBER,
-                  marginBottom: 22,
+                  marginBottom: 18,
                   fontFamily: fontStack(locale, true),
                 }}
               >
@@ -713,10 +742,20 @@ const PatchesScene: React.FC<{ locale: Locale }> = ({ locale }) => {
               </div>
               <div
                 style={{
-                  fontSize: 32,
+                  fontSize: 26,
+                  color: DIM,
+                  fontFamily: fontStack(locale, true),
+                  marginBottom: 12,
+                }}
+              >
+                apply_patch
+              </div>
+              <div
+                style={{
+                  fontSize: 34,
                   color: TEXT,
                   fontFamily: fontStack(locale, true),
-                  lineHeight: 1.6,
+                  lineHeight: 1.5,
                 }}
               >
                 {t.patchConflict}
