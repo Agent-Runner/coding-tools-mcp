@@ -4,7 +4,9 @@
   "description": "Remotion source for the promo video. Render: npm install && npm run render",
   "scripts": {
     "studio": "remotion studio src/index.ts",
-    "render": "remotion render src/index.ts Promo out/coding-tools-mcp-promo.mp4"
+    "render": "remotion render src/index.ts Promo out/coding-tools-mcp-promo.mp4",
+    "render:030": "remotion render src/index.ts Release030 out/coding-tools-mcp-0.3.0.mp4",
+    "render:030zh": "remotion render src/index.ts Release030Zh out/coding-tools-mcp-0.3.0-zh.mp4"
   },
   "dependencies": {
     "@remotion/cli": "^4.0.499",
