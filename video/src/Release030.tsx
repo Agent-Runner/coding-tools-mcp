@@ -347,8 +347,11 @@ const TitleScene: React.FC<{ locale: Locale }> = ({ locale }) => {
             fontSize: 188,
             fontWeight: 800,
             color: TEXT,
-            letterSpacing: -6,
-            fontFamily: fontStack(locale, true),
+            letterSpacing: 4,
+            fontFamily:
+              locale === "zh"
+                ? ZH_SANS
+                : "ui-sans-serif, system-ui, -apple-system, sans-serif",
             transform: `scale(${interpolate(stamp, [0, 1], [0.72, 1])})`,
             textShadow: "0 0 80px rgba(74,222,128,0.28)",
           }}
@@ -488,7 +491,9 @@ const StatelessScene: React.FC<{ locale: Locale }> = ({ locale }) => {
         <FadeUp delay={24}>
           <div
             style={{
-              position: "relative",
+              display: "flex",
+              alignItems: "center",
+              gap: 28,
               fontSize: 52,
               fontFamily: fontStack(locale, true),
               color: TEXT,
@@ -498,23 +503,24 @@ const StatelessScene: React.FC<{ locale: Locale }> = ({ locale }) => {
               padding: "22px 48px",
             }}
           >
-            {t.statelessStrike}: 8e2c…f91
-            <div
-              style={{
-                position: "absolute",
-                left: 28,
-                top: "50%",
-                height: 6,
-                width: `calc(${strike * 100}% - 56px)`,
-                background: RED,
-                transform: "rotate(-4deg)",
-                transformOrigin: "left center",
-                boxShadow: "0 0 12px rgba(248,113,113,0.6)",
-              }}
-            />
+            <span style={{ position: "relative", display: "inline-block" }}>
+              {t.statelessStrike}: 8e2c…f91
+              <span
+                style={{
+                  position: "absolute",
+                  left: 0,
+                  top: "48%",
+                  height: 6,
+                  width: `${strike * 100}%`,
+                  background: RED,
+                  transform: "rotate(-5deg)",
+                  transformOrigin: "left center",
+                  boxShadow: "0 0 12px rgba(248,113,113,0.6)",
+                }}
+              />
+            </span>
             <span
               style={{
-                marginLeft: 28,
                 color: RED,
                 fontSize: 32,
                 opacity: strike,
@@ -535,7 +541,7 @@ const StatelessScene: React.FC<{ locale: Locale }> = ({ locale }) => {
             </FadeUp>
           ))}
         </div>
-        <FadeUp delay={130}>
+        <FadeUp delay={96}>
           <div style={{ fontSize: 34, color: GREEN }}>{t.statelessFooter}</div>
         </FadeUp>
       </AbsoluteFill>
@@ -596,8 +602,8 @@ const CommandsScene: React.FC<{ locale: Locale }> = ({ locale }) => {
             </div>
           ))}
         </Panel>
-        <div style={{ display: "flex", gap: 40 }}>
-          <FadeUp delay={150}>
+        <div style={{ display: "flex", gap: 48 }}>
+          <FadeUp delay={108}>
             <div
               style={{
                 fontSize: 30,
@@ -608,7 +614,7 @@ const CommandsScene: React.FC<{ locale: Locale }> = ({ locale }) => {
               {t.cmdRename1}
             </div>
           </FadeUp>
-          <FadeUp delay={165}>
+          <FadeUp delay={122}>
             <div
               style={{
                 fontSize: 30,
