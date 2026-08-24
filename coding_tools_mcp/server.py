@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -200,6 +201,12 @@ MAX_ACTIVE_COMMANDS = 16
 MAX_RETAINED_OUTPUT_COMMANDS = 32
 COMPLETED_COMMAND_TTL_SECONDS = 300
 MAX_RUNTIME_OUTPUT_BYTES = 16 * 1024 * 1024
+# A mutating call may be retried because its response was lost, not because it
+# failed. Tools in this set accept an idempotency_key and replay the recorded
+# result for a repeat of the same key instead of applying the work twice.
+IDEMPOTENT_TOOLS = frozenset({"apply_patch", "apply_changes"})
+IDEMPOTENCY_CACHE_ENTRIES = 64
+IDEMPOTENCY_KEY_MAX_LENGTH = 128
 _COMMAND_RECOVERY_HINT = (
     "This command_id has expired or never existed; a finished command keeps its"
     f" output for {COMPLETED_COMMAND_TTL_SECONDS} seconds and only the last"
@@ -635,7 +642,14 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     "apply_patch": ToolSpec(
         title="Apply patch",
         description=(
-            "Stage, validate, and atomically apply a patch envelope. Example: "
+            "Stage, validate, and atomically apply a V4A patch envelope. Each hunk locates itself by "
+            "its context, so the context must be unique in the file; when it is not, add a scope header "
+            "(@@ def my_function) naming the enclosing block, or add '*** End of File' to anchor the hunk "
+            "at the end. A blank context line may be written as \"\" or as a single space. Matching is "
+            "graded exact, then ignoring trailing whitespace, then ignoring indentation width, and the "
+            "grade actually used comes back as match_quality. Success returns each file's revision, "
+            "total_lines, and changed_ranges. Several updates to one path in one envelope chain in order. "
+            "Full format reference: docs/tools-and-schemas.md. Example: "
             "*** Begin Patch\n*** Update File: app.py\n@@\n-old\n+new\n*** End Patch"
         ),
         destructive=True,
@@ -1364,6 +1378,8 @@ class Runtime:
         self.patch_baselines: dict[str, str | None] = {}
         self.patch_lock = threading.Lock()
         self.patch_committer = AtomicPatchCommitter()
+        self._idempotency_results: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+        self._idempotency_lock = threading.Lock()
         # ProjectContext is frozen and derived only from the workspace tree, so
         # an embedder that builds several runtimes over one workspace can reuse
         # the discovery (git ls-files / directory walk) result.
@@ -1641,9 +1657,16 @@ class Runtime:
             raise JsonRpcError(-32602, f"Unknown tool: {name}", {"reason": "unknown_tool"})
         spec = TOOL_REGISTRY[name]
         validate_arguments(name, args)
+        idempotency_key = self._idempotency_slot(name, args)
+        replayed = self._recorded_result(idempotency_key)
+        if replayed is not None:
+            self.emit_tool_trace(name, args, replayed, started_at, context=context)
+            content = spec.content_builder(dict(replayed)) if spec.content_builder else None
+            return make_tool_result(name, replayed, is_error=replayed.get("ok") is False, content=content)
         try:
             payload = handler(args)
             payload.setdefault("ok", True)
+            self._record_result(idempotency_key, payload)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             content = spec.content_builder(payload) if spec.content_builder else None
             return make_tool_result(name, payload, is_error=payload.get("ok") is False, content=content)
@@ -1690,6 +1713,40 @@ class Runtime:
                 payload["status"] = spec.error_status
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
+
+    def _idempotency_slot(self, name: str, args: dict[str, Any]) -> tuple[str, str] | None:
+        if name not in IDEMPOTENT_TOOLS:
+            return None
+        raw = args.get("idempotency_key")
+        return (name, raw) if isinstance(raw, str) and raw else None
+
+    def _recorded_result(self, slot: tuple[str, str] | None) -> dict[str, Any] | None:
+        """Return the result a previous call under this key produced, if any.
+
+        Only successes are recorded. A failure carries its own retryability,
+        and replaying one would turn a transient conflict into a permanent
+        answer for as long as the key is reused.
+        """
+
+        if slot is None:
+            return None
+        with self._idempotency_lock:
+            recorded = self._idempotency_results.get(slot)
+            if recorded is None:
+                return None
+            self._idempotency_results.move_to_end(slot)
+        replay = dict(recorded)
+        replay["idempotent_replay"] = True
+        return replay
+
+    def _record_result(self, slot: tuple[str, str] | None, payload: dict[str, Any]) -> None:
+        if slot is None or payload.get("ok") is False:
+            return
+        with self._idempotency_lock:
+            self._idempotency_results[slot] = dict(payload)
+            self._idempotency_results.move_to_end(slot)
+            while len(self._idempotency_results) > IDEMPOTENCY_CACHE_ENTRIES:
+                self._idempotency_results.popitem(last=False)
 
     def server_info(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.server_info_payload()
@@ -4549,6 +4606,9 @@ def validate_schema_value(value: Any, schema: dict[str, Any], *, path: str) -> N
         min_length = schema.get("minLength")
         if isinstance(min_length, int) and len(value) < min_length:
             raise ToolFailure("INVALID_ARGUMENT", f"{path} is shorter than {min_length}.", category="validation")
+        max_length = schema.get("maxLength")
+        if isinstance(max_length, int) and len(value) > max_length:
+            raise ToolFailure("INVALID_ARGUMENT", f"{path} is longer than {max_length}.", category="validation")
         if "enum" in schema and value not in schema["enum"]:
             raise ToolFailure("INVALID_ARGUMENT", f"{path} must be one of {schema['enum']!r}.", category="validation")
 
@@ -4709,7 +4769,14 @@ def input_schemas() -> dict[str, dict[str, Any]]:
             },
             ["query"],
         ),
-        "apply_patch": object_schema({"patch": {**string, "minLength": 1}, "dry_run": {**boolean, "default": False}}, ["patch"]),
+        "apply_patch": object_schema(
+            {
+                "patch": {**string, "minLength": 1},
+                "dry_run": {**boolean, "default": False},
+                "idempotency_key": {**string, "minLength": 1, "maxLength": IDEMPOTENCY_KEY_MAX_LENGTH},
+            },
+            ["patch"],
+        ),
         "exec_command": object_schema(
             {
                 "cmd": {**string, "minLength": 1},

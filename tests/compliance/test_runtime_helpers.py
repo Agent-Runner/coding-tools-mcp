@@ -1900,6 +1900,39 @@ class PatchEvidenceAndIdempotencyTests(unittest.TestCase):
             )
             self.assertEqual(payload["revision_algorithm"], "sha256")
 
+    def test_idempotency_key_replays_the_recorded_result(self) -> None:
+        patch_text = "*** Begin Patch\n*** Add File: new.txt\n+alpha\n*** End Patch\n"
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime = Runtime(workspace, permission_mode="safe")
+            try:
+                first = runtime.call_tool("apply_patch", {"patch": patch_text, "idempotency_key": "k1"})
+                self.assertFalse(first["isError"])
+                self.assertNotIn("idempotent_replay", first["structuredContent"])
+                # The add would fail on its own ("file already exists"); under
+                # the same key the runtime answers with what it recorded.
+                second = runtime.call_tool("apply_patch", {"patch": patch_text, "idempotency_key": "k1"})
+                self.assertFalse(second["isError"])
+                self.assertIs(second["structuredContent"]["idempotent_replay"], True)
+                unkeyed = runtime.call_tool("apply_patch", {"patch": patch_text})
+                self.assertTrue(unkeyed["isError"])
+            finally:
+                runtime.close()
+
+    def test_a_failure_is_never_recorded_under_an_idempotency_key(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime = Runtime(workspace, permission_mode="safe")
+            try:
+                broken = "*** Begin Patch\n*** Update File: absent.txt\n@@\n-a\n+b\n*** End Patch\n"
+                self.assertTrue(runtime.call_tool("apply_patch", {"patch": broken, "idempotency_key": "k2"})["isError"])
+                (workspace / "absent.txt").write_text("a\n", encoding="utf-8")
+                retried = runtime.call_tool("apply_patch", {"patch": broken, "idempotency_key": "k2"})
+                self.assertFalse(retried["isError"])
+                self.assertEqual((workspace / "absent.txt").read_text(encoding="utf-8"), "b\n")
+            finally:
+                runtime.close()
+
     def test_not_found_failures_carry_numbered_repair_text(self) -> None:
         with self.assertRaises(ToolFailure) as raised:
             apply_update_hunks_detailed("alpha\nbeta\ngamma\n", [["-bета", "+delta"]])
