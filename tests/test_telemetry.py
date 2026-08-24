@@ -616,7 +616,7 @@ class OperationOutcomeTests(unittest.TestCase):
         with scrubbed_env(CODING_TOOLS_MCP_TELEMETRY="on"), patch.object(
             telemetry, "_get_sender", return_value=sender
         ), tempfile.TemporaryDirectory() as tmp:
-            runtime = Runtime(Path(tmp), permission_mode="safe")
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
             try:
                 runtime.telemetry.record_request(LEGACY_PROTOCOL_VERSION, "tools/call")
                 command = (
