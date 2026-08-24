@@ -51,6 +51,15 @@ from .oauth import (
     verify_pkce,
 )
 from .breaker import RepeatFailureBreaker, argument_fingerprint
+from .changes import (
+    CHANGE_ACTIONS,
+    EDIT_OPERATIONS,
+    MAX_CHANGES_PER_CALL,
+    MAX_EDITS_PER_CHANGE,
+    ChangeRequest,
+    apply_line_edits,
+    parse_changes,
+)
 from .patching import (
     REVISION_ALGORITHM,
     AtomicPatchCommitter,
@@ -613,6 +622,13 @@ def _patch_evidence(
     return evidence
 
 
+def _whole_file_range(text: str) -> list[dict[str, int]]:
+    """The changed range for a file written in full."""
+
+    lines = _count_lines(text)
+    return [{"start_line": 1, "end_line": lines, "added_lines": lines, "removed_lines": 0}]
+
+
 def _image_content(payload: dict[str, Any]) -> list[dict[str, Any]]:
     encoded = str(payload.pop("_mcp_image_data", ""))
     return [
@@ -673,6 +689,22 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
             "total_lines, and changed_ranges. Several updates to one path in one envelope chain in order. "
             "Full format reference: docs/tools-and-schemas.md. Example: "
             "*** Begin Patch\n*** Update File: app.py\n@@\n-old\n+new\n*** End Patch"
+        ),
+        destructive=True,
+    ),
+    "apply_changes": ToolSpec(
+        title="Apply changes",
+        description=(
+            "Apply line-addressed file changes atomically. Prefer this over apply_patch when you know "
+            "the line numbers: nothing has to match. Each change names an action (create, write, edit, "
+            "delete, move, copy), a path, and — for every action except create — the revision read_file "
+            "reported for that file, which is refused if the file has changed since. edit takes line "
+            "operations (replace, delete, insert_after, insert_before) whose numbers all refer to the "
+            "file as read, not to the result of earlier edits in the same call. content is whole lines: "
+            "\"\" is zero lines and a trailing newline adds a blank line. One path per call; use "
+            "apply_patch to chain several edits onto one file. Example: {\"changes\":[{\"action\":\"edit\","
+            "\"path\":\"app.py\",\"revision\":\"<from read_file>\",\"edits\":[{\"op\":\"replace\","
+            "\"start_line\":10,\"end_line\":12,\"content\":\"new line\"}]}]}"
         ),
         destructive=True,
     ),
@@ -2458,20 +2490,11 @@ class Runtime:
                         None,
                     )
                     added_text = op.add_content or ""
-                    added_lines = _count_lines(added_text)
-                    whole_file = [
-                        {
-                            "start_line": 1,
-                            "end_line": added_lines,
-                            "added_lines": added_lines,
-                            "removed_lines": 0,
-                        }
-                    ]
                     affected.append(
                         {
                             "path": target.display,
                             "operation": "add",
-                            **_patch_evidence(added_text, whole_file),
+                            **_patch_evidence(added_text, _whole_file_range(added_text)),
                         }
                     )
                     summaries.append(f"A {target.display}")
@@ -2574,6 +2597,229 @@ class Runtime:
             "removals": removals,
             "warnings": warnings,
         }
+
+    def apply_changes(self, args: dict[str, Any]) -> dict[str, Any]:
+        dry_run = bool(args.get("dry_run", False))
+        changes = parse_changes(args.get("changes"))
+        staged: dict[str, StagedFile] = {}
+        summaries: list[str] = []
+        affected: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        additions = 0
+        removals = 0
+        unchanged_files = 0
+        with self.patch_lock:
+            # Every path in the array is resolved before anything is staged, so
+            # a rejected path in the last change cannot leave the earlier ones
+            # half prepared.
+            for change in changes:
+                self._validate_change_paths(change)
+            for change in changes:
+                if change.action in {"create", "write"}:
+                    result = self._stage_written_file(change, staged)
+                elif change.action == "edit":
+                    result = self._stage_edited_file(change, staged)
+                elif change.action == "delete":
+                    result = self._stage_deleted_file(change, staged)
+                else:
+                    result = self._stage_relocated_file(change, staged)
+                entry, summary, added, removed = result
+                affected.append(entry)
+                summaries.append(summary)
+                additions += added
+                removals += removed
+                unchanged_files += entry["operation"] == "unchanged"
+            if not affected:
+                raise ToolFailure("PATCH_FAILED", "No files were modified.", category="validation")
+            if not dry_run:
+                self._commit_staged_files(list(staged.values()))
+        return {
+            "dry_run": dry_run,
+            "clean": True,
+            "already_applied": unchanged_files == len(changes),
+            "revision_algorithm": REVISION_ALGORITHM,
+            "summary": "\n".join(summaries),
+            "affected_files": affected,
+            "additions": additions,
+            "removals": removals,
+            "warnings": warnings,
+        }
+
+    def _validate_change_paths(self, change: ChangeRequest) -> None:
+        requires_existing = change.action in {"edit", "delete", "move", "copy"}
+        self._validate_patch_path(change.path, require_existing=requires_existing)
+        self.workspace.reject_write_symlink(change.path)
+        if change.destination is not None:
+            self._validate_patch_path(change.destination, require_existing=False)
+            self.workspace.reject_write_symlink(change.destination)
+
+    def _stage_written_file(
+        self, change: ChangeRequest, staged: dict[str, StagedFile]
+    ) -> tuple[dict[str, Any], str, int, int]:
+        target = self.workspace.resolve_for_write(change.path)
+        content = change.content or ""
+        if change.action == "create" and target.existed:
+            raise ToolFailure(
+                "PATCH_FAILED",
+                f"Cannot create {target.display}: it already exists. Use action \"write\" to replace it.",
+                category="validation",
+            )
+        baseline = FileBaseline.capture(target.path)
+        if target.existed:
+            current = baseline.text(target.display)
+            self._check_revision(change, target.display, current)
+        else:
+            current = None
+            if change.revision is not None:
+                raise ToolFailure(
+                    "REVISION_MISMATCH",
+                    f"{target.display} does not exist, so it has no revision to match.",
+                    category="conflict",
+                    retryable=True,
+                    details={"path": target.display, "expected_revision": change.revision, "exists": False},
+                )
+        unchanged = current == content
+        staged[target.display] = StagedFile(
+            target.display,
+            target.path,
+            content,
+            baseline,
+            baseline.mode,
+            action="verify" if unchanged else "write",
+        )
+        operation = "unchanged" if unchanged else ("create" if current is None else "write")
+        ranges: list[dict[str, int]] = [] if unchanged else _whole_file_range(content)
+        entry = {"path": target.display, "operation": operation, **_patch_evidence(content, ranges)}
+        marker = {"unchanged": "=", "create": "A"}.get(operation, "M")
+        return entry, f"{marker} {target.display}", 0 if unchanged else _count_lines(content), (
+            0 if current is None else _count_lines(current)
+        )
+
+    def _stage_edited_file(
+        self, change: ChangeRequest, staged: dict[str, StagedFile]
+    ) -> tuple[dict[str, Any], str, int, int]:
+        source = self.workspace.resolve_existing(change.path)
+        if source.path.is_dir():
+            raise ToolFailure("PATCH_FAILED", "Cannot edit a directory.", category="validation")
+        baseline = FileBaseline.capture(source.path)
+        current = baseline.text(source.display)
+        self._check_revision(change, source.display, current)
+        outcome = apply_line_edits(current, change.edits, source.display)
+        unchanged = outcome.content == current
+        staged[source.display] = StagedFile(
+            source.display,
+            source.path,
+            current if unchanged else outcome.content,
+            baseline,
+            baseline.mode,
+            action="verify" if unchanged else "write",
+        )
+        added = sum(len(edit.lines) for edit in change.edits)
+        removed = sum(edit.end - edit.start for edit in change.edits)
+        entry = {
+            "path": source.display,
+            "operation": "unchanged" if unchanged else "edit",
+            **_patch_evidence(outcome.content, outcome.changed_ranges),
+        }
+        return entry, f"{'=' if unchanged else 'M'} {source.display}", added, removed
+
+    def _stage_deleted_file(
+        self, change: ChangeRequest, staged: dict[str, StagedFile]
+    ) -> tuple[dict[str, Any], str, int, int]:
+        target = self.workspace.resolve_existing(change.path)
+        if target.path.is_dir():
+            raise ToolFailure("PATCH_FAILED", "Cannot delete a directory.", category="validation")
+        baseline = FileBaseline.capture(target.path)
+        self._check_revision(change, target.display, baseline.text(target.display))
+        staged[target.display] = StagedFile(
+            target.display, target.path, None, baseline, baseline.mode, action="delete"
+        )
+        entry = {"path": target.display, "operation": "delete", "total_lines": 0, "changed_ranges": []}
+        return entry, f"D {target.display}", 0, len((baseline.data or b"").splitlines())
+
+    def _stage_relocated_file(
+        self, change: ChangeRequest, staged: dict[str, StagedFile]
+    ) -> tuple[dict[str, Any], str, int, int]:
+        source = self.workspace.resolve_existing(change.path)
+        if source.path.is_dir():
+            raise ToolFailure("PATCH_FAILED", f"Cannot {change.action} a directory.", category="validation")
+        destination = str(change.destination)
+        dest = self.workspace.resolve_for_write(destination)
+        if dest.existed:
+            raise ToolFailure(
+                "PATCH_FAILED",
+                f"Cannot {change.action} onto {dest.display}: it already exists.",
+                category="validation",
+            )
+        baseline = FileBaseline.capture(source.path)
+        content = baseline.text(source.display)
+        self._check_revision(change, source.display, content)
+        # A copy must still fail if its source changed underneath us, so the
+        # source is staged as a baseline assertion that writes nothing.
+        staged[source.display] = StagedFile(
+            source.display,
+            source.path,
+            None if change.action == "move" else content,
+            baseline,
+            baseline.mode,
+            action="delete" if change.action == "move" else "verify",
+        )
+        staged[dest.display] = StagedFile(
+            dest.display,
+            dest.path,
+            content,
+            FileBaseline.capture(dest.path),
+            baseline.mode,
+            action="write",
+        )
+        entry = {
+            "path": dest.display,
+            "old_path": source.display,
+            "operation": change.action,
+            **_patch_evidence(content, _whole_file_range(content)),
+        }
+        marker = "R" if change.action == "move" else "C"
+        return entry, f"{marker} {source.display} -> {dest.display}", _count_lines(content), 0
+
+    def _check_revision(self, change: ChangeRequest, display: str, current: str) -> None:
+        """Refuse to write over bytes the caller has not seen.
+
+        The revision is the whole point of the tool: line numbers are only
+        meaningful against a known file version, and a stale request that
+        still parses is exactly the failure this refuses to commit.
+        """
+
+        actual = content_revision(current)
+        if change.revision is None:
+            raise ToolFailure(
+                "REVISION_REQUIRED",
+                f"changes[{change.index}] must carry the revision of {display}. "
+                f"Read the file first; its current revision is {actual}.",
+                category="validation",
+                retryable=True,
+                details={
+                    "path": display,
+                    "current_revision": actual,
+                    "revision_algorithm": REVISION_ALGORITHM,
+                    "next_action": {"tool": "read_file", "arguments": {"path": display}},
+                },
+            )
+        if change.revision != actual:
+            raise ToolFailure(
+                "REVISION_MISMATCH",
+                f"{display} changed since revision {change.revision}; it is now {actual}. "
+                "Re-read the file and rebuild the change against its current line numbers.",
+                category="conflict",
+                retryable=True,
+                details={
+                    "path": display,
+                    "expected_revision": change.revision,
+                    "current_revision": actual,
+                    "revision_algorithm": REVISION_ALGORITHM,
+                    "total_lines": _count_lines(current),
+                    "next_action": {"tool": "read_file", "arguments": {"path": display}},
+                },
+            )
 
     def _validate_patch_path(self, raw_path: str, *, require_existing: bool) -> None:
         if require_existing:
@@ -4962,10 +5208,17 @@ def validate_schema_value(value: Any, schema: dict[str, Any], *, path: str) -> N
         if isinstance(maximum, (int, float)) and value > maximum:
             raise ToolFailure("INVALID_ARGUMENT", f"{path} must be <= {maximum}.", category="validation")
 
-    if isinstance(value, list) and isinstance(schema.get("items"), dict):
-        item_schema = schema["items"]
-        for index, item in enumerate(value):
-            validate_schema_value(item, item_schema, path=f"{path}[{index}]")
+    if isinstance(value, list):
+        min_items = schema.get("minItems")
+        if isinstance(min_items, int) and len(value) < min_items:
+            raise ToolFailure("INVALID_ARGUMENT", f"{path} needs at least {min_items} items.", category="validation")
+        max_items = schema.get("maxItems")
+        if isinstance(max_items, int) and len(value) > max_items:
+            raise ToolFailure("INVALID_ARGUMENT", f"{path} holds more than {max_items} items.", category="validation")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                validate_schema_value(item, item_schema, path=f"{path}[{index}]")
 
     if isinstance(value, dict):
         properties = schema.get("properties", {})
@@ -5118,6 +5371,105 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "idempotency_key": {**string, "minLength": 1, "maxLength": IDEMPOTENCY_KEY_MAX_LENGTH},
             },
             ["patch"],
+        ),
+        "apply_changes": object_schema(
+            {
+                "changes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_CHANGES_PER_CALL,
+                    "description": (
+                        "One entry per file. A path may appear once per call; use apply_patch to chain "
+                        "several edits onto one file. The whole request must fit in 1 MiB, so keep it to "
+                        "roughly 20 files per call."
+                    ),
+                    "items": object_schema(
+                        {
+                            "action": {
+                                **string,
+                                "enum": list(CHANGE_ACTIONS),
+                                "description": (
+                                    "create writes a file that must not exist; write upserts one; edit "
+                                    "applies line operations; delete removes; move and copy need a "
+                                    "destination that must not exist."
+                                ),
+                            },
+                            "path": {**string, "minLength": 1},
+                            "revision": {
+                                **string,
+                                "minLength": 1,
+                                "description": (
+                                    "The revision read_file reported for this path. Required for write, "
+                                    "edit, delete, move, and copy; rejected for create. A file that "
+                                    "changed since is refused with REVISION_MISMATCH."
+                                ),
+                            },
+                            "content": {
+                                **string,
+                                "description": "Full file text for create and write.",
+                            },
+                            "destination": {
+                                **string,
+                                "minLength": 1,
+                                "description": "Target path for move and copy; must not already exist.",
+                            },
+                            "edits": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": MAX_EDITS_PER_CHANGE,
+                                "description": (
+                                    "Line operations for action=edit. Every line number refers to the "
+                                    "file as read_file reported it, never to the result of another edit "
+                                    "in the same call, and no two edits may address the same lines."
+                                ),
+                                "items": object_schema(
+                                    {
+                                        "op": {**string, "enum": list(EDIT_OPERATIONS)},
+                                        "start_line": {
+                                            **integer,
+                                            "minimum": 1,
+                                            "description": (
+                                                "First line of the range for replace and delete, "
+                                                "1-based and inclusive."
+                                            ),
+                                        },
+                                        "end_line": {
+                                            **integer,
+                                            "minimum": 1,
+                                            "description": (
+                                                "Last line of the range for replace and delete, "
+                                                "inclusive; defaults to start_line."
+                                            ),
+                                        },
+                                        "line": {
+                                            **integer,
+                                            "minimum": 0,
+                                            "description": (
+                                                "Anchor for insert_after (0 to total_lines, where 0 "
+                                                "inserts at the beginning) or insert_before (1 to "
+                                                "total_lines + 1, where total_lines + 1 appends)."
+                                            ),
+                                        },
+                                        "content": {
+                                            **string,
+                                            "description": (
+                                                "Whole lines to write. \"\" is zero lines, which makes "
+                                                "replace with empty content a deletion; a trailing "
+                                                "newline adds a blank line. Not accepted for op=delete."
+                                            ),
+                                        },
+                                    },
+                                    ["op"],
+                                ),
+                            },
+                        },
+                        ["action", "path"],
+                    ),
+                },
+                "dry_run": {**boolean, "default": False},
+                "idempotency_key": {**string, "minLength": 1, "maxLength": IDEMPOTENCY_KEY_MAX_LENGTH},
+            },
+            ["changes"],
         ),
         "exec_command": object_schema(
             {

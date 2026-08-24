@@ -516,7 +516,7 @@ def apply_update_hunks_detailed(content: str, hunks: HunkInput, path: str = "<pa
         )
     return UpdateOutcome(
         content=bom + restore_line_endings(updated, line_ending),
-        changed_ranges=_changed_ranges(matched),
+        changed_ranges=changed_ranges(matched),
         match_quality=quality,
         warnings=warnings,
         already_applied_hunks=already_applied,
@@ -524,7 +524,7 @@ def apply_update_hunks_detailed(content: str, hunks: HunkInput, path: str = "<pa
     )
 
 
-def _changed_ranges(matched: list[MatchedHunk]) -> list[dict[str, int]]:
+def changed_ranges(matched: list[MatchedHunk]) -> list[dict[str, int]]:
     """Map each placement onto 1-based line numbers in the *new* file.
 
     Context lines a hunk carried only to locate itself are trimmed off both

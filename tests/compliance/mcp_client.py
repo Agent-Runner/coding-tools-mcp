@@ -30,6 +30,7 @@ REQUIRED_TOOLS = (
     "list_files",
     "search_text",
     "apply_patch",
+    "apply_changes",
     "exec_command",
     "write_stdin",
     "kill_command",

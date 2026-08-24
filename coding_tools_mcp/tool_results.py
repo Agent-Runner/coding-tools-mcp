@@ -175,10 +175,14 @@ def _render_search(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _render_patch(payload: dict[str, Any]) -> str:
-    prefix = "Patch validated" if payload.get("dry_run") else "Patch applied"
+def _render_changes(payload: dict[str, Any]) -> str:
+    return _render_patch(payload, noun="Changes")
+
+
+def _render_patch(payload: dict[str, Any], *, noun: str = "Patch") -> str:
+    prefix = f"{noun} validated" if payload.get("dry_run") else f"{noun} applied"
     if payload.get("already_applied"):
-        prefix = "Patch already applied"
+        prefix = f"{noun} already applied"
     files = payload.get("affected_files")
     count = len(files) if isinstance(files, list) else 0
     changes = f" (+{payload.get('additions', 0)} -{payload.get('removals', 0)})"
@@ -449,6 +453,7 @@ _RENDERERS = {
     "list_files": _render_list,
     "search_text": _render_search,
     "apply_patch": _render_patch,
+    "apply_changes": _render_changes,
     "exec_command": _render_exec,
     "write_stdin": _render_exec,
     "kill_command": _render_kill,
