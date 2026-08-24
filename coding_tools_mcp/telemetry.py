@@ -469,6 +469,29 @@ class SessionTelemetry:
                 ]
             )
 
+    def record_deferred_operation_outcome(self, tool: str, outcome: str) -> None:
+        """Attach a later-observed terminal outcome to its original tool call.
+
+        Background commands can still be running when ``exec_command`` returns,
+        so a polling tool may be the first call to observe the terminal result.
+        The result belongs to the already-recorded ``exec_command`` call; this
+        updates that tool's operation counters without adding another call.
+        """
+
+        operation_failed = outcome in FAILED_OPERATION_OUTCOMES
+        with self._lock:
+            stats = self._tools.get(tool)
+            if stats is None:
+                # The owning call belongs to another runtime/session. Avoid a
+                # summary with a failure but no corresponding call.
+                return
+            label = _label(outcome) or "unknown"
+            stats["outcomes"][label] = stats["outcomes"].get(label, 0) + 1
+            if operation_failed:
+                stats["operation_failures"] += 1
+            else:
+                self._clear_streaks_locked(tool)
+
     def _clear_streaks_locked(self, tool: str) -> None:
         for key in [key for key in self._failure_streaks if key[0] == tool]:
             del self._failure_streaks[key]

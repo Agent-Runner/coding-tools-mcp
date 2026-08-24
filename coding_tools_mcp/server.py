@@ -1571,7 +1571,8 @@ class Runtime:
         self._idempotency_pins: dict[tuple[str, str], int] = {}
         # Command ids whose terminal outcome telemetry has already counted. A
         # finished command answers every later poll with the same outcome, so
-        # without this one failing build is counted once per poll.
+        # without this one failing build is counted once per poll. The outcome
+        # is always assigned to exec_command, which owns the command.
         self._counted_command_outcomes: OrderedDict[str, None] = OrderedDict()
         self._counted_outcomes_lock = threading.Lock()
         # Terminal command results can also invalidate breaker verdicts, but
@@ -2289,7 +2290,7 @@ class Runtime:
         error = raw_error if isinstance(raw_error, dict) else {}
         duration_ms = int((time.time() - started_at) * 1000)
         raw_outcome = payload.get("operation_outcome")
-        outcome = self._countable_outcome(payload)
+        outcome = self._countable_outcome(name, payload)
         # `context` is passed on as the opaque per-request fact it is: the
         # runtime neither reads the client identity in it nor branches on it.
         self.telemetry.record_tool_call(
@@ -2352,15 +2353,16 @@ class Runtime:
                 self._breaker_reset_commands.popitem(last=False)
             self.breaker.reset()
 
-    def _countable_outcome(self, payload: dict[str, Any]) -> str | None:
+    def _countable_outcome(self, observer: str, payload: dict[str, Any]) -> str | None:
         """Return the operation outcome telemetry should count for this call.
 
-        A command's terminal outcome is a fact about the command, not about
-        the call that observed it. Every `write_stdin` poll and every
-        `kill_command` on a finished process reports it again, so it is
-        counted the first time it is seen and skipped afterwards; a build that
-        exits 7 is one failed operation however often it is polled. `running`
-        is not terminal and is never claimed.
+        A terminal outcome belongs to the ``exec_command`` call that started
+        the command, not to whichever polling tool first observed it. Every
+        later observer reports that same outcome again, so the command id is
+        claimed once. When a poll wins the claim, its own successful call is
+        recorded without the command outcome and the outcome is attached to
+        the earlier ``exec_command`` summary. ``running`` remains an
+        observation of the current call and is never claimed.
         """
 
         outcome = payload.get("operation_outcome")
@@ -2377,6 +2379,9 @@ class Runtime:
             self._counted_command_outcomes[command_id] = None
             while len(self._counted_command_outcomes) > COUNTED_OUTCOME_LEDGER_ENTRIES:
                 self._counted_command_outcomes.popitem(last=False)
+        if observer != "exec_command":
+            self.telemetry.record_deferred_operation_outcome("exec_command", outcome)
+            return None
         return outcome
 
     def read_file(self, args: dict[str, Any]) -> dict[str, Any]:

@@ -4,7 +4,9 @@ import contextlib
 import io
 import json
 import os
+import sys
 import tempfile
+import time
 import unittest
 from collections.abc import Iterator
 from pathlib import Path
@@ -606,7 +608,7 @@ class OperationOutcomeTests(unittest.TestCase):
         self.assertEqual(payload["exit_code"], 3)
         self.assertEqual(payload["operation_outcome"], "exited_nonzero")
 
-    def test_polling_a_finished_command_counts_its_failure_once(self) -> None:
+    def test_a_poll_observed_failure_is_attributed_to_exec_command(self) -> None:
         # Every poll of a finished command reports the same terminal outcome.
         # Counting each one turned a single failing build into as many failed
         # operations as the model happened to poll.
@@ -617,11 +619,21 @@ class OperationOutcomeTests(unittest.TestCase):
             runtime = Runtime(Path(tmp), permission_mode="safe")
             try:
                 runtime.telemetry.record_request(LEGACY_PROTOCOL_VERSION, "tools/call")
-                started = runtime.call_tool("exec_command", {"cmd": "exit 7", "timeout_ms": 5000})
+                command = (
+                    f'"{sys.executable}" -c "import sys,time; '
+                    'time.sleep(0.2); sys.exit(7)"'
+                )
+                started = runtime.call_tool(
+                    "exec_command",
+                    {"cmd": command, "yield_time_ms": 1, "timeout_ms": 5000},
+                )
                 command_id = started["structuredContent"]["command_id"]
-                self.assertEqual(started["structuredContent"]["operation_outcome"], "exited_nonzero")
+                self.assertEqual(started["structuredContent"]["operation_outcome"], "running")
                 for _ in range(2):
-                    polled = runtime.call_tool("write_stdin", {"command_id": command_id, "chars": ""})
+                    polled = runtime.call_tool(
+                        "write_stdin",
+                        {"command_id": command_id, "chars": "", "yield_time_ms": 5000},
+                    )
                     # The poll still tells the truth about the command…
                     self.assertEqual(polled["structuredContent"]["operation_outcome"], "exited_nonzero")
             finally:
@@ -637,6 +649,48 @@ class OperationOutcomeTests(unittest.TestCase):
         self.assertNotIn("outcome_exited_nonzero", summaries["write_stdin"])
         self.assertEqual(summaries["write_stdin"]["operation_failures"], 0)
         self.assertEqual(summaries["write_stdin"]["calls"], 2)
+        self.assertEqual(summaries["write_stdin"]["ok"], 2)
+
+    def test_every_terminal_observer_attributes_the_outcome_to_exec_command(self) -> None:
+        for observer in ("write_stdin", "read_output", "kill_command"):
+            with self.subTest(observer=observer), scrubbed_env(
+                CODING_TOOLS_MCP_TELEMETRY="on"
+            ), patch.object(telemetry, "_get_sender", return_value=(sender := _CapturingSender())):
+                with tempfile.TemporaryDirectory() as tmp:
+                    runtime = Runtime(Path(tmp), permission_mode="safe")
+                    runtime.telemetry.record_request(LEGACY_PROTOCOL_VERSION, "tools/call")
+                    started_at = time.time()
+                    runtime.emit_tool_trace(
+                        "exec_command",
+                        {},
+                        {"ok": True, "command_id": "background", "operation_outcome": "running"},
+                        started_at,
+                    )
+                    runtime.emit_tool_trace(
+                        observer,
+                        {},
+                        {
+                            "ok": True,
+                            "command_id": "background",
+                            "operation_outcome": "exited_nonzero",
+                        },
+                        started_at,
+                    )
+                    runtime.close()
+
+                summaries = {
+                    _properties(event)["tool"]: _properties(event)
+                    for event in sender.events
+                    if event["event"] == "tool_summary"
+                }
+                self.assertEqual(summaries["exec_command"]["calls"], 1)
+                self.assertEqual(summaries["exec_command"]["ok"], 0)
+                self.assertEqual(summaries["exec_command"]["operation_failures"], 1)
+                self.assertEqual(summaries["exec_command"]["outcome_exited_nonzero"], 1)
+                self.assertEqual(summaries[observer]["calls"], 1)
+                self.assertEqual(summaries[observer]["ok"], 1)
+                self.assertEqual(summaries[observer]["operation_failures"], 0)
+                self.assertNotIn("outcome_exited_nonzero", summaries[observer])
 
 
 class DocumentationDriftTests(unittest.TestCase):
