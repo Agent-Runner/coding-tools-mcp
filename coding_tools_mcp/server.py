@@ -230,6 +230,10 @@ IDEMPOTENT_TOOLS = frozenset({"apply_patch", "apply_changes"})
 WORKSPACE_WRITE_TOOLS = frozenset({"apply_patch", "apply_changes"})
 IDEMPOTENCY_CACHE_ENTRIES = 64
 IDEMPOTENCY_KEY_MAX_LENGTH = 128
+# Command ids remembered only to keep one finished command from being counted
+# as a failed operation once per poll. Comfortably larger than the retained
+# command set, so a command cannot outlive its own ledger entry.
+COUNTED_OUTCOME_LEDGER_ENTRIES = 512
 REPEATED_CALL_BLOCKED = "REPEATED_CALL_BLOCKED"
 IDEMPOTENCY_KEY_REUSED = "IDEMPOTENCY_KEY_REUSED"
 _COMMAND_RECOVERY_HINT = (
@@ -1502,6 +1506,11 @@ class Runtime:
         self.patch_committer = AtomicPatchCommitter()
         self._idempotency_results: OrderedDict[tuple[str, str], tuple[str, dict[str, Any]]] = OrderedDict()
         self._idempotency_lock = threading.Lock()
+        # Command ids whose terminal outcome telemetry has already counted. A
+        # finished command answers every later poll with the same outcome, so
+        # without this one failing build is counted once per poll.
+        self._counted_command_outcomes: OrderedDict[str, None] = OrderedDict()
+        self._counted_outcomes_lock = threading.Lock()
         self.breaker = RepeatFailureBreaker()
         # ProjectContext is frozen and derived only from the workspace tree, so
         # an embedder that builds several runtimes over one workspace can reuse
@@ -2050,7 +2059,7 @@ class Runtime:
         error = raw_error if isinstance(raw_error, dict) else {}
         duration_ms = int((time.time() - started_at) * 1000)
         raw_outcome = payload.get("operation_outcome")
-        outcome = raw_outcome if isinstance(raw_outcome, str) else None
+        outcome = self._countable_outcome(payload)
         # `context` is passed on as the opaque per-request fact it is: the
         # runtime neither reads the client identity in it nor branches on it.
         self.telemetry.record_tool_call(
@@ -2070,7 +2079,7 @@ class Runtime:
             "tool": name,
             "ok": bool(payload.get("ok", False)),
             "status": payload.get("status"),
-            "operation_outcome": outcome,
+            "operation_outcome": raw_outcome if isinstance(raw_outcome, str) else None,
             "error_code": error.get("code"),
             "duration_ms": duration_ms,
             "command_id": payload.get("command_id"),
@@ -2078,6 +2087,33 @@ class Runtime:
             "args": redact_for_trace(args),
         }
         print(json.dumps(event, sort_keys=True, separators=(",", ":")), file=sys.stderr, flush=True)
+
+    def _countable_outcome(self, payload: dict[str, Any]) -> str | None:
+        """Return the operation outcome telemetry should count for this call.
+
+        A command's terminal outcome is a fact about the command, not about
+        the call that observed it. Every `write_stdin` poll and every
+        `kill_command` on a finished process reports it again, so it is
+        counted the first time it is seen and skipped afterwards; a build that
+        exits 7 is one failed operation however often it is polled. `running`
+        is not terminal and is never claimed.
+        """
+
+        outcome = payload.get("operation_outcome")
+        if not isinstance(outcome, str):
+            return None
+        if outcome == "running":
+            return outcome
+        command_id = payload.get("command_id")
+        if not isinstance(command_id, str) or not command_id:
+            return outcome
+        with self._counted_outcomes_lock:
+            if command_id in self._counted_command_outcomes:
+                return None
+            self._counted_command_outcomes[command_id] = None
+            while len(self._counted_command_outcomes) > COUNTED_OUTCOME_LEDGER_ENTRIES:
+                self._counted_command_outcomes.popitem(last=False)
+        return outcome
 
     def read_file(self, args: dict[str, Any]) -> dict[str, Any]:
         requested_path = str(args.get("path", ""))

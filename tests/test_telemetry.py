@@ -579,6 +579,38 @@ class OperationOutcomeTests(unittest.TestCase):
         self.assertEqual(payload["exit_code"], 3)
         self.assertEqual(payload["operation_outcome"], "exited_nonzero")
 
+    def test_polling_a_finished_command_counts_its_failure_once(self) -> None:
+        # Every poll of a finished command reports the same terminal outcome.
+        # Counting each one turned a single failing build into as many failed
+        # operations as the model happened to poll.
+        sender = _CapturingSender()
+        with scrubbed_env(CODING_TOOLS_MCP_TELEMETRY="on"), patch.object(
+            telemetry, "_get_sender", return_value=sender
+        ), tempfile.TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="safe")
+            try:
+                runtime.telemetry.record_request(LEGACY_PROTOCOL_VERSION, "tools/call")
+                started = runtime.call_tool("exec_command", {"cmd": "exit 7", "timeout_ms": 5000})
+                command_id = started["structuredContent"]["command_id"]
+                self.assertEqual(started["structuredContent"]["operation_outcome"], "exited_nonzero")
+                for _ in range(2):
+                    polled = runtime.call_tool("write_stdin", {"command_id": command_id, "chars": ""})
+                    # The poll still tells the truth about the command…
+                    self.assertEqual(polled["structuredContent"]["operation_outcome"], "exited_nonzero")
+            finally:
+                runtime.close()
+        summaries = {
+            _properties(event)["tool"]: _properties(event)
+            for event in sender.events
+            if event["event"] == "tool_summary"
+        }
+        # … but the failed operation is counted once, by the call that ran it.
+        self.assertEqual(summaries["exec_command"]["outcome_exited_nonzero"], 1)
+        self.assertEqual(summaries["exec_command"]["operation_failures"], 1)
+        self.assertNotIn("outcome_exited_nonzero", summaries["write_stdin"])
+        self.assertEqual(summaries["write_stdin"]["operation_failures"], 0)
+        self.assertEqual(summaries["write_stdin"]["calls"], 2)
+
 
 class DocumentationDriftTests(unittest.TestCase):
     def test_documented_schema_matches_emitted_events(self) -> None:
