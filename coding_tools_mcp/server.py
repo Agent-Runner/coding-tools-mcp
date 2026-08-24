@@ -50,10 +50,12 @@ from .oauth import (
     verify_pkce,
 )
 from .patching import (
+    REVISION_ALGORITHM,
     AtomicPatchCommitter,
     FileBaseline,
     StagedFile,
-    apply_update_hunks,
+    apply_update_hunks_detailed,
+    content_revision,
     parse_patch,
     read_text_preserve_newlines,
 )
@@ -554,6 +556,32 @@ class ToolSpec:
     content_builder: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None
     gated_by: str | None = None
     """Name of a Runtime attribute that must be truthy for the tool to be exposed."""
+
+
+def _count_lines(text: str) -> int:
+    """Count file lines the way ``read_file`` reports ``total_lines``."""
+
+    return text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+
+
+def _patch_evidence(
+    content: str, changed_ranges: list[dict[str, int]], *, quality: str | None = None
+) -> dict[str, Any]:
+    """Post-edit evidence for one file: what the result is, not just that it worked.
+
+    ``revision`` is the same token ``read_file`` publishes and ``apply_changes``
+    requires, so a model can chain a structured edit onto a patch result
+    without re-reading the file.
+    """
+
+    evidence: dict[str, Any] = {
+        "revision": content_revision(content),
+        "total_lines": _count_lines(content),
+        "changed_ranges": changed_ranges,
+    }
+    if quality is not None:
+        evidence["match_quality"] = quality
+    return evidence
 
 
 def _image_content(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2235,7 +2263,9 @@ class Runtime:
             operations = parse_patch(patch)
             staged: dict[str, StagedFile] = {}
             summaries: list[str] = []
-            affected: list[dict[str, str]] = []
+            affected: list[dict[str, Any]] = []
+            warnings: list[str] = []
+            already_applied_files = 0
             additions = 0
             removals = 0
             for op in operations:
@@ -2257,17 +2287,35 @@ class Runtime:
                         baseline,
                         None,
                     )
-                    affected.append({"path": target.display, "operation": "add"})
+                    added_text = op.add_content or ""
+                    added_lines = _count_lines(added_text)
+                    whole_file = [
+                        {
+                            "start_line": 1,
+                            "end_line": added_lines,
+                            "added_lines": added_lines,
+                            "removed_lines": 0,
+                        }
+                    ]
+                    affected.append(
+                        {
+                            "path": target.display,
+                            "operation": "add",
+                            **_patch_evidence(added_text, whole_file),
+                        }
+                    )
                     summaries.append(f"A {target.display}")
-                    additions += len((op.add_content or "").splitlines())
+                    additions += len(added_text.splitlines())
                 elif op.kind == "delete":
                     target = self.workspace.resolve_existing(op.path)
                     if target.path.is_dir():
                         raise ToolFailure("PATCH_FAILED", "Cannot delete a directory.", category="validation")
                     prior = staged.get(target.display)
                     baseline = prior.baseline if prior is not None else FileBaseline.capture(target.path)
-                    staged[target.display] = StagedFile(target.display, target.path, None, baseline, baseline.mode)
-                    affected.append({"path": target.display, "operation": "delete"})
+                    staged[target.display] = StagedFile(
+                        target.display, target.path, None, baseline, baseline.mode, action="delete"
+                    )
+                    affected.append({"path": target.display, "operation": "delete", "total_lines": 0})
                     summaries.append(f"D {target.display}")
                     removals += len((baseline.data or b"").splitlines())
                 elif op.kind == "update":
@@ -2280,11 +2328,16 @@ class Runtime:
                     baseline = prior.baseline if prior is not None else FileBaseline.capture(source.path)
                     content = prior.content if prior is not None else baseline.text(source.display)
                     assert content is not None
-                    updated = apply_update_hunks(content, op.hunks, op.path)
+                    outcome = apply_update_hunks_detailed(content, op.hunks, op.path)
+                    updated = outcome.content
+                    warnings.extend(f"{source.display}: {item}" for item in outcome.warnings)
+                    if outcome.applied_hunks == 0 and outcome.already_applied_hunks:
+                        already_applied_files += 1
                     for hunk in op.hunks:
-                        for line in hunk:
+                        for line in hunk.lines:
                             additions += line.startswith("+")
                             removals += line.startswith("-")
+                    evidence = _patch_evidence(updated, outcome.changed_ranges, quality=outcome.match_quality)
                     source_mode = prior.mode if prior is not None else baseline.mode
                     if op.move_to:
                         dest = self.workspace.resolve_for_write(op.move_to)
@@ -2305,18 +2358,37 @@ class Runtime:
                             dest_baseline,
                             source_mode,
                         )
-                        affected.append({"path": dest.display, "old_path": source.display, "operation": "move"})
+                        affected.append(
+                            {
+                                "path": dest.display,
+                                "old_path": source.display,
+                                "operation": "move",
+                                **evidence,
+                            }
+                        )
                         summaries.append(f"R {source.display} -> {dest.display}")
                     else:
+                        # Re-writing identical bytes would bump the mtime and
+                        # make a no-op patch look like an edit to every watcher
+                        # on the tree, so an already-applied update is staged
+                        # as a baseline assertion instead.
+                        unchanged = updated == content
                         staged[source.display] = StagedFile(
                             source.display,
                             source.path,
-                            updated,
+                            content if unchanged else updated,
                             baseline,
                             source_mode,
+                            action="verify" if unchanged and prior is None else "write",
                         )
-                        affected.append({"path": source.display, "operation": "update"})
-                        summaries.append(f"M {source.display}")
+                        affected.append(
+                            {
+                                "path": source.display,
+                                "operation": "unchanged" if unchanged else "update",
+                                **evidence,
+                            }
+                        )
+                        summaries.append(f"{'=' if unchanged else 'M'} {source.display}")
             if not affected:
                 raise ToolFailure("PATCH_FAILED", "No files were modified.", category="validation")
             if not dry_run:
@@ -2324,11 +2396,13 @@ class Runtime:
         return {
             "dry_run": dry_run,
             "clean": True,
+            "already_applied": already_applied_files > 0 and already_applied_files == len(operations),
+            "revision_algorithm": REVISION_ALGORITHM,
             "summary": "\n".join(summaries),
             "affected_files": affected,
             "additions": additions,
             "removals": removals,
-            "warnings": [],
+            "warnings": warnings,
         }
 
     def _validate_patch_path(self, raw_path: str, *, require_existing: bool) -> None:

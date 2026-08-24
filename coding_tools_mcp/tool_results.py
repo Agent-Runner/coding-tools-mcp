@@ -171,13 +171,53 @@ def _render_search(payload: dict[str, Any]) -> str:
 
 def _render_patch(payload: dict[str, Any]) -> str:
     prefix = "Patch validated" if payload.get("dry_run") else "Patch applied"
+    if payload.get("already_applied"):
+        prefix = "Patch already applied"
     files = payload.get("affected_files")
     count = len(files) if isinstance(files, list) else 0
     changes = f" (+{payload.get('additions', 0)} -{payload.get('removals', 0)})"
+    lines = [f"{prefix} to {count} file{'s' if count != 1 else ''}{changes}."]
     summary = str(payload.get("summary") or "").strip()
-    return f"{prefix} to {count} file{'s' if count != 1 else ''}{changes}." + (
-        f"\n{summary}" if summary else ""
-    )
+    if summary:
+        lines.append(summary)
+    # Post-edit evidence: the model asked for a change and gets back what the
+    # file now is, including the revision token apply_changes will demand.
+    lines.extend(_render_file_evidence(files))
+    lines.extend(_render_warnings(payload))
+    return "\n".join(lines)
+
+
+def _render_file_evidence(files: Any) -> list[str]:
+    if not isinstance(files, list):
+        return []
+    rendered: list[str] = []
+    for entry in files:
+        if not isinstance(entry, dict) or not entry.get("revision"):
+            continue
+        parts = [
+            f"{entry.get('path', '')}: revision={entry['revision']}",
+            f"total_lines={entry.get('total_lines', '?')}",
+        ]
+        ranges = entry.get("changed_ranges")
+        if isinstance(ranges, list) and ranges:
+            spans = ", ".join(
+                f"{item.get('start_line')}-{item.get('end_line')}"
+                for item in ranges
+                if isinstance(item, dict)
+            )
+            parts.append(f"changed lines {spans}")
+        quality = entry.get("match_quality")
+        if isinstance(quality, str) and quality and quality != "exact":
+            parts.append(f"match_quality={quality}")
+        rendered.append(" ".join(parts))
+    return rendered
+
+
+def _render_warnings(payload: dict[str, Any]) -> list[str]:
+    warnings = payload.get("warnings")
+    if not isinstance(warnings, list):
+        return []
+    return [f"Warning: {item}" for item in warnings if isinstance(item, str) and item]
 
 
 def _render_exec(payload: dict[str, Any]) -> str:

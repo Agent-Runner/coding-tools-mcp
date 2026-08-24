@@ -123,6 +123,20 @@ class ApplyPatchGoldenTests(ComplianceTestCase):
         self.assertEqual(update_payload.get("removals"), 1)
         self.assertIn("(+1 -1)", self.tool_text(update_result))
         self.assertIn("return a + b", self.tool_text(self.client.call_tool("read_file", {"path": "src/math.js"})))
+        evidence = update_payload["affected_files"][0]
+        self.assertEqual(evidence.get("match_quality"), "exact")
+        self.assertRegex(evidence.get("revision", ""), r"^[0-9a-f]{64}$")
+        self.assertEqual(evidence.get("total_lines"), 7)
+        self.assertEqual(evidence.get("changed_ranges"), [{"start_line": 2, "end_line": 2, "added_lines": 1, "removed_lines": 1}])
+        self.assertIn(f"revision={evidence['revision']}", self.tool_text(update_result))
+
+        # A lost response must not turn into an error the model cannot recover
+        # from: the same envelope replayed reports the work as already done.
+        replay = self.client.call_tool("apply_patch", {"patch": ADD_FIX_PATCH})
+        replay_payload = self.assert_tool_success(replay)
+        self.assertIs(replay_payload.get("already_applied"), True)
+        self.assertEqual(replay_payload["affected_files"][0].get("operation"), "unchanged")
+        self.assertEqual(replay_payload["affected_files"][0].get("revision"), evidence["revision"])
 
         delete = """*** Begin Patch
 *** Delete File: TODO.md
@@ -145,10 +159,14 @@ class ApplyPatchGoldenTests(ComplianceTestCase):
 *** Update File: src/math.js
 @@
 -  return no_such_context;
-+  return a + b;
++  return no_such_replacement;
 *** End Patch
 """
-        self.assert_tool_error("apply_patch", {"patch": mismatch})
+        payload = self.assert_tool_error("apply_patch", {"patch": mismatch})
+        details = payload.get("error", {}).get("details", {})
+        self.assertEqual(details.get("hunk_index"), 0)
+        self.assertIn("nearby_text", details)
+        self.assertRegex(details["nearby_text"], r"^\d+: ")
 
     def test_apply_patch_preserves_bom_crlf_and_rejects_ambiguous_context(self) -> None:
         crlf_file = self.workspace.root / "src" / "crlf.txt"

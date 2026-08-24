@@ -22,8 +22,11 @@ from coding_tools_mcp import telemetry as telemetry_module
 from coding_tools_mcp.patching import (
     AtomicPatchCommitter,
     FileBaseline,
+    PatchHunk,
     StagedFile,
     apply_update_hunks,
+    apply_update_hunks_detailed,
+    content_revision,
     parse_patch,
 )
 from coding_tools_mcp.server import (
@@ -1764,6 +1767,146 @@ class PatchLineFidelityTests(unittest.TestCase):
             apply_update_hunks("alpha\nomega\n", [[" omega", "+tail"]]),
             "alpha\nomega\ntail\n",
         )
+
+
+DUPLICATE_SCOPES = 'def greet(n):\n    print("hi")\n\n\ndef farewell(n):\n    print("hi")\n'
+
+
+class PatchLocatorTests(unittest.TestCase):
+    """The `@@` scope anchor, `*** End of File`, and graded matching."""
+
+    def test_scope_header_text_is_retained_per_hunk(self) -> None:
+        operations = parse_patch(
+            "*** Begin Patch\n*** Update File: a.py\n@@ def farewell\n-x\n+y\n*** End Patch\n"
+        )
+        self.assertEqual(operations[0].hunks[0].scope, "def farewell")
+
+    def test_unified_diff_position_header_is_not_treated_as_scope(self) -> None:
+        operations = parse_patch(
+            "*** Begin Patch\n*** Update File: a.py\n@@ -1,4 +1,4 @@\n-x\n+y\n*** End Patch\n"
+        )
+        self.assertIsNone(operations[0].hunks[0].scope)
+
+    def test_scope_selects_between_identical_bodies(self) -> None:
+        outcome = apply_update_hunks_detailed(
+            DUPLICATE_SCOPES, [PatchHunk(['-    print("hi")', '+    print("bye")'], "def farewell")]
+        )
+        self.assertEqual(
+            outcome.content,
+            'def greet(n):\n    print("hi")\n\n\ndef farewell(n):\n    print("bye")\n',
+        )
+
+    def test_missing_scope_leaves_identical_bodies_ambiguous(self) -> None:
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed(DUPLICATE_SCOPES, [['-    print("hi")', '+    print("bye")']])
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_AMBIGUOUS")
+        self.assertEqual(raised.exception.details["candidate_lines"], [2, 6])
+        self.assertIn("2: ", raised.exception.details["candidates"][0]["text"])
+
+    def test_end_of_file_marker_anchors_the_last_occurrence(self) -> None:
+        outcome = apply_update_hunks_detailed(
+            "beta\nbeta\nbeta\n", [["-beta", "+omega", "*** End of File"]]
+        )
+        self.assertEqual(outcome.content, "beta\nbeta\nomega\n")
+
+    def test_end_of_file_marker_survives_the_envelope_parser(self) -> None:
+        operations = parse_patch(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-beta\n+omega\n*** End of File\n*** End Patch\n"
+        )
+        self.assertEqual(operations[0].hunks[0].lines[-1], "*** End of File")
+
+
+class GradedMatchingTests(unittest.TestCase):
+    def test_trailing_whitespace_downgrade_is_labeled_and_preserves_the_file_line(self) -> None:
+        outcome = apply_update_hunks_detailed("keep  \nold\n", [[" keep", "-old", "+new"]])
+        self.assertEqual(outcome.match_quality, "trailing_ws")
+        # The context line is reinstated from the file, so tolerating the
+        # difference does not silently strip the file's trailing spaces.
+        self.assertEqual(outcome.content, "keep  \nnew\n")
+        self.assertIn("trailing whitespace", " ".join(outcome.warnings))
+
+    def test_indent_downgrade_reindents_added_lines_by_the_uniform_delta(self) -> None:
+        outcome = apply_update_hunks_detailed(
+            "class S:\n    def run(self):\n        value = 1\n        return value\n",
+            [[" value = 1", "-return value", "+return value * 2"]],
+        )
+        self.assertEqual(outcome.match_quality, "indent")
+        self.assertEqual(
+            outcome.content,
+            "class S:\n    def run(self):\n        value = 1\n        return value * 2\n",
+        )
+
+    def test_non_uniform_indent_drift_is_not_guessed_at(self) -> None:
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed(
+                "    alpha\n        beta\n",
+                [[" alpha", "-  beta", "+  gamma"]],
+            )
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_a_fuzzy_grade_that_matches_twice_is_still_ambiguous(self) -> None:
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed("old \nold  \n", [["-old", "+new"]])
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_AMBIGUOUS")
+        self.assertEqual(raised.exception.details["match_quality"], "trailing_ws")
+
+    def test_exact_matches_are_labeled_exact_and_warn_about_nothing(self) -> None:
+        outcome = apply_update_hunks_detailed("old\n", [["-old", "+new"]])
+        self.assertEqual(outcome.match_quality, "exact")
+        self.assertEqual(outcome.warnings, [])
+
+
+class PatchEvidenceAndIdempotencyTests(unittest.TestCase):
+    def test_changed_ranges_name_only_the_lines_that_differ(self) -> None:
+        outcome = apply_update_hunks_detailed(
+            "a\nb\nc\n", [[" a", "-b", "+B", " c"]]
+        )
+        self.assertEqual(
+            outcome.changed_ranges,
+            [{"start_line": 2, "end_line": 2, "added_lines": 1, "removed_lines": 1}],
+        )
+
+    def test_pure_deletion_reports_an_empty_range_at_the_removal_point(self) -> None:
+        outcome = apply_update_hunks_detailed("a\nb\nc\n", [[" a", "-b", " c"]])
+        self.assertEqual(outcome.changed_ranges[0]["start_line"], 2)
+        self.assertEqual(outcome.changed_ranges[0]["end_line"], 1)
+        self.assertEqual(outcome.changed_ranges[0]["removed_lines"], 1)
+
+    def test_already_applied_hunks_are_skipped_rather_than_failing(self) -> None:
+        outcome = apply_update_hunks_detailed("value = 2\n", [["-value = 1", "+value = 2"]])
+        self.assertEqual(outcome.content, "value = 2\n")
+        self.assertEqual(outcome.already_applied_hunks, [0])
+        self.assertEqual(outcome.applied_hunks, 0)
+
+    def test_a_context_only_hunk_never_claims_to_be_already_applied(self) -> None:
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed("a\n", [[" nowhere"]])
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_revision_is_the_sha256_of_the_files_utf8_bytes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "a.txt").write_text("alpha\n", encoding="utf-8")
+            runtime = Runtime(workspace, permission_mode="safe")
+            try:
+                payload = runtime.apply_patch(
+                    {"patch": "*** Begin Patch\n*** Update File: a.txt\n@@\n-alpha\n+beta\n*** End Patch\n"}
+                )
+            finally:
+                runtime.close()
+            self.assertEqual(
+                payload["affected_files"][0]["revision"],
+                content_revision((workspace / "a.txt").read_text(encoding="utf-8")),
+            )
+            self.assertEqual(payload["revision_algorithm"], "sha256")
+
+    def test_not_found_failures_carry_numbered_repair_text(self) -> None:
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed("alpha\nbeta\ngamma\n", [["-bета", "+delta"]])
+        details = raised.exception.details
+        self.assertEqual(details["hunk_index"], 0)
+        self.assertEqual(details["total_lines"], 4)
+        self.assertIn("1: alpha", details["nearby_text"])
 
 
 class ErrorTextTerminalityTests(unittest.TestCase):
