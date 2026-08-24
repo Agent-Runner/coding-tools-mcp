@@ -47,8 +47,11 @@ The v0.5.0 reliability work. Migration notes:
   the effective policy and whether it is enforced appear in `server_info` as
   `workspace_mutation_policy`.
 - **`idempotency_key` on `apply_patch` and `apply_changes`.** Replaying a key
-  returns the recorded result instead of doing the work twice, so a lost
-  response is safe to retry.
+  with the same arguments returns the recorded result instead of doing the work
+  twice, so a lost response is safe to retry. A key names one request: it is
+  recorded with a fingerprint of the arguments that earned it, reusing it for
+  different arguments is `IDEMPOTENCY_KEY_REUSED` rather than a replay of work
+  that was never done, and a `dry_run` result is never recorded at all.
 - **A repeat-failure circuit breaker.** The third byte-identical call that
   would produce the same deterministic error is refused with
   `REPEATED_CALL_BLOCKED`. Changing any argument clears that entry; a
@@ -77,18 +80,28 @@ The v0.5.0 reliability work. Migration notes:
 - **A failed patch returns repair data**: the hunk index, nearby numbered text,
   and candidate match positions, so the next attempt can be aimed.
 - **A patch whose changes are already present reports `already_applied`**
-  instead of failing.
+  instead of failing, when the result is locatable: an exact or
+  trailing-whitespace match of a block that carries a context line, or a
+  multi-line addition. A context-free single line that happens to occur
+  somewhere in the file is a coincidence, not a completed edit, and still
+  fails with `PATCH_CONTEXT_NOT_FOUND`.
 - **Same-path chaining in `apply_patch` is now promised.** Several
   `*** Update File` blocks naming one path in one envelope chain in order. This
-  already worked and is now documented and tested.
+  already worked and is now documented, unit-tested, and covered by
+  `make test-patch-repro` in CI.
+- **`apply_changes` compares paths after resolving them**, so `a.txt` and
+  `./a.txt` are one path: naming both is `INVALID_ARGUMENT` rather than a
+  silent overwrite reported as two applied changes.
 - **`git_diff` includes untracked files** by default, so a file created by
   `apply_patch` is visible. Pass `include_untracked: false` for the old
   behavior.
 - **Telemetry counts operations truthfully.** A command that exits nonzero,
   times out, or dies on a signal is no longer recorded as a successful tool
-  call, and consecutive failures are tracked per (tool, error code) rather than
-  in one global slot any tool's success could reset. A 0.5.0 dashboard is not
-  comparable to an earlier one.
+  call; its terminal outcome is counted once rather than again on every
+  `write_stdin` or `kill_command` poll that observes it; and consecutive
+  failures are tracked per (tool, error code) rather than in one global slot
+  any tool's success could reset. A 0.5.0 dashboard is not comparable to an
+  earlier one.
 - **`check_exec_environment` warns on non-Linux hosts** that there is no
   Landlock and therefore no filesystem confinement.
 - **`server_info` discloses the output retention TTL and the completed-command
