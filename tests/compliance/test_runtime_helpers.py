@@ -2054,6 +2054,57 @@ class SamePathChainingTests(unittest.TestCase):
                 [{"start_line": 2, "end_line": 5, "added_lines": 4, "removed_lines": 0}],
             )
 
+    def test_chained_already_applied_blocks_verify_without_rewriting(self) -> None:
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            " anchor-one\n"
+            "-old-one\n"
+            "+new-one\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            " anchor-two\n"
+            "-old-two\n"
+            "+new-two\n"
+            "*** End Patch\n"
+        )
+        with self._runtime("anchor-one\nnew-one\nanchor-two\nnew-two\n") as (workspace, runtime):
+            path = workspace / "app.py"
+            os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+            before = path.stat().st_mtime_ns
+            payload = runtime.apply_patch({"patch": patch_text})
+
+            self.assertEqual(path.stat().st_mtime_ns, before)
+            self.assertIs(payload["already_applied"], True)
+            self.assertEqual(payload["affected_files"][0]["operation"], "unchanged")
+            self.assertEqual(payload["affected_files"][0]["changed_ranges"], [])
+
+    def test_chained_edits_that_restore_the_baseline_verify_without_rewriting(self) -> None:
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-one\n"
+            "+ONE\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-ONE\n"
+            "+one\n"
+            "*** End Patch\n"
+        )
+        with self._runtime("one\ntwo\n") as (workspace, runtime):
+            path = workspace / "app.py"
+            os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+            before = path.stat().st_mtime_ns
+            payload = runtime.apply_patch({"patch": patch_text})
+
+            self.assertEqual(path.read_text(encoding="utf-8"), "one\ntwo\n")
+            self.assertEqual(path.stat().st_mtime_ns, before)
+            self.assertIs(payload["already_applied"], False)
+            self.assertEqual(payload["affected_files"][0]["operation"], "unchanged")
+            self.assertEqual(payload["affected_files"][0]["changed_ranges"], [])
+
     def test_update_then_move_reports_only_final_destination_evidence(self) -> None:
         patch_text = (
             "*** Begin Patch\n"

@@ -1562,6 +1562,8 @@ class Runtime:
         self.patch_committer = AtomicPatchCommitter()
         self._idempotency_results: OrderedDict[tuple[str, str], tuple[str, dict[str, Any]]] = OrderedDict()
         self._idempotency_lock = threading.Lock()
+        self._idempotency_condition = threading.Condition(self._idempotency_lock)
+        self._idempotency_inflight: set[tuple[str, str]] = set()
         # Command ids whose terminal outcome telemetry has already counted. A
         # finished command answers every later poll with the same outcome, so
         # without this one failing build is counted once per poll.
@@ -1967,11 +1969,13 @@ class Runtime:
         spec = TOOL_REGISTRY[name]
         validate_arguments(name, args)
         fingerprint = argument_fingerprint(args)
-        idempotency_key = self._idempotency_slot(name, args)
+        idempotency_slot = self._idempotency_slot(name, args)
+        self._begin_idempotent_call(idempotency_slot)
+        breaker_generation = self.breaker.generation
         try:
             # Inside the try: a key reused for different work is a tool error
             # the model can act on, not an exception that escapes the envelope.
-            replayed = self._recorded_result(idempotency_key, fingerprint)
+            replayed = self._recorded_result(idempotency_slot, fingerprint)
             if replayed is not None:
                 self.emit_tool_trace(name, args, replayed, started_at, context=context)
                 content = spec.content_builder(dict(replayed)) if spec.content_builder else None
@@ -1982,11 +1986,11 @@ class Runtime:
             payload = handler(args)
             payload.setdefault("ok", True)
             if payload.get("ok") is False:
-                self._record_breaker_failure(name, fingerprint, payload)
+                self._record_breaker_failure(name, fingerprint, payload, breaker_generation)
                 self.emit_tool_trace(name, args, payload, started_at, context=context)
                 content = spec.content_builder(payload) if spec.content_builder else None
                 return make_tool_result(name, payload, is_error=True, content=content)
-            self.breaker.record_success(name, fingerprint)
+            self.breaker.record_success(name, fingerprint, generation=breaker_generation)
             if name in WORKSPACE_WRITE_TOOLS and not (
                 payload.get("dry_run") or payload.get("already_applied") or payload.get("idempotent_replay")
             ):
@@ -1996,7 +2000,7 @@ class Runtime:
                 self.breaker.reset()
             else:
                 self._reset_breaker_after_terminal_command(payload)
-            self._record_result(idempotency_key, fingerprint, payload)
+            self._record_result(idempotency_slot, fingerprint, payload)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             content = spec.content_builder(payload) if spec.content_builder else None
             return make_tool_result(name, payload, is_error=payload.get("ok") is False, content=content)
@@ -2026,7 +2030,7 @@ class Runtime:
                 }
             if exc.code == "ELICITATION_UNSUPPORTED":
                 payload["status"] = "unsupported"
-            self._record_breaker_failure(name, fingerprint, payload)
+            self._record_breaker_failure(name, fingerprint, payload, breaker_generation)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
         except Exception as exc:  # noqa: BLE001 - tool failures must stay structured
@@ -2042,12 +2046,18 @@ class Runtime:
             }
             if spec.error_status:
                 payload["status"] = spec.error_status
-            self._record_breaker_failure(name, fingerprint, payload)
+            self._record_breaker_failure(name, fingerprint, payload, breaker_generation)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
+        finally:
+            self._finish_idempotent_call(idempotency_slot)
 
     def _record_breaker_failure(
-        self, name: str, fingerprint: str, payload: dict[str, Any]
+        self,
+        name: str,
+        fingerprint: str,
+        payload: dict[str, Any],
+        generation: int,
     ) -> None:
         """Count a structured failure whether returned or raised by a handler."""
 
@@ -2061,6 +2071,7 @@ class Runtime:
             fingerprint,
             error_code=code,
             retryable=bool(error.get("retryable")),
+            generation=generation,
         )
         if repeats >= self.breaker.limit:
             raw_details = error.get("details")
@@ -2108,6 +2119,29 @@ class Runtime:
             return None
         raw = args.get("idempotency_key")
         return (name, raw) if isinstance(raw, str) and raw else None
+
+    def _begin_idempotent_call(self, slot: tuple[str, str] | None) -> None:
+        """Take the execution turn for one keyed request.
+
+        Looking in the completed-result cache is not enough: two callers can
+        both miss before either has recorded its result. Keep the slot occupied
+        through execution and recording so every waiter rechecks the cache
+        after the first call has made its mutation durable.
+        """
+
+        if slot is None:
+            return
+        with self._idempotency_condition:
+            while slot in self._idempotency_inflight:
+                self._idempotency_condition.wait()
+            self._idempotency_inflight.add(slot)
+
+    def _finish_idempotent_call(self, slot: tuple[str, str] | None) -> None:
+        if slot is None:
+            return
+        with self._idempotency_condition:
+            self._idempotency_inflight.discard(slot)
+            self._idempotency_condition.notify_all()
 
     def _recorded_result(self, slot: tuple[str, str] | None, fingerprint: str) -> dict[str, Any] | None:
         """Return the result a previous call under this key produced, if any.
@@ -2938,32 +2972,37 @@ class Runtime:
                     else:
                         if operation_already_applied:
                             already_applied_operations += 1
-                        # Re-writing identical bytes would bump the mtime and
-                        # make a no-op patch look like an edit to every watcher
-                        # on the tree, so an already-applied update is staged
-                        # as a baseline assertion instead.
-                        unchanged = updated == content
+                        # The final staged bytes, rather than only this block's
+                        # input, decide whether a write is necessary. A chain
+                        # of already-applied blocks, or a later block that
+                        # returns an earlier edit to the original bytes, must
+                        # remain a baseline assertion and preserve the mtime.
+                        block_unchanged = updated == content
+                        baseline_content = baseline.text(source.display)
+                        net_unchanged = updated == baseline_content
                         staged[source.display] = StagedFile(
                             source.display,
                             source.path,
-                            content if unchanged else updated,
+                            updated,
                             baseline,
                             source_mode,
-                            action="verify" if unchanged and prior is None else "write",
+                            action="verify" if net_unchanged else "write",
                         )
                         _merge_patch_affected_file(
                             affected,
                             {
                                 "path": source.display,
-                                "operation": "unchanged" if unchanged else "update",
+                                "operation": "unchanged" if net_unchanged else "update",
                                 **evidence,
                             },
                         )
                         if prior is not None:
-                            affected[source.display]["changed_ranges"] = changed_ranges_between(
-                                baseline.text(source.display), updated
+                            net_ranges = changed_ranges_between(baseline_content, updated)
+                            affected[source.display]["changed_ranges"] = net_ranges
+                            affected[source.display]["operation"] = (
+                                "unchanged" if net_unchanged else "update"
                             )
-                        summaries.append(f"{'=' if unchanged else 'M'} {source.display}")
+                        summaries.append(f"{'=' if block_unchanged else 'M'} {source.display}")
             if not affected:
                 raise ToolFailure("PATCH_FAILED", "No files were modified.", category="validation")
             if not dry_run:

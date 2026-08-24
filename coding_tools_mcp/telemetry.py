@@ -414,6 +414,7 @@ class SessionTelemetry:
                     "buckets": {},
                     "truncated": 0,
                     "outcomes": {},
+                    "operation_failures": 0,
                 }
             stats["calls"] += 1
             bucket = _DURATION_OVERFLOW
@@ -427,6 +428,12 @@ class SessionTelemetry:
             if outcome:
                 label = _label(outcome) or "unknown"
                 stats["outcomes"][label] = stats["outcomes"].get(label, 0) + 1
+            if ok and operation_failed:
+                # Operation failures are successful tool dispatches whose
+                # underlying command failed. A spawn_error is itself a tool
+                # error, so counting its outcome again would make one call
+                # contribute two failures and could drive `ok` negative.
+                stats["operation_failures"] += 1
             if ok and not operation_failed:
                 self._clear_streaks_locked(tool)
             elif ok:
@@ -489,9 +496,7 @@ class SessionTelemetry:
             for tool, stats in sorted(self._tools.items()):
                 failures = sum(stats["errors"].values())
                 outcomes: dict[str, int] = stats.get("outcomes", {})
-                operation_failures = sum(
-                    count for name, count in outcomes.items() if name in FAILED_OPERATION_OUTCOMES
-                )
+                operation_failures = int(stats.get("operation_failures", 0))
                 properties: dict[str, Any] = {
                     "tool": _label(tool),
                     "calls": stats["calls"],

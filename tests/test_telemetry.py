@@ -568,6 +568,33 @@ class OperationOutcomeTests(unittest.TestCase):
         self.assertEqual(summary["outcome_timeout"], 1)
         self.assertEqual(summary["outcome_signal"], 1)
 
+    def test_spawn_error_is_not_counted_as_two_failures(self) -> None:
+        sender = _CapturingSender()
+        with scrubbed_env(CODING_TOOLS_MCP_TELEMETRY="on"), patch.object(
+            telemetry, "_get_sender", return_value=sender
+        ):
+            session = SessionTelemetry(permission_mode="safe")
+            session.record_request(LEGACY_PROTOCOL_VERSION, "tools/call")
+            session.record_tool_call(
+                "exec_command",
+                ok=False,
+                error_code="COMMAND_SPAWN_FAILED",
+                duration_ms=1,
+                truncated=False,
+                outcome="spawn_error",
+            )
+            session.finish()
+        summary = next(
+            _properties(event)
+            for event in sender.events
+            if event["event"] == "tool_summary" and _properties(event)["tool"] == "exec_command"
+        )
+        self.assertEqual(summary["calls"], 1)
+        self.assertEqual(summary["ok"], 0)
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["operation_failures"], 0)
+        self.assertEqual(summary["outcome_spawn_error"], 1)
+
     def test_a_nonzero_exit_is_reported_as_the_operation_outcome(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = Runtime(Path(tmp), permission_mode="safe")

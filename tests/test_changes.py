@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -493,6 +494,67 @@ class ApplyChangesRuntimeTests(unittest.TestCase):
         second = self.runtime.call_tool("apply_changes", request)
         self.assertFalse(second["isError"])
         self.assertIs(second["structuredContent"]["idempotent_replay"], True)
+
+    def test_concurrent_calls_under_one_key_execute_once_and_replay(self) -> None:
+        request = {
+            "changes": [{"action": "create", "path": "new.txt", "content": "x\n"}],
+            "idempotency_key": "concurrent-key",
+        }
+        original = self.runtime._tool_handlers["apply_changes"]
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+        calls_lock = threading.Lock()
+        handler_calls = 0
+
+        def delayed(arguments: dict[str, object]) -> dict[str, object]:
+            nonlocal handler_calls
+            with calls_lock:
+                handler_calls += 1
+                call_number = handler_calls
+            if call_number == 1:
+                first_entered.set()
+                if not release_first.wait(timeout=2):
+                    raise RuntimeError("timed out waiting to release the first keyed call")
+            else:
+                second_entered.set()
+            return original(arguments)
+
+        self.runtime._tool_handlers["apply_changes"] = delayed
+        results: list[dict[str, object] | None] = [None, None]
+
+        def invoke(index: int) -> None:
+            results[index] = self.runtime.call_tool("apply_changes", request)
+
+        first = threading.Thread(target=invoke, args=(0,))
+        second = threading.Thread(target=invoke, args=(1,))
+        first.start()
+        self.assertTrue(first_entered.wait(timeout=1))
+        second.start()
+        try:
+            self.assertFalse(
+                second_entered.wait(timeout=0.2),
+                "a duplicate entered the handler while the original key was in flight",
+            )
+        finally:
+            release_first.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(handler_calls, 1)
+        completed = [result for result in results if result is not None]
+        self.assertEqual(len(completed), 2)
+        self.assertTrue(all(result["isError"] is False for result in completed))
+        self.assertEqual(
+            sum(
+                result["structuredContent"].get("idempotent_replay") is True
+                for result in completed
+            ),
+            1,
+        )
+        self.assertEqual((self.workspace / "new.txt").read_text(encoding="utf-8"), "x\n")
 
     def test_a_dry_run_under_a_key_never_answers_the_real_apply(self) -> None:
         changes = [{"action": "create", "path": "new.txt", "content": "x\n"}]

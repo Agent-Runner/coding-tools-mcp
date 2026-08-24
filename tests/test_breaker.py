@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -161,6 +162,64 @@ class BreakerInRuntimeTests(unittest.TestCase):
                 )
                 self.assertFalse(created["isError"])
                 self.assertFalse(self.call(runtime, {"path": "late.txt"})["isError"])
+            finally:
+                runtime.close()
+
+    def test_failures_started_before_a_reset_do_not_strike_the_new_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="safe")
+            original = runtime._tool_handlers["read_file"]
+            all_entered = threading.Event()
+            release = threading.Event()
+            count_lock = threading.Lock()
+            entered = 0
+
+            def delayed(arguments: dict[str, object]) -> dict[str, object]:
+                nonlocal entered
+                with count_lock:
+                    entered += 1
+                    if entered == 2:
+                        all_entered.set()
+                if not release.wait(timeout=2):
+                    raise RuntimeError("timed out waiting for breaker reset")
+                return original(arguments)
+
+            runtime._tool_handlers["read_file"] = delayed
+            old_results: list[dict[str, object] | None] = [None, None]
+
+            def read_missing(index: int) -> None:
+                old_results[index] = self.call(runtime, {"path": "missing.txt"})
+
+            threads = [
+                threading.Thread(target=read_missing, args=(0,)),
+                threading.Thread(target=read_missing, args=(1,)),
+            ]
+            try:
+                for thread in threads:
+                    thread.start()
+                self.assertTrue(all_entered.wait(timeout=1))
+                write = runtime.call_tool(
+                    "apply_patch",
+                    {"patch": "*** Begin Patch\n*** Add File: reset.txt\n+new\n*** End Patch\n"},
+                )
+                self.assertFalse(write["isError"], write)
+            finally:
+                release.set()
+                for thread in threads:
+                    thread.join(timeout=2)
+
+            runtime._tool_handlers["read_file"] = original
+            try:
+                self.assertTrue(all(not thread.is_alive() for thread in threads))
+                self.assertTrue(
+                    all(
+                        result is not None
+                        and result["structuredContent"]["error"]["code"] == "NOT_FOUND"
+                        for result in old_results
+                    )
+                )
+                fresh = self.call(runtime, {"path": "missing.txt"})
+                self.assertEqual(fresh["structuredContent"]["error"]["code"], "NOT_FOUND")
             finally:
                 runtime.close()
 

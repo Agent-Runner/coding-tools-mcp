@@ -79,10 +79,18 @@ class RepeatFailureBreaker:
         self._capacity = capacity
         self._lock = threading.Lock()
         self._entries: OrderedDict[tuple[str, str], dict[str, int]] = OrderedDict()
+        self._generation = 0
 
     @property
     def limit(self) -> int:
         return self._limit
+
+    @property
+    def generation(self) -> int:
+        """Return the current workspace-verdict generation."""
+
+        with self._lock:
+            return self._generation
 
     def blocked_error_code(self, tool: str, fingerprint: str) -> str | None:
         """Return the error code this exact call has already exhausted, if any."""
@@ -97,7 +105,15 @@ class RepeatFailureBreaker:
                     return code
         return None
 
-    def record_failure(self, tool: str, fingerprint: str, *, error_code: str, retryable: bool) -> int:
+    def record_failure(
+        self,
+        tool: str,
+        fingerprint: str,
+        *,
+        error_code: str,
+        retryable: bool,
+        generation: int | None = None,
+    ) -> int:
         """Count one failure and return the new consecutive count for its code."""
 
         if error_code in BREAKER_EXCLUDED_ERROR_CODES:
@@ -105,6 +121,11 @@ class RepeatFailureBreaker:
         if retryable and error_code not in RETRY_MEANS_CHANGING_THE_CALL:
             return 0
         with self._lock:
+            if generation is not None and generation != self._generation:
+                # The call began against a tree whose verdicts have since been
+                # invalidated. Let the caller observe its real failure, but do
+                # not seed the fresh generation with stale evidence.
+                return 0
             counts = self._entries.setdefault((tool, fingerprint), {})
             self._entries.move_to_end((tool, fingerprint))
             count = counts.get(error_code, 0) + 1
@@ -113,10 +134,14 @@ class RepeatFailureBreaker:
                 self._entries.popitem(last=False)
             return count
 
-    def record_success(self, tool: str, fingerprint: str) -> None:
+    def record_success(
+        self, tool: str, fingerprint: str, *, generation: int | None = None
+    ) -> None:
         """Forget this call's history: the same arguments just worked."""
 
         with self._lock:
+            if generation is not None and generation != self._generation:
+                return
             self._entries.pop((tool, fingerprint), None)
 
     def reset(self) -> None:
@@ -129,3 +154,4 @@ class RepeatFailureBreaker:
 
         with self._lock:
             self._entries.clear()
+            self._generation += 1
