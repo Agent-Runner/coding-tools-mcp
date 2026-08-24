@@ -21,7 +21,7 @@ DESKTOP_PACKAGE := apps/desktop-client/mcp_desktop_client
 DESKTOP_TS := $(DESKTOP_PACKAGE)/locales/app_zh_CN.ts
 DESKTOP_QM := $(DESKTOP_PACKAGE)/locales/app_zh_CN.qm
 
-.PHONY: start lint typecheck test ci check-dispatch-inputs check-npm-launcher check-release compliance test-protocol test-integration test-mcp-contract test-dual-era test-tool-golden test-security test-e2e test-runtime-semantics test-docs-required test-schema-drift dogfood-mcp dogfood-runner dogfood-smoke benchmark-latency benchmark-smoke benchmark-real-workloads agent-eval agent-eval-validate swebench-reference-predictions swebench-preflight swebench-evaluate desktop-i18n-update desktop-i18n-release desktop-i18n-check install-user publish-testpypi publish-pypi publish-all report
+.PHONY: start lint typecheck test test-patch-repro ci check-dispatch-inputs check-npm-launcher check-release compliance test-protocol test-integration test-mcp-contract test-dual-era test-tool-golden test-security test-e2e test-runtime-semantics test-docs-required test-schema-drift dogfood-mcp dogfood-runner dogfood-smoke benchmark-latency benchmark-smoke benchmark-real-workloads agent-eval agent-eval-validate swebench-reference-predictions swebench-preflight swebench-evaluate desktop-i18n-update desktop-i18n-release desktop-i18n-check install-user publish-testpypi publish-pypi publish-all report
 
 start:
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m coding_tools_mcp --workspace "$(MCP_WORKSPACE)" --host "$(MCP_HOST)" --port "$(MCP_PORT)" $(MCP_ARGS)
@@ -46,7 +46,13 @@ typecheck:
 test:
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
-ci: lint typecheck test check-dispatch-inputs check-npm-launcher test-protocol test-integration test-docs-required test-schema-drift dogfood-smoke benchmark-latency benchmark-smoke
+# Each case is one shape a real model produced against a real file. The script
+# exits with the number of failing cases, so a regressed recovery affordance
+# fails the build without any output parsing.
+test-patch-repro:
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) scripts/repro_patch_failures.py
+
+ci: lint typecheck test test-patch-repro check-dispatch-inputs check-npm-launcher test-protocol test-integration test-docs-required test-schema-drift dogfood-smoke benchmark-latency benchmark-smoke
 
 compliance:
 	$(COMPLIANCE_RUNNER) --suite all $(REPORT_FLAG)

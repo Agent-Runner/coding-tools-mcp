@@ -1865,6 +1865,66 @@ class GradedMatchingTests(unittest.TestCase):
         self.assertEqual(outcome.warnings, [])
 
 
+class SamePathChainingTests(unittest.TestCase):
+    """Two `*** Update File` blocks naming one path chain, in order.
+
+    `scripts/repro_patch_failures.py` states the same promise as an executable
+    case and runs in CI as `make test-patch-repro`; this is the unit-test half,
+    so the guarantee cannot regress unnoticed in either runner.
+    """
+
+    @contextmanager
+    def _runtime(self, content: str) -> Iterator[tuple[Path, Runtime]]:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "app.py").write_text(content, encoding="utf-8")
+            runtime = Runtime(workspace, permission_mode="safe")
+            try:
+                yield workspace, runtime
+            finally:
+                runtime.close()
+
+    def test_the_second_block_sees_the_first_blocks_result(self) -> None:
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-one\n"
+            "+ONE\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-two\n"
+            "+TWO\n"
+            "*** End Patch\n"
+        )
+        with self._runtime("one\ntwo\n") as (workspace, runtime):
+            payload = runtime.apply_patch({"patch": patch_text})
+            self.assertEqual((workspace / "app.py").read_text(encoding="utf-8"), "ONE\nTWO\n")
+            # One file, staged once: the committer refuses a path staged twice.
+            self.assertEqual([entry["path"] for entry in payload["affected_files"]], ["app.py", "app.py"])
+            self.assertEqual(
+                payload["affected_files"][-1]["revision"],
+                content_revision((workspace / "app.py").read_text(encoding="utf-8")),
+            )
+
+    def test_a_later_block_may_edit_what_an_earlier_block_wrote(self) -> None:
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-one\n"
+            "+first\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-first\n"
+            "+FIRST\n"
+            "*** End Patch\n"
+        )
+        with self._runtime("one\ntwo\n") as (workspace, runtime):
+            runtime.apply_patch({"patch": patch_text})
+            self.assertEqual((workspace / "app.py").read_text(encoding="utf-8"), "FIRST\ntwo\n")
+
+
 class PatchEvidenceAndIdempotencyTests(unittest.TestCase):
     def test_changed_ranges_name_only_the_lines_that_differ(self) -> None:
         outcome = apply_update_hunks_detailed(
