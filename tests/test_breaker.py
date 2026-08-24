@@ -165,6 +165,62 @@ class BreakerInRuntimeTests(unittest.TestCase):
             finally:
                 runtime.close()
 
+    def test_a_write_tool_with_no_net_mutation_keeps_earlier_verdicts(self) -> None:
+        for tool_name in ("apply_patch", "apply_changes"):
+            with self.subTest(tool=tool_name), tempfile.TemporaryDirectory() as tmp:
+                workspace = Path(tmp)
+                path = workspace / "app.py"
+                path.write_text("one\ntwo\n", encoding="utf-8")
+                runtime = Runtime(workspace, permission_mode="safe")
+                missing_args = {"path": "missing.txt"}
+                if tool_name == "apply_patch":
+                    write_args: dict[str, object] = {
+                        "patch": (
+                            "*** Begin Patch\n"
+                            "*** Update File: app.py\n"
+                            "@@\n"
+                            "-one\n"
+                            "+ONE\n"
+                            "*** Update File: app.py\n"
+                            "@@\n"
+                            "-ONE\n"
+                            "+one\n"
+                            "*** End Patch\n"
+                        )
+                    }
+                else:
+                    write_args = {
+                        "changes": [
+                            {
+                                "action": "write",
+                                "path": "app.py",
+                                "revision": server_module.content_revision("one\ntwo\n"),
+                                "content": "one\ntwo\n",
+                            }
+                        ]
+                    }
+                try:
+                    self.call(runtime, missing_args)
+                    self.call(runtime, missing_args)
+                    before = path.stat().st_mtime_ns
+                    no_op = runtime.call_tool(tool_name, write_args)
+                    third = self.call(runtime, missing_args)
+                finally:
+                    runtime.close()
+                self.assertFalse(no_op["isError"], no_op)
+                self.assertEqual(path.read_text(encoding="utf-8"), "one\ntwo\n")
+                self.assertEqual(path.stat().st_mtime_ns, before)
+                self.assertTrue(
+                    all(
+                        entry["operation"] == "unchanged"
+                        for entry in no_op["structuredContent"]["affected_files"]
+                    )
+                )
+                self.assertEqual(
+                    third["structuredContent"]["error"]["code"],
+                    "REPEATED_CALL_BLOCKED",
+                )
+
     def test_failures_started_before_a_reset_do_not_strike_the_new_generation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = Runtime(Path(tmp), permission_mode="safe")

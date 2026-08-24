@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from coding_tools_mcp import server as server_module
 from coding_tools_mcp.changes import (
@@ -555,6 +557,101 @@ class ApplyChangesRuntimeTests(unittest.TestCase):
             1,
         )
         self.assertEqual((self.workspace / "new.txt").read_text(encoding="utf-8"), "x\n")
+
+    def test_waiter_keeps_its_result_pinned_during_lru_churn(self) -> None:
+        request = {
+            "changes": [{"action": "create", "path": "new.txt", "content": "x\n"}],
+            "idempotency_key": "pinned-key",
+        }
+        slot = ("apply_changes", "pinned-key")
+        original_handler = self.runtime._tool_handlers["apply_changes"]
+        original_recorded_result = self.runtime._recorded_result
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        waiter_before_lookup = threading.Event()
+        release_waiter_lookup = threading.Event()
+        calls_lock = threading.Lock()
+        handler_calls = 0
+
+        def delayed_handler(arguments: dict[str, object]) -> dict[str, object]:
+            nonlocal handler_calls
+            if arguments.get("idempotency_key") == "pinned-key":
+                with calls_lock:
+                    handler_calls += 1
+                    call_number = handler_calls
+                if call_number == 1:
+                    first_entered.set()
+                    if not release_first.wait(timeout=2):
+                        raise RuntimeError("timed out waiting to release the first keyed call")
+            return original_handler(arguments)
+
+        def delayed_waiter_lookup(
+            lookup_slot: tuple[str, str] | None, fingerprint: str
+        ) -> dict[str, object] | None:
+            if threading.current_thread().name == "idempotency-waiter" and lookup_slot == slot:
+                waiter_before_lookup.set()
+                if not release_waiter_lookup.wait(timeout=2):
+                    raise RuntimeError("timed out waiting to inspect the pinned result")
+            return original_recorded_result(lookup_slot, fingerprint)
+
+        self.runtime._tool_handlers["apply_changes"] = delayed_handler
+        self.runtime._recorded_result = delayed_waiter_lookup
+        results: list[dict[str, object] | None] = [None, None]
+
+        def invoke(index: int) -> None:
+            results[index] = self.runtime.call_tool("apply_changes", request)
+
+        first = threading.Thread(target=invoke, args=(0,), name="idempotency-owner")
+        waiter = threading.Thread(target=invoke, args=(1,), name="idempotency-waiter")
+        with patch.object(server_module, "IDEMPOTENCY_CACHE_ENTRIES", 1):
+            first.start()
+            self.assertTrue(first_entered.wait(timeout=1))
+            waiter.start()
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                with self.runtime._idempotency_lock:
+                    if self.runtime._idempotency_pins.get(slot) == 2:
+                        break
+                time.sleep(0.01)
+            else:
+                self.fail("the duplicate call never registered as an idempotency waiter")
+
+            release_first.set()
+            try:
+                self.assertTrue(waiter_before_lookup.wait(timeout=1))
+                churn = self.runtime.call_tool(
+                    "apply_changes",
+                    {
+                        "changes": [
+                            {
+                                "action": "write",
+                                "path": "a.txt",
+                                "revision": self.revision("a.txt"),
+                                "content": "alpha\nbeta\ngamma\n",
+                            }
+                        ],
+                        "idempotency_key": "evictor",
+                    },
+                )
+                self.assertFalse(churn["isError"], churn)
+            finally:
+                release_waiter_lookup.set()
+                first.join(timeout=2)
+                waiter.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(handler_calls, 1)
+        completed = [result for result in results if result is not None]
+        self.assertEqual(len(completed), 2)
+        self.assertTrue(all(result["isError"] is False for result in completed))
+        self.assertEqual(
+            sum(
+                result["structuredContent"].get("idempotent_replay") is True
+                for result in completed
+            ),
+            1,
+        )
 
     def test_a_dry_run_under_a_key_never_answers_the_real_apply(self) -> None:
         changes = [{"action": "create", "path": "new.txt", "content": "x\n"}]

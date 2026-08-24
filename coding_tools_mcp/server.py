@@ -1564,6 +1564,11 @@ class Runtime:
         self._idempotency_lock = threading.Lock()
         self._idempotency_condition = threading.Condition(self._idempotency_lock)
         self._idempotency_inflight: set[tuple[str, str]] = set()
+        # Every keyed caller pins its cache slot before it either executes or
+        # waits. A completed owner may wake after enough unrelated completions
+        # to overflow the LRU; retaining the slot until all registered waiters
+        # drain guarantees they replay the result instead of executing twice.
+        self._idempotency_pins: dict[tuple[str, str], int] = {}
         # Command ids whose terminal outcome telemetry has already counted. A
         # finished command answers every later poll with the same outcome, so
         # without this one failing build is counted once per poll.
@@ -1991,9 +1996,7 @@ class Runtime:
                 content = spec.content_builder(payload) if spec.content_builder else None
                 return make_tool_result(name, payload, is_error=True, content=content)
             self.breaker.record_success(name, fingerprint, generation=breaker_generation)
-            if name in WORKSPACE_WRITE_TOOLS and not (
-                payload.get("dry_run") or payload.get("already_applied") or payload.get("idempotent_replay")
-            ):
+            if self._workspace_write_landed(name, payload):
                 # A write landed, so every "this call can never succeed"
                 # verdict the breaker holds was reached against a tree that no
                 # longer exists.
@@ -2132,16 +2135,42 @@ class Runtime:
         if slot is None:
             return
         with self._idempotency_condition:
-            while slot in self._idempotency_inflight:
-                self._idempotency_condition.wait()
-            self._idempotency_inflight.add(slot)
+            self._idempotency_pins[slot] = self._idempotency_pins.get(slot, 0) + 1
+            try:
+                while slot in self._idempotency_inflight:
+                    self._idempotency_condition.wait()
+                self._idempotency_inflight.add(slot)
+            except BaseException:
+                self._unpin_idempotency_slot_locked(slot)
+                raise
 
     def _finish_idempotent_call(self, slot: tuple[str, str] | None) -> None:
         if slot is None:
             return
         with self._idempotency_condition:
             self._idempotency_inflight.discard(slot)
+            self._unpin_idempotency_slot_locked(slot)
+            self._prune_idempotency_results_locked()
             self._idempotency_condition.notify_all()
+
+    def _unpin_idempotency_slot_locked(self, slot: tuple[str, str]) -> None:
+        remaining = self._idempotency_pins.get(slot, 0) - 1
+        if remaining > 0:
+            self._idempotency_pins[slot] = remaining
+        else:
+            self._idempotency_pins.pop(slot, None)
+
+    def _prune_idempotency_results_locked(self) -> None:
+        while len(self._idempotency_results) > IDEMPOTENCY_CACHE_ENTRIES:
+            victim = next(
+                (candidate for candidate in self._idempotency_results if candidate not in self._idempotency_pins),
+                None,
+            )
+            if victim is None:
+                # A short-lived overflow is safer than evicting a result a
+                # waiter has already been promised. The final waiter prunes it.
+                return
+            del self._idempotency_results[victim]
 
     def _recorded_result(self, slot: tuple[str, str] | None, fingerprint: str) -> dict[str, Any] | None:
         """Return the result a previous call under this key produced, if any.
@@ -2192,8 +2221,26 @@ class Runtime:
         with self._idempotency_lock:
             self._idempotency_results[slot] = (fingerprint, dict(payload))
             self._idempotency_results.move_to_end(slot)
-            while len(self._idempotency_results) > IDEMPOTENCY_CACHE_ENTRIES:
-                self._idempotency_results.popitem(last=False)
+            self._prune_idempotency_results_locked()
+
+    @staticmethod
+    def _workspace_write_landed(name: str, payload: dict[str, Any]) -> bool:
+        """Whether a structured write tool changed the workspace's net state."""
+
+        if name not in WORKSPACE_WRITE_TOOLS or any(
+            payload.get(flag) for flag in ("dry_run", "already_applied", "idempotent_replay")
+        ):
+            return False
+        affected = payload.get("affected_files")
+        if not isinstance(affected, list):
+            return False
+        non_mutating_operations = {"unchanged", "verify"}
+        operations = [
+            entry.get("operation")
+            for entry in affected
+            if isinstance(entry, dict) and isinstance(entry.get("operation"), str)
+        ]
+        return any(operation not in non_mutating_operations for operation in operations)
 
     def server_info(self, args: dict[str, Any]) -> dict[str, Any]:
         return self.server_info_payload()
