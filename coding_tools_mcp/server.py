@@ -59,6 +59,7 @@ from .changes import (
     ChangeRequest,
     apply_line_edits,
     parse_changes,
+    reject_duplicate_paths,
 )
 from .patching import (
     REVISION_ALGORITHM,
@@ -2716,9 +2717,12 @@ class Runtime:
         with self.patch_lock:
             # Every path in the array is resolved before anything is staged, so
             # a rejected path in the last change cannot leave the earlier ones
-            # half prepared.
+            # half prepared, and so the duplicate check below compares the
+            # names staging will actually use.
+            targets: list[tuple[int, str]] = []
             for change in changes:
-                self._validate_change_paths(change)
+                targets.extend(self._resolve_change_paths(change))
+            reject_duplicate_paths(targets)
             for change in changes:
                 if change.action in {"create", "write"}:
                     result = self._stage_written_file(change, staged)
@@ -2750,13 +2754,16 @@ class Runtime:
             "warnings": warnings,
         }
 
-    def _validate_change_paths(self, change: ChangeRequest) -> None:
+    def _resolve_change_paths(self, change: ChangeRequest) -> list[tuple[int, str]]:
+        """Validate one change's paths and return the display names it claims."""
+
         requires_existing = change.action in {"edit", "delete", "move", "copy"}
-        self._validate_patch_path(change.path, require_existing=requires_existing)
         self.workspace.reject_write_symlink(change.path)
+        targets = [(change.index, self._resolve_patch_path(change.path, require_existing=requires_existing))]
         if change.destination is not None:
-            self._validate_patch_path(change.destination, require_existing=False)
             self.workspace.reject_write_symlink(change.destination)
+            targets.append((change.index, self._resolve_patch_path(change.destination, require_existing=False)))
+        return targets
 
     def _stage_written_file(
         self, change: ChangeRequest, staged: dict[str, StagedFile]
@@ -2927,10 +2934,14 @@ class Runtime:
             )
 
     def _validate_patch_path(self, raw_path: str, *, require_existing: bool) -> None:
+        self._resolve_patch_path(raw_path, require_existing=require_existing)
+
+    def _resolve_patch_path(self, raw_path: str, *, require_existing: bool) -> str:
+        """Validate one patch target and return its workspace-relative display name."""
+
         if require_existing:
-            self.workspace.resolve_existing(raw_path)
-        else:
-            self.workspace.resolve_for_write(raw_path)
+            return self.workspace.resolve_existing(raw_path).display
+        return self.workspace.resolve_for_write(raw_path).display
 
     def _commit_staged_files(self, staged: list[StagedFile]) -> None:
         self.patch_committer.commit(staged)

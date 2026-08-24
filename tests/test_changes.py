@@ -4,7 +4,13 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from coding_tools_mcp.changes import apply_line_edits, content_lines, parse_changes, split_lines
+from coding_tools_mcp.changes import (
+    apply_line_edits,
+    content_lines,
+    parse_changes,
+    reject_duplicate_paths,
+    split_lines,
+)
 from coding_tools_mcp.errors import ToolFailure
 from coding_tools_mcp.patching import content_revision
 from coding_tools_mcp.server import Runtime
@@ -144,25 +150,16 @@ class ChangeParsingTests(unittest.TestCase):
             parse_changes([{"action": "create", "path": "a.txt", "content": "x", "revision": "r"}])
         self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
 
-    def test_two_changes_to_one_path_are_refused(self) -> None:
+    def test_two_changes_naming_one_resolved_path_are_refused(self) -> None:
         with self.assertRaises(ToolFailure) as raised:
-            parse_changes(
-                [
-                    {"action": "write", "path": "a.txt", "content": "x", "revision": "r"},
-                    {"action": "delete", "path": "a.txt", "revision": "r"},
-                ]
-            )
+            reject_duplicate_paths([(0, "a.txt"), (1, "a.txt")])
         self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
         self.assertIn("apply_patch", raised.exception.message)
+        self.assertEqual(raised.exception.details["change_indexes"], [0, 1])
 
     def test_a_destination_that_collides_with_another_change_is_refused(self) -> None:
         with self.assertRaises(ToolFailure) as raised:
-            parse_changes(
-                [
-                    {"action": "create", "path": "a.txt", "content": "x"},
-                    {"action": "move", "path": "b.txt", "destination": "a.txt", "revision": "r"},
-                ]
-            )
+            reject_duplicate_paths([(0, "a.txt"), (1, "b.txt"), (1, "a.txt")])
         self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
 
     def test_fields_that_do_not_belong_to_an_action_are_refused(self) -> None:
@@ -374,6 +371,53 @@ class ApplyChangesRuntimeTests(unittest.TestCase):
                 }
             )
         self.assertFalse((self.workspace / "first.txt").exists())
+
+    def test_two_spellings_of_one_path_are_refused_rather_than_overwriting(self) -> None:
+        # Staging keys files by their resolved display path, so "a.txt" and
+        # "./a.txt" are one entry: without a check on the resolved name the
+        # second change silently replaced the first and both were reported as
+        # applied.
+        with self.assertRaises(ToolFailure) as raised:
+            self.runtime.apply_changes(
+                {
+                    "changes": [
+                        {
+                            "action": "write",
+                            "path": "a.txt",
+                            "revision": self.revision("a.txt"),
+                            "content": "written\n",
+                        },
+                        {
+                            "action": "edit",
+                            "path": "./a.txt",
+                            "revision": self.revision("a.txt"),
+                            "edits": [edit(op="replace", start_line=1, content="edited")],
+                        },
+                    ]
+                }
+            )
+        self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
+        self.assertEqual(raised.exception.details["path"], "a.txt")
+        self.assertEqual(raised.exception.details["change_indexes"], [0, 1])
+        self.assertEqual((self.workspace / "a.txt").read_text(encoding="utf-8"), "alpha\nbeta\ngamma\n")
+
+    def test_a_destination_colliding_with_another_change_is_refused_after_resolution(self) -> None:
+        with self.assertRaises(ToolFailure) as raised:
+            self.runtime.apply_changes(
+                {
+                    "changes": [
+                        {"action": "create", "path": "new.txt", "content": "x\n"},
+                        {
+                            "action": "copy",
+                            "path": "a.txt",
+                            "revision": self.revision("a.txt"),
+                            "destination": "./new.txt",
+                        },
+                    ]
+                }
+            )
+        self.assertEqual(raised.exception.code, "INVALID_ARGUMENT")
+        self.assertFalse((self.workspace / "new.txt").exists())
 
     def test_paths_outside_the_workspace_are_refused_before_staging(self) -> None:
         for path in ("../escape.txt", "/etc/passwd"):

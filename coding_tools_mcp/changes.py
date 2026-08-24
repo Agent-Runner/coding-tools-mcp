@@ -12,6 +12,7 @@ which is where workspace policy lives.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -91,9 +92,7 @@ def parse_changes(raw: Any) -> list[ChangeRequest]:
             category="validation",
             details={"max_changes": MAX_CHANGES_PER_CALL, "received": len(raw)},
         )
-    parsed = [_parse_change(entry, index) for index, entry in enumerate(raw)]
-    _reject_duplicate_paths(parsed)
-    return parsed
+    return [_parse_change(entry, index) for index, entry in enumerate(raw)]
 
 
 def _parse_change(entry: Any, index: int) -> ChangeRequest:
@@ -260,28 +259,30 @@ def _require_int(entry: dict[str, Any], field: str, location: str) -> int:
     return value
 
 
-def _reject_duplicate_paths(changes: list[ChangeRequest]) -> None:
+def reject_duplicate_paths(targets: Sequence[tuple[int, str]]) -> None:
     """One path, one change.
 
     apply_changes is declarative: two entries naming one path describe two
     states for it, and the line numbers in the second were read before the
     first existed. apply_patch is the tool that chains edits to one file.
+
+    Each entry pairs the index of the change with the *resolved* display path
+    it names, because that is the key the staging map uses. Comparing the raw
+    request strings instead would let ``a.txt`` and ``./a.txt`` through as two
+    changes and let the second silently overwrite the first.
     """
 
     seen: dict[str, int] = {}
-    for change in changes:
-        for path in (change.path, change.destination):
-            if path is None:
-                continue
-            if path in seen:
-                raise ToolFailure(
-                    "INVALID_ARGUMENT",
-                    f"changes[{change.index}] names {path}, which changes[{seen[path]}] already names. "
-                    "Combine them into one change, or use apply_patch to chain edits to one file.",
-                    category="validation",
-                    details={"path": path, "change_indexes": [seen[path], change.index]},
-                )
-            seen[path] = change.index
+    for index, path in targets:
+        if path in seen:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                f"changes[{index}] names {path}, which changes[{seen[path]}] already names. "
+                "Combine them into one change, or use apply_patch to chain edits to one file.",
+                category="validation",
+                details={"path": path, "change_indexes": [seen[path], index]},
+            )
+        seen[path] = index
 
 
 def content_lines(content: str) -> list[str]:
