@@ -262,6 +262,7 @@ class BreakerInRuntimeTests(unittest.TestCase):
                         "cmd": f'"{sys.executable}" -c "print(\'done\')"',
                         "yield_time_ms": 5000,
                         "timeout_ms": 5000,
+                        "verbosity": "summary",
                     },
                 )
                 self.assertEqual(command["structuredContent"]["operation_outcome"], "exited_0")
