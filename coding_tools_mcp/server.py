@@ -244,8 +244,8 @@ IDEMPOTENCY_KEY_DESCRIPTION = (
     "(flagged idempotent_replay) instead of doing the work twice. Use a new key for new work: "
     "the key is bound to the arguments that first used it, and reusing it with any other "
     "argument — including a different dry_run — is refused with IDEMPOTENCY_KEY_REUSED. "
-    "Only a successful non-dry-run result is recorded, and only the last "
-    f"{IDEMPOTENCY_CACHE_ENTRIES} of them per tool."
+    "Only a successful non-dry-run result is recorded, and only the "
+    f"{IDEMPOTENCY_CACHE_ENTRIES} most recently used keys are kept across all tools."
 )
 _COMMAND_RECOVERY_HINT = (
     "This command_id has expired or never existed; a finished command keeps its"
@@ -2246,12 +2246,21 @@ class Runtime:
         command_id = payload.get("command_id")
         if not isinstance(command_id, str) or not command_id:
             return
-        mutation = self.workspace_mutation_payload()
-        commands_may_write = (
-            not self.workspace_mutation.structured_only
-            or mutation.get("enforced") is not True
-            or bool(self._workspace_write_path_roots)
-        )
+        with self.commands_lock:
+            command = self.commands.get(command_id) or self.output_commands.get(command_id)
+        if command is not None:
+            # This launch-specific fact handles a Landlock ruleset install
+            # that failed open even when the host still advertises support.
+            commands_may_write = command.workspace_may_write
+        else:
+            # Synthetic/embedder-provided command payloads have no retained
+            # CommandRun. Conservatively fall back to the advertised policy.
+            mutation = self.workspace_mutation_payload()
+            commands_may_write = (
+                not self.workspace_mutation.structured_only
+                or mutation.get("enforced") is not True
+                or bool(self._workspace_write_path_roots)
+            )
         if not commands_may_write:
             return
         with self._breaker_reset_commands_lock:
@@ -2810,7 +2819,7 @@ class Runtime:
             summaries: list[str] = []
             affected: dict[str, dict[str, Any]] = {}
             warnings: list[str] = []
-            already_applied_files = 0
+            already_applied_operations = 0
             additions = 0
             removals = 0
             for op in operations:
@@ -2871,8 +2880,9 @@ class Runtime:
                     outcome = apply_update_hunks_detailed(content, op.hunks, op.path)
                     updated = outcome.content
                     warnings.extend(f"{source.display}: {item}" for item in outcome.warnings)
-                    if outcome.applied_hunks == 0 and outcome.already_applied_hunks:
-                        already_applied_files += 1
+                    operation_already_applied = (
+                        outcome.applied_hunks == 0 and bool(outcome.already_applied_hunks)
+                    )
                     for hunk in op.hunks:
                         for line in hunk.lines:
                             additions += line.startswith("+")
@@ -2883,6 +2893,10 @@ class Runtime:
                         dest = self.workspace.resolve_for_write(op.move_to)
                         if dest.existed and dest.display != source.display:
                             raise ToolFailure("PATCH_FAILED", "Cannot move over an existing file.", category="validation")
+                        # Already-matching hunks make the content update a
+                        # no-op, but relocating the file is still a write.
+                        if operation_already_applied and dest.display == source.display:
+                            already_applied_operations += 1
                         dest_baseline = baseline if dest.display == source.display else FileBaseline.capture(dest.path)
                         staged[source.display] = StagedFile(
                             source.display,
@@ -2922,6 +2936,8 @@ class Runtime:
                             )
                         summaries.append(f"R {source.display} -> {dest.display}")
                     else:
+                        if operation_already_applied:
+                            already_applied_operations += 1
                         # Re-writing identical bytes would bump the mtime and
                         # make a no-op patch look like an edit to every watcher
                         # on the tree, so an already-applied update is staged
@@ -2955,7 +2971,10 @@ class Runtime:
         return {
             "dry_run": dry_run,
             "clean": True,
-            "already_applied": already_applied_files > 0 and already_applied_files == len(operations),
+            "already_applied": (
+                already_applied_operations > 0
+                and already_applied_operations == len(operations)
+            ),
             "revision_algorithm": REVISION_ALGORITHM,
             "summary": "\n".join(summaries),
             "affected_files": list(affected.values()),
@@ -3234,6 +3253,7 @@ class Runtime:
         deadline = start + (timeout_ms / 1000.0)
         landlock_fd: int | None = None
         landlock_warning: str | None = None
+        landlock_confined = False
         popen_cmd: Any = cmd
         popen_shell = True
         popen_extra = process_group_popen_kwargs()
@@ -3248,10 +3268,18 @@ class Runtime:
                 popen_cmd = landlock_exec_argv(landlock_fd, cmd)
                 popen_shell = False
                 popen_extra["pass_fds"] = (landlock_fd,)
+                landlock_confined = True
             except ToolFailure as exc:
                 if exc.code != "SANDBOX_UNAVAILABLE":
                     raise
                 landlock_warning = landlock_unavailable_warning(exc)
+        mutation = self.workspace_mutation_payload()
+        workspace_may_write = (
+            not self.workspace_mutation.structured_only
+            or mutation.get("enforced") is not True
+            or bool(self._workspace_write_path_roots)
+            or not landlock_confined
+        )
         with self.commands_lock:
             if self._closed or self.command_manager.closed:
                 if landlock_fd is not None:
@@ -3286,6 +3314,8 @@ class Runtime:
                 timeout_at=deadline,
                 warnings=[landlock_warning] if landlock_warning else None,
                 pty_master_fd=pty_master_fd,
+                landlock_confined=landlock_confined,
+                workspace_may_write=workspace_may_write,
             )
             with self.commands_lock:
                 self.starting_commands -= 1
@@ -3608,6 +3638,8 @@ class Runtime:
         timeout_at: float | None = None,
         warnings: list[str] | None = None,
         pty_master_fd: int | None = None,
+        landlock_confined: bool = False,
+        workspace_may_write: bool = True,
     ) -> CommandRun:
         return CommandRun(
             command_id=secrets.token_urlsafe(18),
@@ -3615,6 +3647,8 @@ class Runtime:
             timeout_at=timeout_at,
             warnings=warnings or [],
             pty_master_fd=pty_master_fd,
+            landlock_confined=landlock_confined,
+            workspace_may_write=workspace_may_write,
             on_evict=self.command_manager.record_output_eviction,
         )
 

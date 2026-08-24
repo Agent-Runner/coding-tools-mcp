@@ -131,6 +131,12 @@ class CommandRun:
     process: subprocess.Popen[bytes]
     timeout_at: float | None = None
     warnings: list[str] = field(default_factory=list)
+    # Facts about this command's launch, retained with its output so any
+    # terminal observer can decide whether the process could have changed the
+    # workspace. These describe the command that actually ran, not the
+    # server's advertised Landlock capability.
+    landlock_confined: bool = False
+    workspace_may_write: bool = True
     stdout: bytearray = field(default_factory=bytearray)
     stderr: bytearray = field(default_factory=bytearray)
     stdout_head: bytearray = field(default_factory=bytearray)

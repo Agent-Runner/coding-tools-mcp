@@ -4,8 +4,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from coding_tools_mcp import server as server_module
 from coding_tools_mcp.breaker import RepeatFailureBreaker, argument_fingerprint
+from coding_tools_mcp.errors import ToolFailure
 from coding_tools_mcp.server import Runtime, WorkspaceMutationPolicy
 
 
@@ -160,6 +163,42 @@ class BreakerInRuntimeTests(unittest.TestCase):
                 self.assertFalse(self.call(runtime, {"path": "late.txt"})["isError"])
             finally:
                 runtime.close()
+
+    def test_an_already_applied_update_that_moves_the_file_is_a_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            source = workspace / "source.txt"
+            source.write_text("anchor\nnew\n", encoding="utf-8")
+            runtime = Runtime(workspace, permission_mode="safe")
+            destination_args = {"path": "destination.txt"}
+            try:
+                self.call(runtime, destination_args)
+                self.call(runtime, destination_args)
+                moved = runtime.call_tool(
+                    "apply_patch",
+                    {
+                        "patch": (
+                            "*** Begin Patch\n"
+                            "*** Update File: source.txt\n"
+                            "*** Move to: destination.txt\n"
+                            "@@\n"
+                            " anchor\n"
+                            "-old\n"
+                            "+new\n"
+                            "*** End Patch\n"
+                        )
+                    },
+                )
+                read = self.call(runtime, destination_args)
+                source_exists_after_move = source.exists()
+            finally:
+                runtime.close()
+        self.assertFalse(moved["isError"], moved)
+        self.assertIs(moved["structuredContent"]["already_applied"], False)
+        self.assertEqual(moved["structuredContent"]["affected_files"][0]["operation"], "move")
+        self.assertFalse(source_exists_after_move)
+        self.assertFalse(read["isError"], read)
+        self.assertEqual(read["structuredContent"]["content"], "anchor\nnew\n")
 
     def test_a_completed_exec_makes_workspace_read_verdicts_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -359,6 +398,49 @@ class BreakerInRuntimeTests(unittest.TestCase):
             finally:
                 runtime.close()
         self.assertEqual(command["structuredContent"]["operation_outcome"], "exited_0")
+        self.assertFalse(read["isError"], read)
+
+    def test_landlock_install_failure_clears_stale_verdicts_for_that_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime = Runtime(
+                workspace,
+                permission_mode="trusted",
+                workspace_mutation=WorkspaceMutationPolicy(mode="structured-only"),
+            )
+
+            def unavailable(*_args: object, **_kwargs: object) -> int:
+                raise ToolFailure(
+                    "SANDBOX_UNAVAILABLE",
+                    "simulated Landlock install failure",
+                    category="security",
+                )
+
+            args = {"path": "late.txt"}
+            try:
+                self.call(runtime, args)
+                self.call(runtime, args)
+                with patch.object(
+                    server_module,
+                    "landlock_status_payload",
+                    return_value={"available": True, "abi_version": 6},
+                ), patch.object(server_module, "open_landlock_ruleset", side_effect=unavailable):
+                    self.assertIs(runtime.workspace_mutation_payload()["enforced"], True)
+                    command = runtime.call_tool(
+                        "exec_command",
+                        {
+                            "cmd": "printf 'created\\n' > late.txt",
+                            "yield_time_ms": 5000,
+                            "timeout_ms": 5000,
+                        },
+                    )
+                read = self.call(runtime, args)
+            finally:
+                runtime.close()
+        self.assertEqual(command["structuredContent"]["operation_outcome"], "exited_0")
+        self.assertTrue(
+            any("Landlock" in item for item in command["structuredContent"].get("warnings", []))
+        )
         self.assertFalse(read["isError"], read)
 
     def test_a_dry_run_changes_nothing_and_does_not_clear_the_breaker(self) -> None:

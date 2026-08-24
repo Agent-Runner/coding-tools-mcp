@@ -54,14 +54,20 @@ The v0.5.0 reliability work. Migration notes:
   twice, so a lost response is safe to retry. A key names one request: it is
   recorded with a fingerprint of the arguments that earned it, reusing it for
   different arguments is `IDEMPOTENCY_KEY_REUSED` rather than a replay of work
-  that was never done, and a `dry_run` result is never recorded at all.
+  that was never done, and a `dry_run` result is never recorded at all. The
+  runtime keeps one 64-entry LRU of `(tool, key)` results across both tools,
+  not a separate cache per tool.
 - **A repeat-failure circuit breaker.** The third byte-identical call that
   would produce the same deterministic error is refused with
   `REPEATED_CALL_BLOCKED`. Changing any argument gives the revised call a fresh
-  budget; a successful `apply_patch` or `apply_changes` clears the breaker
-  entirely, as does terminal `exec_command` in unrestricted workspace mode,
-  because the workspace state that made the call impossible may have changed.
-  `IDEMPOTENCY_KEY_REUSED` is excluded because its repair is a new key.
+  budget; a successful write, including a move whose hunks were already
+  present, clears the breaker entirely. The first terminal observation of each
+  `command_id` from `exec_command`, `write_stdin`, `read_output`, or
+  `kill_command` also clears it when that command could write: in unrestricted
+  mode, under an unenforced structured-only policy, through a configured write
+  path, or after Landlock setup failed open. Later observations of the same
+  command do not clear it again. `IDEMPOTENCY_KEY_REUSED` is excluded because
+  its repair is a new key.
 - **Per-tool `outputSchema`** in `tools/list`, replacing one generic envelope.
 - **A real-task evaluation harness** under `benchmarks/agent_eval/`, which runs
   the same tasks and prompt through an agent's native tools and through this
@@ -81,7 +87,8 @@ The v0.5.0 reliability work. Migration notes:
 - **A successful patch returns evidence**: `changed_ranges`, a per-file
   `revision`, and `total_lines`. These are evidence only; `apply_patch` still
   takes no `revision` argument, because its context lines are already its
-  optimistic check.
+  optimistic check. For chained blocks, ranges describe the net original
+  baseline-to-final result rather than accumulated intermediate ranges.
 - **A failed patch returns repair data**: the hunk index, nearby numbered text,
   and candidate match positions, so the next attempt can be aimed.
 - **A patch whose changes are already present reports `already_applied`**
@@ -89,7 +96,9 @@ The v0.5.0 reliability work. Migration notes:
   trailing-whitespace match of a block that carries a context line, or a
   multi-line addition. A context-free single line that happens to occur
   somewhere in the file is a coincidence, not a completed edit, and still
-  fails with `PATCH_CONTEXT_NOT_FOUND`.
+  fails with `PATCH_CONTEXT_NOT_FOUND`. A `*** Move to:` that actually
+  relocates the file remains a write and reports `already_applied: false` even
+  when every hunk was already present.
 - **Same-path chaining in `apply_patch` is now promised.** Several
   `*** Update File` blocks naming one path in one envelope chain in order. This
   already worked and is now documented, unit-tested, and covered by
@@ -103,10 +112,10 @@ The v0.5.0 reliability work. Migration notes:
 - **Telemetry counts operations truthfully.** A command that exits nonzero,
   times out, or dies on a signal is no longer recorded as a successful tool
   call; its terminal outcome is counted once rather than again on every
-  `write_stdin` or `kill_command` poll that observes it; and consecutive
-  failures are tracked per (tool, error code) rather than in one global slot
-  any tool's success could reset. A 0.5.0 dashboard is not comparable to an
-  earlier one.
+  `exec_command`, `write_stdin`, `read_output`, or `kill_command` observation;
+  and consecutive failures are tracked per (tool, error code) rather than in
+  one global slot any tool's success could reset. A 0.5.0 dashboard is not
+  comparable to an earlier one.
 - **`check_exec_environment` warns on non-Linux hosts** that there is no
   Landlock and therefore no filesystem confinement.
 - **`server_info` discloses the output retention TTL and the completed-command
