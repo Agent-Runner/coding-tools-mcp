@@ -363,12 +363,36 @@ class ShellEnvPolicy:
     set: dict[str, str] = field(default_factory=dict)
 
 
+WORKSPACE_MUTATION_CHOICES = ("unrestricted", "structured-only")
+
+
+@dataclass(frozen=True)
+class WorkspaceMutationPolicy:
+    """Who may write to the workspace: the tools only, or commands too.
+
+    ``structured-only`` makes the workspace read-only for `exec_command` under
+    Landlock, leaving `apply_patch` and `apply_changes` as the only way in.
+    Every real project needs somewhere to put build output, so `write_paths`
+    is the escape hatch, and the default stays ``unrestricted`` because
+    defaulting this on would break pytest, npm, cargo, gradle, and git in one
+    release.
+    """
+
+    mode: str = "unrestricted"
+    write_paths: tuple[str, ...] = ()
+
+    @property
+    def structured_only(self) -> bool:
+        return self.mode == "structured-only"
+
+
 @dataclass(frozen=True)
 class RuntimePolicy:
     permission_mode: str
     shell_env_policy: ShellEnvPolicy
     allow_network: bool
     fake_readonly_annotations: bool = False
+    workspace_mutation: WorkspaceMutationPolicy = WorkspaceMutationPolicy()
 
 
 OAUTH_TOKEN_AUTH_METHODS = ("client_secret_basic", "client_secret_post", "none")
@@ -551,6 +575,25 @@ def fake_readonly_annotations_from_args(args: argparse.Namespace, permission_mod
     return requested
 
 
+def workspace_mutation_policy_from_args(args: argparse.Namespace) -> WorkspaceMutationPolicy:
+    raw_mode = (
+        getattr(args, "workspace_mutation", None)
+        or os.environ.get(f"{ENV_PREFIX}_WORKSPACE_MUTATION")
+        or "unrestricted"
+    )
+    mode = str(raw_mode).strip().lower()
+    if mode not in WORKSPACE_MUTATION_CHOICES:
+        supported = ", ".join(WORKSPACE_MUTATION_CHOICES)
+        raise ValueError(f"workspace mutation mode must be one of: {supported}")
+    raw_paths = list(getattr(args, "write_path", None) or ())
+    from_env = os.environ.get(f"{ENV_PREFIX}_WRITE_PATHS") or ""
+    raw_paths.extend(part for part in from_env.split(os.pathsep) if part.strip())
+    write_paths = tuple(dict.fromkeys(part.strip() for part in raw_paths if part.strip()))
+    if write_paths and mode != "structured-only":
+        raise ValueError("--write-path only applies with --workspace-mutation structured-only")
+    return WorkspaceMutationPolicy(mode=mode, write_paths=write_paths)
+
+
 def runtime_policy_from_args(args: argparse.Namespace) -> RuntimePolicy:
     permission_mode = permission_mode_from_args(args)
     allow_network = (
@@ -563,6 +606,7 @@ def runtime_policy_from_args(args: argparse.Namespace) -> RuntimePolicy:
         shell_env_policy=shell_env_policy_from_args(args),
         allow_network=allow_network,
         fake_readonly_annotations=fake_readonly_annotations_from_args(args, permission_mode),
+        workspace_mutation=workspace_mutation_policy_from_args(args),
     )
 
 
@@ -1383,10 +1427,19 @@ class Runtime:
         oauth_config: OAuthConfig | None = None,
         project_context: ProjectContext | None = None,
         fake_readonly_annotations: bool = False,
+        workspace_mutation: WorkspaceMutationPolicy | None = None,
         transport: str = "stdio",
         command_manager: WorkspaceCommandManager | None = None,
     ) -> None:
         self.workspace = Workspace(workspace)
+        self.workspace_mutation = workspace_mutation or WorkspaceMutationPolicy()
+        if self.workspace_mutation.mode not in WORKSPACE_MUTATION_CHOICES:
+            raise ToolFailure(
+                "INVALID_ARGUMENT",
+                f"Unknown workspace mutation mode: {self.workspace_mutation.mode}",
+                category="validation",
+                details={"supported": list(WORKSPACE_MUTATION_CHOICES)},
+            )
         self.enable_view_image = enable_view_image
         if permission_mode not in PERMISSION_MODE_CHOICES:
             raise ToolFailure(
@@ -1565,7 +1618,51 @@ class Runtime:
         return self.capabilities.landlock
 
     def landlock_write_roots(self) -> list[Path]:
-        return [self.runtime_dir]
+        roots = [self.runtime_dir]
+        if self.workspace_mutation.structured_only:
+            roots.extend(self.workspace_write_paths())
+        return roots
+
+    def workspace_write_paths(self) -> list[Path]:
+        """Resolve the configured write allowlist inside the workspace.
+
+        A write path that escapes the workspace would widen the sandbox past
+        the boundary every other tool enforces, so it is dropped rather than
+        honoured.
+        """
+
+        resolved: list[Path] = []
+        for entry in self.workspace_mutation.write_paths:
+            candidate = Path(entry)
+            absolute = candidate if candidate.is_absolute() else self.workspace.root / candidate
+            try:
+                real = absolute.resolve(strict=False)
+            except OSError:
+                continue
+            if is_relative_to(real, self.workspace.root):
+                resolved.append(real)
+        return resolved
+
+    def workspace_mutation_payload(self) -> dict[str, Any]:
+        """Disclose who may write to the workspace, and whether it is enforced.
+
+        `structured-only` is enforced by Landlock. Where Landlock is
+        unavailable the mode is a statement of intent and nothing more, and
+        saying so is the difference between a policy and a false promise.
+        """
+
+        enforced = self.workspace_mutation.structured_only and self.landlock_enabled() and (
+            bool(landlock_status_payload().get("available"))
+        )
+        return {
+            "mode": self.workspace_mutation.mode,
+            "write_paths": [
+                normalize_rel_display(path, self.workspace.root) for path in self.workspace_write_paths()
+            ],
+            "enforced": enforced if self.workspace_mutation.structured_only else True,
+            "enforced_by": "landlock" if self.workspace_mutation.structured_only else "none",
+            "structured_write_tools": sorted(WORKSPACE_WRITE_TOOLS),
+        }
 
     def is_allowed_command_tmp_path(self, candidate: str) -> bool:
         if self.capabilities.skip_all_permissions:
@@ -1691,6 +1788,7 @@ class Runtime:
                 "global_tmp_write": self.global_tmp_write_policy(),
                 "secret_env_filter": self.secret_env_filter_policy(),
             },
+            "workspace_mutation_policy": self.workspace_mutation_payload(),
             "shell_env_inherit": self.shell_env_policy.inherit,
             "shell_env_include_only": list(self.shell_env_policy.include_only),
             "shell_env_exclude": list(self.shell_env_policy.exclude),
@@ -1889,6 +1987,12 @@ class Runtime:
             )
         if not landlock.get("available"):
             warnings.append("Linux Landlock filesystem confinement is unavailable")
+        mutation = self.workspace_mutation_payload()
+        if self.workspace_mutation.structured_only and not mutation["enforced"]:
+            warnings.append(
+                "workspace_mutation=structured-only is not enforced without Landlock; "
+                "exec_command can still write to the workspace"
+            )
         if self.capabilities.skip_all_permissions:
             warnings.append("permission_mode=dangerous disables MCP safety gates")
         if self.fake_readonly_annotations:
@@ -1901,6 +2005,7 @@ class Runtime:
             "landlock_enabled": self._landlock_enforced(landlock),
             "landlock_abi": landlock.get("abi_version"),
             "global_tmp_write": self.global_tmp_write_policy(),
+            "workspace_mutation_policy": mutation,
             "warnings": warnings,
         }
 
@@ -2867,6 +2972,7 @@ class Runtime:
                     self.workspace.root,
                     guard_allow_roots(),
                     write_roots=self.landlock_write_roots(),
+                    workspace_writable=not self.workspace_mutation.structured_only,
                 )
                 popen_cmd = landlock_exec_argv(landlock_fd, cmd)
                 popen_shell = False
@@ -4672,7 +4778,13 @@ def landlock_device_access(handled: int) -> int:
     )
 
 
-def open_landlock_ruleset(workspace: Path, read_roots: list[str], *, write_roots: list[Path] | None = None) -> int:
+def open_landlock_ruleset(
+    workspace: Path,
+    read_roots: list[str],
+    *,
+    write_roots: list[Path] | None = None,
+    workspace_writable: bool = True,
+) -> int:
     version = landlock_abi_version()
     handled = landlock_handled_access(version)
     ruleset_attr = LandlockRulesetAttr(handled)
@@ -4696,7 +4808,12 @@ def open_landlock_ruleset(workspace: Path, read_roots: list[str], *, write_roots
             LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR
         )
         device_access = landlock_device_access(handled)
-        add_landlock_path(ruleset_fd, workspace, workspace_access)
+        # Under structured-only the workspace itself is read-only for the
+        # command, so the write roots below are the complete list of places a
+        # command may still write.
+        add_landlock_path(
+            ruleset_fd, workspace, workspace_access if workspace_writable else readonly_access
+        )
         for write_root in write_roots or []:
             add_landlock_path(ruleset_fd, write_root, workspace_access, required=False)
         for read_root in read_roots:
@@ -6398,12 +6515,19 @@ def build_runtime(
         oauth_config=oauth_config,
         project_context=project_context,
         fake_readonly_annotations=runtime_policy.fake_readonly_annotations,
+        workspace_mutation=runtime_policy.workspace_mutation,
         transport=transport,
         command_manager=command_manager,
     )
     if emit_warning and runtime.capabilities.skip_all_permissions:
         print(
             "WARNING: permission_mode=dangerous disables MCP safety gates. Use only inside an isolated container or VM.",
+            file=sys.stderr,
+        )
+    if emit_warning and runtime.workspace_mutation.structured_only and not runtime.workspace_mutation_payload()["enforced"]:
+        print(
+            "WARNING: --workspace-mutation structured-only needs Linux Landlock to be enforced. "
+            "Without it exec_command can still write to the workspace.",
             file=sys.stderr,
         )
     if emit_warning and runtime.fake_readonly_annotations:
@@ -6609,6 +6733,29 @@ def build_parser() -> argparse.ArgumentParser:
             "exec_command permission mode: safe denies network/shell-expansion/inline-script gates; "
             "trusted allows local development network, shell expansion, and inline scripts; "
             "dangerous disables permission gates"
+        ),
+    )
+    parser.add_argument(
+        "--workspace-mutation",
+        choices=WORKSPACE_MUTATION_CHOICES,
+        default=None,
+        help=(
+            "who may write to the workspace: unrestricted (default) lets exec_command write; "
+            "structured-only makes the workspace read-only for commands under Landlock, leaving "
+            "apply_patch and apply_changes as the only way in. Experimental: it breaks any command "
+            "that writes into the tree (pytest caches, npm, cargo, gradle, git) unless every such "
+            f"directory is listed with --write-path; also settable with {ENV_PREFIX}_WORKSPACE_MUTATION"
+        ),
+    )
+    parser.add_argument(
+        "--write-path",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help=(
+            "workspace-relative directory that stays writable under "
+            "--workspace-mutation structured-only; repeatable, and also settable as an "
+            f"os.pathsep-separated {ENV_PREFIX}_WRITE_PATHS"
         ),
     )
     parser.add_argument(
