@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from coding_tools_mcp.breaker import RepeatFailureBreaker, argument_fingerprint
-from coding_tools_mcp.server import Runtime
+from coding_tools_mcp.server import Runtime, WorkspaceMutationPolicy
 
 
 class ArgumentFingerprintTests(unittest.TestCase):
@@ -180,6 +181,117 @@ class BreakerInRuntimeTests(unittest.TestCase):
         self.assertFalse(command["isError"], command)
         self.assertEqual(command["structuredContent"]["operation_outcome"], "exited_0")
         self.assertFalse(read["isError"], read)
+
+    def test_a_terminal_write_stdin_poll_makes_workspace_read_verdicts_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            command_text = (
+                f'"{sys.executable}" -c "import time; time.sleep(0.2); '
+                "open('late.txt', 'w').write('created\\\\n')\""
+            )
+            try:
+                self.call(runtime, {"path": "late.txt"})
+                self.call(runtime, {"path": "late.txt"})
+                command = runtime.call_tool(
+                    "exec_command",
+                    {"cmd": command_text, "yield_time_ms": 1, "timeout_ms": 5000},
+                )
+                self.assertEqual(command["structuredContent"]["operation_outcome"], "running")
+                poll: dict[str, object] = {}
+                for _ in range(20):
+                    poll = runtime.call_tool(
+                        "write_stdin",
+                        {
+                            "command_id": command["structuredContent"]["command_id"],
+                            "chars": "",
+                            "yield_time_ms": 250,
+                        },
+                    )
+                    if poll["structuredContent"]["operation_outcome"] != "running":
+                        break
+                read = self.call(runtime, {"path": "late.txt"})
+            finally:
+                runtime.close()
+        self.assertEqual(poll["structuredContent"]["operation_outcome"], "exited_0")
+        self.assertFalse(read["isError"], read)
+
+    def test_every_terminal_command_observer_can_clear_stale_verdicts(self) -> None:
+        arguments = {
+            "write_stdin": {"command_id": "observed", "chars": ""},
+            "read_output": {"output_ref": "command:observed:stdout"},
+            "kill_command": {"command_id": "observed"},
+        }
+        for tool_name, tool_args in arguments.items():
+            with self.subTest(tool=tool_name), tempfile.TemporaryDirectory() as tmp:
+                workspace = Path(tmp)
+                runtime = Runtime(workspace, permission_mode="trusted")
+                try:
+                    self.call(runtime, {"path": "late.txt"})
+                    self.call(runtime, {"path": "late.txt"})
+                    (workspace / "late.txt").write_text("created\n", encoding="utf-8")
+                    runtime._tool_handlers[tool_name] = lambda _args: {
+                        "command_id": "observed",
+                        "operation_outcome": "exited_0",
+                    }
+                    observed = runtime.call_tool(tool_name, tool_args)
+                    read = self.call(runtime, {"path": "late.txt"})
+                finally:
+                    runtime.close()
+                self.assertFalse(observed["isError"], observed)
+                self.assertFalse(read["isError"], read)
+
+    def test_a_structured_only_command_with_a_write_path_clears_stale_verdicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime = Runtime(
+                workspace,
+                permission_mode="trusted",
+                workspace_mutation=WorkspaceMutationPolicy(
+                    mode="structured-only", write_paths=("generated",)
+                ),
+            )
+            try:
+                args = {"path": "generated/late.txt"}
+                self.call(runtime, args)
+                self.call(runtime, args)
+                command = runtime.call_tool(
+                    "exec_command",
+                    {
+                        "cmd": "printf 'created\\n' > generated/late.txt",
+                        "yield_time_ms": 5000,
+                        "timeout_ms": 5000,
+                    },
+                )
+                read = self.call(runtime, args)
+            finally:
+                runtime.close()
+        self.assertEqual(command["structuredContent"]["operation_outcome"], "exited_0")
+        self.assertFalse(read["isError"], read)
+
+    def test_a_structured_only_command_without_a_write_path_keeps_verdicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Runtime(
+                Path(tmp),
+                permission_mode="trusted",
+                workspace_mutation=WorkspaceMutationPolicy(mode="structured-only"),
+            )
+            try:
+                args = {"path": "late.txt"}
+                self.call(runtime, args)
+                self.call(runtime, args)
+                command = runtime.call_tool(
+                    "exec_command",
+                    {
+                        "cmd": f'"{sys.executable}" -c "pass"',
+                        "yield_time_ms": 5000,
+                        "timeout_ms": 5000,
+                    },
+                )
+                read = self.call(runtime, args)
+            finally:
+                runtime.close()
+        self.assertEqual(command["structuredContent"]["operation_outcome"], "exited_0")
+        self.assertEqual(read["structuredContent"]["error"]["code"], "REPEATED_CALL_BLOCKED")
 
     def test_a_dry_run_changes_nothing_and_does_not_clear_the_breaker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

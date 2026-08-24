@@ -1867,6 +1867,13 @@ class PatchLocatorTests(unittest.TestCase):
             'def greet(n):\n    print("hi")\n\n\ndef farewell(n):\n    print("bye")\n',
         )
 
+    def test_scope_warning_is_only_emitted_when_the_scope_narrows_candidates(self) -> None:
+        outcome = apply_update_hunks_detailed(
+            "def farewell(n):\n    print('hi')\n",
+            [PatchHunk(["-    print('hi')", "+    print('bye')"], "def farewell")],
+        )
+        self.assertFalse(any("@@ scope" in warning for warning in outcome.warnings))
+
     def test_missing_scope_leaves_identical_bodies_ambiguous(self) -> None:
         with self.assertRaises(ToolFailure) as raised:
             apply_update_hunks_detailed(DUPLICATE_SCOPES, [['-    print("hi")', '+    print("bye")']])
@@ -1996,6 +2003,46 @@ class SamePathChainingTests(unittest.TestCase):
             runtime.apply_patch({"patch": patch_text})
             self.assertEqual((workspace / "app.py").read_text(encoding="utf-8"), "FIRST\ntwo\n")
 
+    def test_changed_ranges_are_rebased_against_the_final_chained_text(self) -> None:
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-b\n"
+            "+B\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "+x\n"
+            " a\n"
+            "*** End Patch\n"
+        )
+        with self._runtime("a\nb\nc\n") as (workspace, runtime):
+            payload = runtime.apply_patch({"patch": patch_text})
+            self.assertEqual((workspace / "app.py").read_text(encoding="utf-8"), "x\na\nB\nc\n")
+            self.assertEqual(
+                payload["affected_files"][0]["changed_ranges"],
+                [
+                    {"start_line": 1, "end_line": 1, "added_lines": 1, "removed_lines": 0},
+                    {"start_line": 3, "end_line": 3, "added_lines": 1, "removed_lines": 1},
+                ],
+            )
+
+    def test_delete_evidence_does_not_inherit_update_match_quality(self) -> None:
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-one\n"
+            "+ONE\n"
+            "*** Delete File: app.py\n"
+            "*** End Patch\n"
+        )
+        with self._runtime("one\n") as (_workspace, runtime):
+            payload = runtime.apply_patch({"patch": patch_text})
+        evidence = payload["affected_files"][0]
+        self.assertEqual(evidence["operation"], "delete")
+        self.assertNotIn("match_quality", evidence)
+
 
 class PatchEvidenceAndIdempotencyTests(unittest.TestCase):
     def test_changed_ranges_name_only_the_lines_that_differ(self) -> None:
@@ -2051,6 +2098,16 @@ class PatchEvidenceAndIdempotencyTests(unittest.TestCase):
 
     def test_already_applied_evidence_must_be_inside_the_named_scope(self) -> None:
         content = "def wrong():\n    marker\n    new\n\ndef target():\n    pass\n"
+        hunk = PatchHunk(
+            ["     marker", "-    old", "+    new"],
+            "def target",
+        )
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed(content, [hunk])
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_already_applied_evidence_stops_at_the_next_scope(self) -> None:
+        content = "def target():\n    pass\n\ndef wrong():\n    marker\n    new\n"
         hunk = PatchHunk(
             ["     marker", "-    old", "+    new"],
             "def target",

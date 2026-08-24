@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import ctypes
+import errno
 import hashlib
 import html
 import difflib
@@ -67,6 +68,7 @@ from .patching import (
     FileBaseline,
     StagedFile,
     apply_update_hunks_detailed,
+    changed_ranges_between,
     content_revision,
     parse_patch,
     read_text_preserve_newlines,
@@ -77,6 +79,7 @@ from .processes import (
     COMMAND_HEAD_BUFFER_DIVISOR,
     COMMAND_OUTCOMES,
     CommandRun,
+    command_outcome,
     spawn_process,
     start_reader_threads,
     start_command_watchdog,
@@ -704,7 +707,11 @@ def _merge_patch_affected_file(
         affected[path] = entry
         return
     merged = dict(entry)
-    if entry.get("operation") != "delete":
+    if entry.get("operation") == "delete":
+        # A deleted file has no final text whose placement quality could be
+        # inspected. Do not leak evidence from an earlier staged update.
+        merged.pop("match_quality", None)
+    else:
         previous_ranges = previous.get("changed_ranges")
         current_ranges = entry.get("changed_ranges")
         merged["changed_ranges"] = [
@@ -1492,6 +1499,7 @@ class Runtime:
                 category="validation",
                 details={"supported": list(WORKSPACE_MUTATION_CHOICES)},
             )
+        self._workspace_write_path_roots = tuple(self._resolve_workspace_write_paths())
         self.enable_view_image = enable_view_image
         if permission_mode not in PERMISSION_MODE_CHOICES:
             raise ToolFailure(
@@ -1677,17 +1685,16 @@ class Runtime:
     def landlock_write_roots(self) -> list[Path]:
         roots = [self.runtime_dir]
         if self.workspace_mutation.structured_only:
-            roots.extend(self.workspace_write_paths())
+            roots.extend(self._ensure_workspace_write_paths())
         return roots
 
-    def workspace_write_paths(self) -> list[Path]:
-        """Resolve the configured write allowlist inside the workspace.
+    def _resolve_workspace_write_paths(self) -> list[Path]:
+        """Resolve and validate the configured workspace write allowlist.
 
         A write path that escapes the workspace would widen the sandbox past
         the boundary every other tool enforces, so it is dropped rather than
-        honoured. Landlock cannot attach a rule to a path that does not exist,
-        so valid configured directories are created before they are reported
-        or passed to the ruleset.
+        honoured. Resolution is deliberately side-effect free: reporting tools
+        must not create directories merely by describing the policy.
         """
 
         resolved: list[Path] = []
@@ -1699,20 +1706,10 @@ class Runtime:
             except OSError:
                 continue
             if is_relative_to(real, self.workspace.root):
-                try:
-                    real.mkdir(parents=True, exist_ok=True)
-                except OSError as exc:
-                    raise ToolFailure(
-                        "SANDBOX_UNAVAILABLE",
-                        f"Configured write path could not be created: {entry}",
-                        category="security",
-                        details={
-                            "path": entry,
-                            "errno": exc.errno,
-                            "reason": exc.strerror or str(exc),
-                        },
-                    ) from exc
-                if not real.is_dir():
+                existing = real
+                while not existing.exists() and existing != self.workspace.root:
+                    existing = existing.parent
+                if existing.exists() and not existing.is_dir():
                     raise ToolFailure(
                         "INVALID_ARGUMENT",
                         f"Configured write path is not a directory: {entry}",
@@ -1721,6 +1718,46 @@ class Runtime:
                     )
                 resolved.append(real)
         return resolved
+
+    def workspace_write_paths(self) -> list[Path]:
+        """Return the validated allowlist without mutating the workspace."""
+
+        return list(self._workspace_write_path_roots)
+
+    def _ensure_workspace_write_paths(self) -> list[Path]:
+        """Create allowlisted directories immediately before Landlock uses them."""
+
+        for path in self._workspace_write_path_roots:
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                display = normalize_rel_display(path, self.workspace.root)
+                if exc.errno in {errno.EEXIST, errno.ENOTDIR}:
+                    raise ToolFailure(
+                        "INVALID_ARGUMENT",
+                        f"Configured write path is not a directory: {display}",
+                        category="validation",
+                        details={"path": display},
+                    ) from exc
+                raise ToolFailure(
+                    "SANDBOX_UNAVAILABLE",
+                    f"Configured write path could not be created: {display}",
+                    category="security",
+                    details={
+                        "path": display,
+                        "errno": exc.errno,
+                        "reason": exc.strerror or str(exc),
+                    },
+                ) from exc
+            if not path.is_dir():
+                display = normalize_rel_display(path, self.workspace.root)
+                raise ToolFailure(
+                    "INVALID_ARGUMENT",
+                    f"Configured write path is not a directory: {display}",
+                    category="validation",
+                    details={"path": display},
+                )
+        return self.workspace_write_paths()
 
     def workspace_mutation_payload(self) -> dict[str, Any]:
         """Disclose who may write to the workspace, and whether it is enforced.
@@ -1951,14 +1988,12 @@ class Runtime:
                 # verdict the breaker holds was reached against a tree that no
                 # longer exists.
                 self.breaker.reset()
-            elif (
-                name == "exec_command"
-                and not self.workspace_mutation.structured_only
-                and payload.get("operation_outcome") not in {None, "running", "spawn_error"}
+            elif payload.get("operation_outcome") in set(COMMAND_OUTCOMES) - {"running", "spawn_error"} and (
+                not self.workspace_mutation.structured_only or bool(self._workspace_write_path_roots)
             ):
-                # In unrestricted mode a completed command may have changed
-                # any workspace path. Verdicts reached against the old tree
-                # are stale even when the command ultimately exited nonzero.
+                # Any tool that observes a completed command may be the first
+                # to learn that it changed the workspace. Structured-only
+                # commands can do so only when a write root was configured.
                 self.breaker.reset()
             self._record_result(idempotency_key, fingerprint, payload)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
@@ -2846,6 +2881,10 @@ class Runtime:
                                 **evidence,
                             },
                         )
+                        if prior is not None:
+                            affected[dest.display]["changed_ranges"] = changed_ranges_between(
+                                baseline.text(source.display), updated
+                            )
                         summaries.append(f"R {source.display} -> {dest.display}")
                     else:
                         # Re-writing identical bytes would bump the mtime and
@@ -2869,6 +2908,10 @@ class Runtime:
                                 **evidence,
                             },
                         )
+                        if prior is not None:
+                            affected[source.display]["changed_ranges"] = changed_ranges_between(
+                                baseline.text(source.display), updated
+                            )
                         summaries.append(f"{'=' if unchanged else 'M'} {source.display}")
             if not affected:
                 raise ToolFailure("PATCH_FAILED", "No files were modified.", category="validation")
@@ -3232,7 +3275,7 @@ class Runtime:
                         "code": "COMMAND_SPAWN_FAILED",
                         "message": f"Failed to start command: {exc}",
                         "category": "runtime",
-                        "retryable": False,
+                        "retryable": exc.errno in {errno.EAGAIN, errno.ENOMEM},
                         "details": {
                             "errno": exc.errno,
                             "reason": exc.strerror or str(exc),
@@ -3770,6 +3813,19 @@ class Runtime:
         if omitted_bytes:
             self.command_manager.record_omitted_read("read_output")
         result = {
+            "command_id": command.command_id,
+            "operation_outcome": command_outcome(
+                "timeout"
+                if command.timed_out
+                else "running"
+                if command.process.poll() is None
+                else "terminated"
+                if command.signal_name is not None
+                else "exited",
+                command.exit_code,
+                command.signal_name,
+                command.timed_out,
+            ),
             "output_ref": output_ref,
             "stream_output_ref": f"command:{command.command_id}:{stream}",
             "stream": stream,
@@ -5493,6 +5549,8 @@ def output_schemas() -> dict[str, dict[str, Any]]:
         # the head-truncation fields the `truncation` block declares, and its
         # byte counts are per stream rather than one `total_bytes`.
         "read_output": {
+            "command_id": string,
+            "operation_outcome": {**string, "enum": list(COMMAND_OUTCOMES)},
             "output_ref": string,
             "stream_output_ref": string,
             "stream": string,
@@ -6906,7 +6964,17 @@ def run_http(args: argparse.Namespace) -> int:
         )
         return 2
 
-    runtime = build_runtime(args, runtime_policy, auth_token=auth_token, oauth_config=oauth_config, transport="http")
+    try:
+        runtime = build_runtime(
+            args,
+            runtime_policy,
+            auth_token=auth_token,
+            oauth_config=oauth_config,
+            transport="http",
+        )
+    except ToolFailure as exc:
+        print(f"ERROR: {exc.code}: {exc.message}", file=sys.stderr)
+        return 2
     server = RuntimeHTTPServer((args.host, args.port), MCPHandler, runtime)
     if oauth_config:
         url_label = oauth_config.server_url or "dynamic request URL"
@@ -6933,7 +7001,11 @@ def run_stdio(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    runtime = build_runtime(args, runtime_policy)
+    try:
+        runtime = build_runtime(args, runtime_policy)
+    except ToolFailure as exc:
+        print(f"ERROR: {exc.code}: {exc.message}", file=sys.stderr)
+        return 2
     return serve_stdio(runtime)
 
 

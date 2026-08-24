@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import io
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -12,6 +14,7 @@ from coding_tools_mcp.server import (
     WorkspaceMutationPolicy,
     build_parser,
     open_landlock_ruleset,
+    run_stdio,
     runtime_policy_from_args,
     workspace_mutation_policy_from_args,
 )
@@ -89,7 +92,7 @@ class WorkspaceMutationRuntimeTests(unittest.TestCase):
             finally:
                 runtime.close()
 
-    def test_a_missing_write_path_is_created_before_it_is_reported(self) -> None:
+    def test_reporting_a_missing_write_path_does_not_create_it(self) -> None:
         with TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             runtime = self.runtime(
@@ -100,11 +103,58 @@ class WorkspaceMutationRuntimeTests(unittest.TestCase):
             try:
                 payload = runtime.workspace_mutation_payload()
                 expected = (workspace / "generated" / "nested").resolve()
-                self.assertTrue(expected.is_dir())
+                self.assertFalse(expected.exists())
                 self.assertEqual(runtime.workspace_write_paths(), [expected])
                 self.assertEqual(payload["write_paths"], ["generated/nested"])
+                runtime.server_info_payload()
+                runtime.check_exec_environment({})
+                self.assertFalse(expected.exists())
             finally:
                 runtime.close()
+
+    def test_landlock_initialization_creates_a_missing_write_path(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            expected = workspace / "generated" / "nested"
+            runtime = self.runtime(
+                workspace,
+                mode="structured-only",
+                write_paths=("generated/nested",),
+            )
+            try:
+                with patch.object(runtime, "landlock_enabled", return_value=True), patch(
+                    f"{open_landlock_ruleset.__module__}.open_landlock_ruleset"
+                ) as ruleset:
+                    ruleset.side_effect = RuntimeError("stop after the ruleset is described")
+                    with self.assertRaises(RuntimeError):
+                        runtime.exec_command({"cmd": "true"})
+                self.assertTrue(expected.is_dir())
+                self.assertIn(expected.resolve(), ruleset.call_args.kwargs["write_roots"])
+            finally:
+                runtime.close()
+
+    def test_a_write_path_that_is_a_file_is_a_clean_cli_error(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "build").write_text("not a directory", encoding="utf-8")
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                status = run_stdio(
+                    parse(
+                        [
+                            "--stdio",
+                            "--workspace",
+                            str(workspace),
+                            "--workspace-mutation",
+                            "structured-only",
+                            "--write-path",
+                            "build",
+                        ]
+                    )
+                )
+        self.assertEqual(status, 2)
+        self.assertIn("INVALID_ARGUMENT", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_a_write_path_outside_the_workspace_is_dropped(self) -> None:
         with TemporaryDirectory() as tmp:

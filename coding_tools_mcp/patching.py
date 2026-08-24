@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import hashlib
 import os
 import re
@@ -558,6 +559,41 @@ def changed_ranges(matched: list[MatchedHunk]) -> list[dict[str, int]]:
     return ranges
 
 
+def changed_ranges_between(before: str, after: str) -> list[dict[str, int]]:
+    """Describe the final-file ranges changed between two complete texts.
+
+    Sequential patch blocks locate each hunk against a different intermediate
+    file. Comparing the original baseline with the final staged text keeps all
+    reported line numbers in the one coordinate system the caller can inspect.
+    """
+
+    def content_lines(value: str) -> list[str]:
+        _bom, text = strip_bom(value)
+        if not text:
+            return []
+        lines = normalize_to_lf(text).split("\n")
+        if lines[-1] == "":
+            lines.pop()
+        return lines
+
+    before_lines = content_lines(before)
+    after_lines = content_lines(after)
+    ranges: list[dict[str, int]] = []
+    matcher = difflib.SequenceMatcher(a=before_lines, b=after_lines, autojunk=False)
+    for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        ranges.append(
+            {
+                "start_line": new_start + 1,
+                "end_line": new_end,
+                "added_lines": new_end - new_start,
+                "removed_lines": old_end - old_start,
+            }
+        )
+    return ranges
+
+
 def _unchanged_margins(old: list[str], new: list[str]) -> tuple[int, int]:
     limit = min(len(old), len(new))
     prefix = 0
@@ -635,17 +671,37 @@ def _filter_by_scope(
             continue
         governed: dict[int, list[int]] = {}
         for candidate in candidates:
-            preceding = [anchor for anchor in anchors if anchor <= candidate]
-            if not preceding:
+            containing = [
+                anchor
+                for anchor in anchors
+                if anchor <= candidate < _scope_region_end(lines, anchor)
+            ]
+            if not containing:
                 continue
-            governed.setdefault(max(preceding), []).append(candidate)
+            governed.setdefault(max(containing), []).append(candidate)
         if len(governed) == 1:
-            return next(iter(governed.values())), True
+            selected = next(iter(governed.values()))
+            return selected, len(selected) < len(candidates)
         if governed:
-            return sorted(value for group in governed.values() for value in group), True
+            selected = sorted(value for group in governed.values() for value in group)
+            return selected, len(selected) < len(candidates)
         if strict:
             return [], True
     return ([], False) if strict else (candidates, False)
+
+
+def _scope_region_end(lines: list[str], anchor: int) -> int:
+    """Return the first nonblank line dedented out of an anchored scope."""
+
+    anchor_line = lines[anchor]
+    indentation = len(anchor_line) - len(anchor_line.lstrip())
+    for index in range(anchor + 1, len(lines)):
+        line = lines[index]
+        if not line.strip():
+            continue
+        if len(line) - len(line.lstrip()) <= indentation:
+            return index
+    return len(lines)
 
 
 def _scope_anchors(lines: list[str], scope: str, *, exact: bool) -> list[int]:
