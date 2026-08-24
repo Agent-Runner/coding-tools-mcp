@@ -190,6 +190,14 @@ class ApplyChangesRuntimeTests(unittest.TestCase):
     def revision(self, name: str) -> str:
         return content_revision((self.workspace / name).read_text(encoding="utf-8"))
 
+    def test_an_empty_array_reaches_the_caller_as_a_tool_error_like_apply_patch(self) -> None:
+        # Schema validation raising invalid-params here would hand the model a
+        # transport fault instead of the readable verdict apply_patch gives.
+        changes = self.runtime.call_tool("apply_changes", {"changes": []})
+        patch = self.runtime.call_tool("apply_patch", {"patch": "*** Begin Patch\n*** End Patch"})
+        self.assertTrue(changes["isError"])
+        self.assertEqual(changes["structuredContent"]["error"], patch["structuredContent"]["error"])
+
     def test_an_edit_needs_the_revision_and_applies_with_it(self) -> None:
         change = {
             "action": "edit",

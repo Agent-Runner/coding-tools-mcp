@@ -5493,12 +5493,15 @@ def input_schemas() -> dict[str, dict[str, Any]]:
             {
                 "changes": {
                     "type": "array",
-                    "minItems": 1,
+                    # No minItems: an empty array is answered by the handler with
+                    # the same readable PATCH_FAILED apply_patch gives an empty
+                    # envelope, rather than a transport-level invalid-params
+                    # error the model cannot act on.
                     "maxItems": MAX_CHANGES_PER_CALL,
                     "description": (
-                        "One entry per file. A path may appear once per call; use apply_patch to chain "
-                        "several edits onto one file. The whole request must fit in 1 MiB, so keep it to "
-                        "roughly 20 files per call."
+                        "One entry per file, at least one. A path may appear once per call; use "
+                        "apply_patch to chain several edits onto one file. The whole request must fit in "
+                        "1 MiB, so keep it to roughly 20 files per call."
                     ),
                     "items": object_schema(
                         {
