@@ -629,13 +629,20 @@ class OperationOutcomeTests(unittest.TestCase):
                 )
                 command_id = started["structuredContent"]["command_id"]
                 self.assertEqual(started["structuredContent"]["operation_outcome"], "running")
-                for _ in range(2):
+                poll_calls = 0
+                for _ in range(20):
                     polled = runtime.call_tool(
                         "write_stdin",
-                        {"command_id": command_id, "chars": "", "yield_time_ms": 5000},
+                        {"command_id": command_id, "chars": "", "yield_time_ms": 250},
                     )
-                    # The poll still tells the truth about the command…
-                    self.assertEqual(polled["structuredContent"]["operation_outcome"], "exited_nonzero")
+                    poll_calls += 1
+                    if polled["structuredContent"]["operation_outcome"] != "running":
+                        break
+                # The poll still tells the truth about the command…
+                self.assertEqual(polled["structuredContent"]["operation_outcome"], "exited_nonzero")
+                repeated = runtime.call_tool("write_stdin", {"command_id": command_id, "chars": ""})
+                poll_calls += 1
+                self.assertEqual(repeated["structuredContent"]["operation_outcome"], "exited_nonzero")
             finally:
                 runtime.close()
         summaries = {
@@ -648,8 +655,8 @@ class OperationOutcomeTests(unittest.TestCase):
         self.assertEqual(summaries["exec_command"]["operation_failures"], 1)
         self.assertNotIn("outcome_exited_nonzero", summaries["write_stdin"])
         self.assertEqual(summaries["write_stdin"]["operation_failures"], 0)
-        self.assertEqual(summaries["write_stdin"]["calls"], 2)
-        self.assertEqual(summaries["write_stdin"]["ok"], 2)
+        self.assertEqual(summaries["write_stdin"]["calls"], poll_calls)
+        self.assertEqual(summaries["write_stdin"]["ok"], poll_calls)
 
     def test_every_terminal_observer_attributes_the_outcome_to_exec_command(self) -> None:
         for observer in ("write_stdin", "read_output", "kill_command"):
