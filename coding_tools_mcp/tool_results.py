@@ -100,7 +100,7 @@ def _render_read_file(payload: dict[str, Any]) -> str:
     if not isinstance(content, str):
         return ""
     shown = (
-        f"{payload.get('path', '')} lines {payload.get('start_line', '?')}-{payload.get('end_line', '?')}"
+        f"Showing lines {payload.get('start_line', '?')}-{payload.get('end_line', '?')}"
         f" of {payload.get('total_lines', '?')}"
     )
     # apply_changes requires the revision of the bytes the model actually read.

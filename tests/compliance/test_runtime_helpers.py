@@ -943,7 +943,9 @@ Maven home: /usr/share/maven
                 if item.get("type") == "text"
             )
             self.assertEqual(payload["content"], content)
-            self.assertEqual(model_text, content)
+            # The banner names the revision apply_changes will ask for; the
+            # content below it must still arrive whole.
+            self.assertEqual(model_text, f"[Showing lines 1-1 of 1 revision={payload['revision']}]\n{content}")
             self.assertNotIn("preview truncated", model_text)
 
     def agent_text(self, result: dict[str, object]) -> str:
@@ -1488,6 +1490,11 @@ Maven home: /usr/share/maven
                     {
                         "buffer_bytes_per_stream": server_module.COMMAND_BUFFER_BYTES,
                         "head_bytes_per_stream": server_module.COMMAND_BUFFER_BYTES // 8,
+                        # Output does not only get trimmed, it expires and gets
+                        # dropped wholesale; limitations.md promises both are
+                        # discoverable here rather than only in the source.
+                        "completed_command_ttl_seconds": server_module.COMPLETED_COMMAND_TTL_SECONDS,
+                        "max_retained_completed_commands": server_module.MAX_RETAINED_OUTPUT_COMMANDS,
                     },
                 )
 
