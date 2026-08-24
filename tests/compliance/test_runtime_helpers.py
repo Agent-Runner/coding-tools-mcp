@@ -1981,8 +1981,7 @@ class SamePathChainingTests(unittest.TestCase):
             self.assertEqual(
                 evidence["changed_ranges"],
                 [
-                    {"start_line": 1, "end_line": 1, "added_lines": 1, "removed_lines": 1},
-                    {"start_line": 2, "end_line": 2, "added_lines": 1, "removed_lines": 1},
+                    {"start_line": 1, "end_line": 2, "added_lines": 2, "removed_lines": 2},
                 ],
             )
 
@@ -2025,6 +2024,69 @@ class SamePathChainingTests(unittest.TestCase):
                     {"start_line": 1, "end_line": 1, "added_lines": 1, "removed_lines": 0},
                     {"start_line": 3, "end_line": 3, "added_lines": 1, "removed_lines": 1},
                 ],
+            )
+
+    def test_nested_insert_expands_an_earlier_added_span(self) -> None:
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            " start\n"
+            "+line1\n"
+            "+line2\n"
+            "+line3\n"
+            " end\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            " line1\n"
+            "+line1b\n"
+            " line2\n"
+            "*** End Patch\n"
+        )
+        with self._runtime("start\nend\n") as (workspace, runtime):
+            payload = runtime.apply_patch({"patch": patch_text})
+            self.assertEqual(
+                (workspace / "app.py").read_text(encoding="utf-8"),
+                "start\nline1\nline1b\nline2\nline3\nend\n",
+            )
+            self.assertEqual(
+                payload["affected_files"][0]["changed_ranges"],
+                [{"start_line": 2, "end_line": 5, "added_lines": 4, "removed_lines": 0}],
+            )
+
+    def test_update_then_move_reports_only_final_destination_evidence(self) -> None:
+        patch_text = (
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            " a\n"
+            "-b\n"
+            "+B\n"
+            "-c\n"
+            "+C\n"
+            " d\n"
+            "*** Update File: app.py\n"
+            "*** Move to: moved.py\n"
+            "@@\n"
+            " B\n"
+            "+x\n"
+            " C\n"
+            "*** End Patch\n"
+        )
+        with self._runtime("a\nb\nc\nd\n") as (workspace, runtime):
+            payload = runtime.apply_patch({"patch": patch_text})
+            final = "a\nB\nx\nC\nd\n"
+            self.assertFalse((workspace / "app.py").exists())
+            self.assertEqual((workspace / "moved.py").read_text(encoding="utf-8"), final)
+            self.assertEqual(len(payload["affected_files"]), 1)
+            evidence = payload["affected_files"][0]
+            self.assertEqual(evidence["path"], "moved.py")
+            self.assertEqual(evidence["old_path"], "app.py")
+            self.assertEqual(evidence["operation"], "move")
+            self.assertEqual(evidence["revision"], content_revision(final))
+            self.assertEqual(
+                evidence["changed_ranges"],
+                [{"start_line": 2, "end_line": 4, "added_lines": 3, "removed_lines": 2}],
             )
 
     def test_delete_evidence_does_not_inherit_update_match_quality(self) -> None:

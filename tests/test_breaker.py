@@ -240,6 +240,44 @@ class BreakerInRuntimeTests(unittest.TestCase):
                 self.assertFalse(observed["isError"], observed)
                 self.assertFalse(read["isError"], read)
 
+    def test_a_terminal_command_resets_the_breaker_only_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "a.txt").write_text("present\n", encoding="utf-8")
+            runtime = Runtime(workspace, permission_mode="trusted")
+            patch_args = {
+                "patch": (
+                    "*** Begin Patch\n"
+                    "*** Update File: a.txt\n"
+                    "@@\n"
+                    "-missing\n"
+                    "+replacement\n"
+                    "*** End Patch\n"
+                )
+            }
+            try:
+                command = runtime.call_tool(
+                    "exec_command",
+                    {
+                        "cmd": f'"{sys.executable}" -c "print(\'done\')"',
+                        "yield_time_ms": 5000,
+                        "timeout_ms": 5000,
+                    },
+                )
+                self.assertEqual(command["structuredContent"]["operation_outcome"], "exited_0")
+                output_ref = command["structuredContent"]["output_refs"]["stdout"]
+
+                first = runtime.call_tool("apply_patch", patch_args)
+                runtime.call_tool("read_output", {"output_ref": output_ref})
+                second = runtime.call_tool("apply_patch", patch_args)
+                runtime.call_tool("read_output", {"output_ref": output_ref})
+                third = runtime.call_tool("apply_patch", patch_args)
+            finally:
+                runtime.close()
+        self.assertEqual(first["structuredContent"]["error"]["code"], "PATCH_CONTEXT_NOT_FOUND")
+        self.assertEqual(second["structuredContent"]["error"]["code"], "PATCH_CONTEXT_NOT_FOUND")
+        self.assertEqual(third["structuredContent"]["error"]["code"], "REPEATED_CALL_BLOCKED")
+
     def test_a_structured_only_command_with_a_write_path_clears_stale_verdicts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -292,6 +330,35 @@ class BreakerInRuntimeTests(unittest.TestCase):
                 runtime.close()
         self.assertEqual(command["structuredContent"]["operation_outcome"], "exited_0")
         self.assertEqual(read["structuredContent"]["error"]["code"], "REPEATED_CALL_BLOCKED")
+
+    def test_unenforced_structured_only_mode_clears_stale_verdicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime = Runtime(
+                workspace,
+                permission_mode="dangerous",
+                workspace_mutation=WorkspaceMutationPolicy(mode="structured-only"),
+            )
+            try:
+                mutation = runtime.workspace_mutation_payload()
+                self.assertEqual(mutation["mode"], "structured-only")
+                self.assertIs(mutation["enforced"], False)
+                args = {"path": "late.txt"}
+                self.call(runtime, args)
+                self.call(runtime, args)
+                command = runtime.call_tool(
+                    "exec_command",
+                    {
+                        "cmd": "printf 'created\\n' > late.txt",
+                        "yield_time_ms": 5000,
+                        "timeout_ms": 5000,
+                    },
+                )
+                read = self.call(runtime, args)
+            finally:
+                runtime.close()
+        self.assertEqual(command["structuredContent"]["operation_outcome"], "exited_0")
+        self.assertFalse(read["isError"], read)
 
     def test_a_dry_run_changes_nothing_and_does_not_clear_the_breaker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
