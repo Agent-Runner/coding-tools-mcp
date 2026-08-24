@@ -508,8 +508,13 @@ def apply_update_hunks_detailed(content: str, hunks: HunkInput, path: str = "<pa
                 },
             )
 
+    # Splicing back to front keeps every later placement's indices valid.
+    # Two placements can share a start (a hunk that only adds lines is an
+    # empty span), and the one spliced last is the one whose text ends up
+    # first, so the final-file order is this order reversed.
+    application_order = sorted(matched, key=lambda item: item.start, reverse=True)
     updated_lines = list(lines)
-    for matched_hunk in sorted(matched, key=lambda item: item.start, reverse=True):
+    for matched_hunk in application_order:
         updated_lines = updated_lines[: matched_hunk.start] + matched_hunk.new + updated_lines[matched_hunk.end :]
     updated = "\n".join(updated_lines)
     quality = "exact"
@@ -522,7 +527,7 @@ def apply_update_hunks_detailed(content: str, hunks: HunkInput, path: str = "<pa
         )
     return UpdateOutcome(
         content=bom + restore_line_endings(updated, line_ending),
-        changed_ranges=changed_ranges(matched),
+        changed_ranges=changed_ranges(list(reversed(application_order))),
         match_quality=quality,
         warnings=warnings,
         already_applied_hunks=already_applied,
@@ -530,8 +535,14 @@ def apply_update_hunks_detailed(content: str, hunks: HunkInput, path: str = "<pa
     )
 
 
-def changed_ranges(matched: list[MatchedHunk]) -> list[dict[str, int]]:
+def changed_ranges(matched: Sequence[MatchedHunk]) -> list[dict[str, int]]:
     """Map each placement onto 1-based line numbers in the *new* file.
+
+    ``matched`` must already be ordered the way its replacement text appears
+    in the new file, because each range is offset by the net line count of the
+    ones before it. Sorting by ``start`` alone is not that order: placements
+    that share a start are ordered by which one was spliced last, which only
+    the caller doing the splicing knows.
 
     Context lines a hunk carried only to locate itself are trimmed off both
     ends, so the reported range names the lines that actually differ rather
@@ -542,7 +553,7 @@ def changed_ranges(matched: list[MatchedHunk]) -> list[dict[str, int]]:
 
     ranges: list[dict[str, int]] = []
     delta = 0
-    for item in sorted(matched, key=lambda entry: entry.start):
+    for item in matched:
         removed = item.end - item.start
         added = len(item.new)
         prefix, suffix = _unchanged_margins(item.old, item.new)
