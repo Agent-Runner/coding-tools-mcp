@@ -68,7 +68,6 @@ from .patching import (
     FileBaseline,
     StagedFile,
     apply_update_hunks_detailed,
-    changed_ranges_between,
     content_revision,
     parse_patch,
     read_text_preserve_newlines,
@@ -690,6 +689,65 @@ def _whole_file_range(text: str) -> list[dict[str, int]]:
     return [{"start_line": 1, "end_line": lines, "added_lines": lines, "removed_lines": 0}]
 
 
+def _rebase_patch_changed_ranges(
+    previous: list[dict[str, int]], current: list[dict[str, int]]
+) -> list[dict[str, int]]:
+    """Move earlier hunk ranges through a later update's line changes."""
+
+    later_changes: list[tuple[int, int, int]] = []
+    cumulative_delta = 0
+    for item in sorted(current, key=lambda value: value["start_line"]):
+        added = item["added_lines"]
+        removed = item["removed_lines"]
+        old_start = item["start_line"] - 1 - cumulative_delta
+        later_changes.append((old_start, removed, added - removed))
+        cumulative_delta += added - removed
+
+    rebased: list[dict[str, int]] = []
+    for item in previous:
+        start = item["start_line"] - 1
+        added = item["added_lines"]
+        end = start + added
+        shift = 0
+        superseded = False
+        for old_start, removed, delta in later_changes:
+            old_end = old_start + removed
+            if removed == 0:
+                if start >= old_start:
+                    shift += delta
+                continue
+            if added == 0:
+                if old_start <= start < old_end:
+                    superseded = True
+                    break
+                if start >= old_end:
+                    shift += delta
+                continue
+            if end <= old_start:
+                continue
+            if start >= old_end:
+                shift += delta
+                continue
+            superseded = True
+            break
+        if superseded:
+            continue
+        moved = dict(item)
+        moved["start_line"] += shift
+        moved["end_line"] += shift
+        rebased.append(moved)
+
+    combined = sorted(
+        [*rebased, *current],
+        key=lambda value: (value["start_line"], value["end_line"]),
+    )
+    unique: list[dict[str, int]] = []
+    for item in combined:
+        if item not in unique:
+            unique.append(item)
+    return unique
+
+
 def _merge_patch_affected_file(
     affected: dict[str, dict[str, Any]], entry: dict[str, Any]
 ) -> None:
@@ -711,13 +769,15 @@ def _merge_patch_affected_file(
         # A deleted file has no final text whose placement quality could be
         # inspected. Do not leak evidence from an earlier staged update.
         merged.pop("match_quality", None)
+        affected[path] = merged
+        return
     else:
         previous_ranges = previous.get("changed_ranges")
         current_ranges = entry.get("changed_ranges")
-        merged["changed_ranges"] = [
-            *(previous_ranges if isinstance(previous_ranges, list) else []),
-            *(current_ranges if isinstance(current_ranges, list) else []),
-        ]
+        merged["changed_ranges"] = _rebase_patch_changed_ranges(
+            previous_ranges if isinstance(previous_ranges, list) else [],
+            current_ranges if isinstance(current_ranges, list) else [],
+        )
     if merged.get("operation") == "unchanged" and previous.get("operation") != "unchanged":
         merged["operation"] = previous["operation"]
     quality_order = {"exact": 0, "trailing_ws": 1, "indent": 2}
@@ -2881,10 +2941,6 @@ class Runtime:
                                 **evidence,
                             },
                         )
-                        if prior is not None:
-                            affected[dest.display]["changed_ranges"] = changed_ranges_between(
-                                baseline.text(source.display), updated
-                            )
                         summaries.append(f"R {source.display} -> {dest.display}")
                     else:
                         # Re-writing identical bytes would bump the mtime and
@@ -2908,10 +2964,6 @@ class Runtime:
                                 **evidence,
                             },
                         )
-                        if prior is not None:
-                            affected[source.display]["changed_ranges"] = changed_ranges_between(
-                                baseline.text(source.display), updated
-                            )
                         summaries.append(f"{'=' if unchanged else 'M'} {source.display}")
             if not affected:
                 raise ToolFailure("PATCH_FAILED", "No files were modified.", category="validation")

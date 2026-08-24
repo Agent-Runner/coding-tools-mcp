@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import difflib
 import hashlib
 import os
 import re
@@ -556,41 +555,6 @@ def changed_ranges(matched: list[MatchedHunk]) -> list[dict[str, int]]:
             }
         )
         delta += added - removed
-    return ranges
-
-
-def changed_ranges_between(before: str, after: str) -> list[dict[str, int]]:
-    """Describe the final-file ranges changed between two complete texts.
-
-    Sequential patch blocks locate each hunk against a different intermediate
-    file. Comparing the original baseline with the final staged text keeps all
-    reported line numbers in the one coordinate system the caller can inspect.
-    """
-
-    def content_lines(value: str) -> list[str]:
-        _bom, text = strip_bom(value)
-        if not text:
-            return []
-        lines = normalize_to_lf(text).split("\n")
-        if lines[-1] == "":
-            lines.pop()
-        return lines
-
-    before_lines = content_lines(before)
-    after_lines = content_lines(after)
-    ranges: list[dict[str, int]] = []
-    matcher = difflib.SequenceMatcher(a=before_lines, b=after_lines, autojunk=False)
-    for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
-        if tag == "equal":
-            continue
-        ranges.append(
-            {
-                "start_line": new_start + 1,
-                "end_line": new_end,
-                "added_lines": new_end - new_start,
-                "removed_lines": old_end - old_start,
-            }
-        )
     return ranges
 
 
