@@ -161,9 +161,11 @@ unique inside the hunk's `@@` scope and `*** End of File` constraint. A result
 made only of blank lines is never evidence: every newline-terminated file has
 a trailing empty element in the patcher's line model.
 
-`idempotency_key` goes further: the runtime keeps the last 64 successful
-results per key and replays the recorded one, flagged `idempotent_replay`,
-rather than doing the work twice. A key names one request. It is recorded with
+`idempotency_key` goes further: the runtime keeps the 64 most recently used
+keys — across all tools, not per tool — and replays the recorded result,
+flagged `idempotent_replay`, rather than doing the work twice. A key older than
+that has been evicted and its repeat does the work again. A key names one
+request. It is recorded with
 a fingerprint of the arguments that produced it, and reusing it for anything
 else — a different patch, a different `dry_run` — is `IDEMPOTENCY_KEY_REUSED`
 rather than a replay of work that was never done for those arguments. Failures

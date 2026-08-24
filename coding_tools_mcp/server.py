@@ -244,8 +244,8 @@ IDEMPOTENCY_KEY_DESCRIPTION = (
     "(flagged idempotent_replay) instead of doing the work twice. Use a new key for new work: "
     "the key is bound to the arguments that first used it, and reusing it with any other "
     "argument — including a different dry_run — is refused with IDEMPOTENCY_KEY_REUSED. "
-    "Only a successful non-dry-run result is recorded, and only the last "
-    f"{IDEMPOTENCY_CACHE_ENTRIES} of them per tool."
+    "Only a successful non-dry-run result is recorded, and only the "
+    f"{IDEMPOTENCY_CACHE_ENTRIES} most recently used keys are kept across all tools."
 )
 _COMMAND_RECOVERY_HINT = (
     "This command_id has expired or never existed; a finished command keeps its"
