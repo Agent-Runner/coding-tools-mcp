@@ -32,6 +32,11 @@ BREAKER_CAPACITY = 256
 # Arguments that name the call rather than the work. A model that varies only
 # these has not changed anything the failure depended on.
 FINGERPRINT_IGNORED_ARGUMENTS = frozenset({"idempotency_key"})
+# This error's prescribed repair is changing an ignored naming argument. It
+# must not consume the shared work fingerprint's budget, or two collisions
+# under one key would block the same work under the fresh key the error asks
+# the caller to use.
+BREAKER_EXCLUDED_ERROR_CODES = frozenset({"IDEMPOTENCY_KEY_REUSED"})
 # `retryable: true` normally means "a retry can work" — but for these codes the
 # retry has to carry different arguments, and the fingerprint proves it did
 # not. A byte-identical repeat of one of these is as deterministic as a
@@ -39,7 +44,12 @@ FINGERPRINT_IGNORED_ARGUMENTS = frozenset({"idempotency_key"})
 # (PATCH_CONFLICT, COMMAND_LIMIT_REACHED) depend on time rather than on the
 # arguments and are never counted.
 RETRY_MEANS_CHANGING_THE_CALL = frozenset(
-    {"PATCH_CONTEXT_NOT_FOUND", "PATCH_CONTEXT_AMBIGUOUS", "REVISION_MISMATCH"}
+    {
+        "PATCH_CONTEXT_NOT_FOUND",
+        "PATCH_CONTEXT_AMBIGUOUS",
+        "REVISION_MISMATCH",
+        "REVISION_REQUIRED",
+    }
 )
 
 
@@ -90,6 +100,8 @@ class RepeatFailureBreaker:
     def record_failure(self, tool: str, fingerprint: str, *, error_code: str, retryable: bool) -> int:
         """Count one failure and return the new consecutive count for its code."""
 
+        if error_code in BREAKER_EXCLUDED_ERROR_CODES:
+            return 0
         if retryable and error_code not in RETRY_MEANS_CHANGING_THE_CALL:
             return 0
         with self._lock:

@@ -687,6 +687,43 @@ def _whole_file_range(text: str) -> list[dict[str, int]]:
     return [{"start_line": 1, "end_line": lines, "added_lines": lines, "removed_lines": 0}]
 
 
+def _merge_patch_affected_file(
+    affected: dict[str, dict[str, Any]], entry: dict[str, Any]
+) -> None:
+    """Keep one final evidence record per resolved path.
+
+    Same-path update blocks chain through intermediate staged bytes, but only
+    the last bytes are ever committed. Preserve every block's changed ranges
+    while replacing intermediate revisions and line counts with the final
+    evidence.
+    """
+
+    path = str(entry["path"])
+    previous = affected.get(path)
+    if previous is None:
+        affected[path] = entry
+        return
+    merged = dict(entry)
+    if entry.get("operation") != "delete":
+        previous_ranges = previous.get("changed_ranges")
+        current_ranges = entry.get("changed_ranges")
+        merged["changed_ranges"] = [
+            *(previous_ranges if isinstance(previous_ranges, list) else []),
+            *(current_ranges if isinstance(current_ranges, list) else []),
+        ]
+    if merged.get("operation") == "unchanged" and previous.get("operation") != "unchanged":
+        merged["operation"] = previous["operation"]
+    quality_order = {"exact": 0, "trailing_ws": 1, "indent": 2}
+    previous_quality = previous.get("match_quality")
+    current_quality = merged.get("match_quality")
+    if (
+        isinstance(previous_quality, str)
+        and quality_order.get(previous_quality, -1) > quality_order.get(str(current_quality), -1)
+    ):
+        merged["match_quality"] = previous_quality
+    affected[path] = merged
+
+
 def _image_content(payload: dict[str, Any]) -> list[dict[str, Any]]:
     encoded = str(payload.pop("_mcp_image_data", ""))
     return [
@@ -755,8 +792,9 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         description=(
             "Apply line-addressed file changes atomically. Prefer this over apply_patch when you know "
             "the line numbers: nothing has to match. Each change names an action (create, write, edit, "
-            "delete, move, copy), a path, and — for every action except create — the revision read_file "
-            "reported for that file, which is refused if the file has changed since. edit takes line "
+            "delete, move, copy), and a path. write is an upsert: it needs the revision read_file reported "
+            "when the path exists, but may omit it when creating a missing path. edit, delete, move, and "
+            "copy always need that revision; create rejects it and asserts absence. edit takes line "
             "operations (replace, delete, insert_after, insert_before) whose numbers all refer to the "
             "file as read, not to the result of earlier edits in the same call. content is whole lines: "
             "\"\" is zero lines and a trailing newline adds a blank line. One path per call; use "
@@ -1647,7 +1685,9 @@ class Runtime:
 
         A write path that escapes the workspace would widen the sandbox past
         the boundary every other tool enforces, so it is dropped rather than
-        honoured.
+        honoured. Landlock cannot attach a rule to a path that does not exist,
+        so valid configured directories are created before they are reported
+        or passed to the ruleset.
         """
 
         resolved: list[Path] = []
@@ -1659,28 +1699,67 @@ class Runtime:
             except OSError:
                 continue
             if is_relative_to(real, self.workspace.root):
+                try:
+                    real.mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    raise ToolFailure(
+                        "SANDBOX_UNAVAILABLE",
+                        f"Configured write path could not be created: {entry}",
+                        category="security",
+                        details={
+                            "path": entry,
+                            "errno": exc.errno,
+                            "reason": exc.strerror or str(exc),
+                        },
+                    ) from exc
+                if not real.is_dir():
+                    raise ToolFailure(
+                        "INVALID_ARGUMENT",
+                        f"Configured write path is not a directory: {entry}",
+                        category="validation",
+                        details={"path": entry},
+                    )
                 resolved.append(real)
         return resolved
 
     def workspace_mutation_payload(self) -> dict[str, Any]:
         """Disclose who may write to the workspace, and whether it is enforced.
 
-        `structured-only` is enforced by Landlock. Where Landlock is
-        unavailable the mode is a statement of intent and nothing more, and
-        saying so is the difference between a policy and a false promise.
+        `structured-only` is enforced by Landlock ABI 3 or newer. Older ABIs
+        cannot mediate truncate, so calling them enforced would promise more
+        than the kernel can provide.
         """
 
-        enforced = self.workspace_mutation.structured_only and self.landlock_enabled() and (
-            bool(landlock_status_payload().get("available"))
+        landlock = landlock_status_payload()
+        abi = landlock.get("abi_version")
+        truncate_protected = isinstance(abi, int) and abi >= 3
+        enforced = (
+            self.workspace_mutation.structured_only
+            and self.landlock_enabled()
+            and bool(landlock.get("available"))
+            and truncate_protected
         )
+        warnings: list[str] = []
+        if self.workspace_mutation.structured_only and not enforced:
+            if bool(landlock.get("available")) and self.landlock_enabled() and not truncate_protected:
+                warnings.append(
+                    "workspace_mutation=structured-only requires Landlock ABI 3 or newer; "
+                    f"ABI {abi} cannot deny file truncation, so the policy is not fully enforced"
+                )
+            else:
+                warnings.append(
+                    "workspace_mutation=structured-only is not enforced without enabled Landlock; "
+                    "exec_command can still write to the workspace"
+                )
         return {
             "mode": self.workspace_mutation.mode,
             "write_paths": [
                 normalize_rel_display(path, self.workspace.root) for path in self.workspace_write_paths()
             ],
             "enforced": enforced if self.workspace_mutation.structured_only else True,
-            "enforced_by": "landlock" if self.workspace_mutation.structured_only else "none",
+            "enforced_by": "landlock" if enforced else "none",
             "structured_write_tools": sorted(WORKSPACE_WRITE_TOOLS),
+            "warnings": warnings,
         }
 
     def is_allowed_command_tmp_path(self, candidate: str) -> bool:
@@ -1859,6 +1938,11 @@ class Runtime:
                 raise self._repeat_failure_error(name, blocked)
             payload = handler(args)
             payload.setdefault("ok", True)
+            if payload.get("ok") is False:
+                self._record_breaker_failure(name, fingerprint, payload)
+                self.emit_tool_trace(name, args, payload, started_at, context=context)
+                content = spec.content_builder(payload) if spec.content_builder else None
+                return make_tool_result(name, payload, is_error=True, content=content)
             self.breaker.record_success(name, fingerprint)
             if name in WORKSPACE_WRITE_TOOLS and not (
                 payload.get("dry_run") or payload.get("already_applied") or payload.get("idempotent_replay")
@@ -1866,6 +1950,15 @@ class Runtime:
                 # A write landed, so every "this call can never succeed"
                 # verdict the breaker holds was reached against a tree that no
                 # longer exists.
+                self.breaker.reset()
+            elif (
+                name == "exec_command"
+                and not self.workspace_mutation.structured_only
+                and payload.get("operation_outcome") not in {None, "running", "spawn_error"}
+            ):
+                # In unrestricted mode a completed command may have changed
+                # any workspace path. Verdicts reached against the old tree
+                # are stale even when the command ultimately exited nonzero.
                 self.breaker.reset()
             self._record_result(idempotency_key, fingerprint, payload)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
@@ -1897,19 +1990,7 @@ class Runtime:
                 }
             if exc.code == "ELICITATION_UNSUPPORTED":
                 payload["status"] = "unsupported"
-            if exc.code != REPEATED_CALL_BLOCKED:
-                repeats = self.breaker.record_failure(
-                    name, fingerprint, error_code=exc.code, retryable=exc.retryable
-                )
-                if repeats >= self.breaker.limit:
-                    payload["error"]["details"] = {
-                        **exc.details,
-                        "consecutive_identical_failures": repeats,
-                        "breaker": (
-                            "This exact call has now failed "
-                            f"{repeats} times. Repeating it unchanged will be refused."
-                        ),
-                    }
+            self._record_breaker_failure(name, fingerprint, payload)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
         except Exception as exc:  # noqa: BLE001 - tool failures must stay structured
@@ -1925,9 +2006,37 @@ class Runtime:
             }
             if spec.error_status:
                 payload["status"] = spec.error_status
-            self.breaker.record_failure(name, fingerprint, error_code="INTERNAL_ERROR", retryable=False)
+            self._record_breaker_failure(name, fingerprint, payload)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
+
+    def _record_breaker_failure(
+        self, name: str, fingerprint: str, payload: dict[str, Any]
+    ) -> None:
+        """Count a structured failure whether returned or raised by a handler."""
+
+        raw_error = payload.get("error")
+        error = raw_error if isinstance(raw_error, dict) else {}
+        code = str(error.get("code") or "INTERNAL_ERROR")
+        if code == REPEATED_CALL_BLOCKED:
+            return
+        repeats = self.breaker.record_failure(
+            name,
+            fingerprint,
+            error_code=code,
+            retryable=bool(error.get("retryable")),
+        )
+        if repeats >= self.breaker.limit:
+            raw_details = error.get("details")
+            details = raw_details if isinstance(raw_details, dict) else {}
+            error["details"] = {
+                **details,
+                "consecutive_identical_failures": repeats,
+                "breaker": (
+                    f"This exact call has now failed {repeats} times. "
+                    "Repeating it unchanged will be refused."
+                ),
+            }
 
     def _is_callable_tool(self, name: str) -> bool:
         if name in self._exposed_tool_name_set:
@@ -2033,11 +2142,7 @@ class Runtime:
         if not landlock.get("available"):
             warnings.append("Linux Landlock filesystem confinement is unavailable")
         mutation = self.workspace_mutation_payload()
-        if self.workspace_mutation.structured_only and not mutation["enforced"]:
-            warnings.append(
-                "workspace_mutation=structured-only is not enforced without Landlock; "
-                "exec_command can still write to the workspace"
-            )
+        warnings.extend(str(item) for item in mutation.get("warnings", []))
         if self.capabilities.skip_all_permissions:
             warnings.append("permission_mode=dangerous disables MCP safety gates")
         if self.fake_readonly_annotations:
@@ -2642,7 +2747,7 @@ class Runtime:
             operations = parse_patch(patch)
             staged: dict[str, StagedFile] = {}
             summaries: list[str] = []
-            affected: list[dict[str, Any]] = []
+            affected: dict[str, dict[str, Any]] = {}
             warnings: list[str] = []
             already_applied_files = 0
             additions = 0
@@ -2667,12 +2772,13 @@ class Runtime:
                         None,
                     )
                     added_text = op.add_content or ""
-                    affected.append(
+                    _merge_patch_affected_file(
+                        affected,
                         {
                             "path": target.display,
                             "operation": "add",
                             **_patch_evidence(added_text, _whole_file_range(added_text)),
-                        }
+                        },
                     )
                     summaries.append(f"A {target.display}")
                     additions += len(added_text.splitlines())
@@ -2685,7 +2791,10 @@ class Runtime:
                     staged[target.display] = StagedFile(
                         target.display, target.path, None, baseline, baseline.mode, action="delete"
                     )
-                    affected.append({"path": target.display, "operation": "delete", "total_lines": 0})
+                    _merge_patch_affected_file(
+                        affected,
+                        {"path": target.display, "operation": "delete", "total_lines": 0},
+                    )
                     summaries.append(f"D {target.display}")
                     removals += len((baseline.data or b"").splitlines())
                 elif op.kind == "update":
@@ -2728,13 +2837,14 @@ class Runtime:
                             dest_baseline,
                             source_mode,
                         )
-                        affected.append(
+                        _merge_patch_affected_file(
+                            affected,
                             {
                                 "path": dest.display,
                                 "old_path": source.display,
                                 "operation": "move",
                                 **evidence,
-                            }
+                            },
                         )
                         summaries.append(f"R {source.display} -> {dest.display}")
                     else:
@@ -2751,12 +2861,13 @@ class Runtime:
                             source_mode,
                             action="verify" if unchanged and prior is None else "write",
                         )
-                        affected.append(
+                        _merge_patch_affected_file(
+                            affected,
                             {
                                 "path": source.display,
                                 "operation": "unchanged" if unchanged else "update",
                                 **evidence,
-                            }
+                            },
                         )
                         summaries.append(f"{'=' if unchanged else 'M'} {source.display}")
             if not affected:
@@ -2769,7 +2880,7 @@ class Runtime:
             "already_applied": already_applied_files > 0 and already_applied_files == len(operations),
             "revision_algorithm": REVISION_ALGORITHM,
             "summary": "\n".join(summaries),
-            "affected_files": affected,
+            "affected_files": list(affected.values()),
             "additions": additions,
             "removals": removals,
             "warnings": warnings,
@@ -3106,12 +3217,28 @@ class Runtime:
                     registered = True
             if not registered:
                 raise ToolFailure("COMMAND_CLOSED", "Runtime closed while the command was starting.", category="runtime")
-        except Exception:
+        except Exception as exc:
             with self.commands_lock:
                 if not registered and not slot_released:
                     self.starting_commands -= 1
             if process is not None and process.poll() is None:
                 terminate_process_group(process, signal.SIGTERM)
+            if isinstance(exc, OSError) and process is None:
+                return {
+                    "ok": False,
+                    "status": "failed",
+                    "operation_outcome": "spawn_error",
+                    "error": {
+                        "code": "COMMAND_SPAWN_FAILED",
+                        "message": f"Failed to start command: {exc}",
+                        "category": "runtime",
+                        "retryable": False,
+                        "details": {
+                            "errno": exc.errno,
+                            "reason": exc.strerror or str(exc),
+                        },
+                    },
+                }
             raise
         finally:
             if landlock_fd is not None:
@@ -5255,10 +5382,27 @@ def output_schemas() -> dict[str, dict[str, Any]]:
         "stderr": string,
         "stdout_truncated": boolean,
         "stderr_truncated": boolean,
+        "stdout_truncated_by": nullable_string,
+        "stderr_truncated_by": nullable_string,
+        "stdout_output_lines": integer,
+        "stderr_output_lines": integer,
+        "stdout_output_bytes": integer,
+        "stderr_output_bytes": integer,
+        "stdout_dropped_bytes": integer,
+        "stderr_dropped_bytes": integer,
+        "stdout_omitted_bytes": integer,
+        "stderr_omitted_bytes": integer,
         "output_ref": nullable_string,
+        "output_stream": string,
         "output_refs": {"type": "object", "additionalProperties": {"type": "string"}},
+        "output_truncated": boolean,
+        "truncated_output_streams": string_array,
         "truncated": boolean,
         "next_action": {"type": ["object", "null"], "additionalProperties": True},
+        "next_actions": object_array,
+        "summary": string,
+        "preview": string,
+        "preview_truncated": boolean,
         "warnings": string_array,
     }
     patch_result: dict[str, Any] = {
@@ -5333,14 +5477,17 @@ def output_schemas() -> dict[str, dict[str, Any]]:
         },
         "apply_patch": patch_result,
         "apply_changes": patch_result,
-        "exec_command": command_result,
+        "exec_command": {**command_result, "elapsed_ms": integer},
         "write_stdin": command_result,
         "kill_command": {
-            "command_id": string,
-            "status": string,
+            **command_result,
+            "killed": boolean,
+            "evicted": boolean,
             "signal_sent": nullable_string,
-            "exit_code": nullable_integer,
-            "warnings": string_array,
+            "next_action": {
+                "type": ["object", "string", "null"],
+                "additionalProperties": True,
+            },
         },
         # Paging a retained stream, not running one: this result has none of
         # the head-truncation fields the `truncation` block declares, and its
@@ -5621,9 +5768,10 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                                 **string,
                                 "minLength": 1,
                                 "description": (
-                                    "The revision read_file reported for this path. Required for write, "
-                                    "edit, delete, move, and copy; rejected for create. A file that "
-                                    "changed since is refused with REVISION_MISMATCH."
+                                    "The revision read_file reported for this path. Required for write "
+                                    "when the path exists, and always for edit, delete, move, and copy; "
+                                    "write may omit it when creating a missing path, and create rejects "
+                                    "it. A file that changed since is refused with REVISION_MISMATCH."
                                 ),
                             },
                             "content": {
@@ -6634,12 +6782,10 @@ def build_runtime(
             "WARNING: permission_mode=dangerous disables MCP safety gates. Use only inside an isolated container or VM.",
             file=sys.stderr,
         )
-    if emit_warning and runtime.workspace_mutation.structured_only and not runtime.workspace_mutation_payload()["enforced"]:
-        print(
-            "WARNING: --workspace-mutation structured-only needs Linux Landlock to be enforced. "
-            "Without it exec_command can still write to the workspace.",
-            file=sys.stderr,
-        )
+    mutation = runtime.workspace_mutation_payload()
+    if emit_warning and runtime.workspace_mutation.structured_only and not mutation["enforced"]:
+        for warning in mutation.get("warnings", []):
+            print(f"WARNING: {warning}.", file=sys.stderr)
     if emit_warning and runtime.fake_readonly_annotations:
         print(
             "WARNING: tools/list reports every tool as read-only and non-destructive. "

@@ -6,6 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from coding_tools_mcp import server as server_module
 from coding_tools_mcp.server import (
     Runtime,
     WorkspaceMutationPolicy,
@@ -88,6 +89,23 @@ class WorkspaceMutationRuntimeTests(unittest.TestCase):
             finally:
                 runtime.close()
 
+    def test_a_missing_write_path_is_created_before_it_is_reported(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime = self.runtime(
+                workspace,
+                mode="structured-only",
+                write_paths=("generated/nested",),
+            )
+            try:
+                payload = runtime.workspace_mutation_payload()
+                expected = (workspace / "generated" / "nested").resolve()
+                self.assertTrue(expected.is_dir())
+                self.assertEqual(runtime.workspace_write_paths(), [expected])
+                self.assertEqual(payload["write_paths"], ["generated/nested"])
+            finally:
+                runtime.close()
+
     def test_a_write_path_outside_the_workspace_is_dropped(self) -> None:
         with TemporaryDirectory() as tmp:
             runtime = self.runtime(Path(tmp), mode="structured-only", write_paths=("../elsewhere", "/etc"))
@@ -110,6 +128,24 @@ class WorkspaceMutationRuntimeTests(unittest.TestCase):
                 )
             finally:
                 runtime.close()
+
+    def test_landlock_before_abi_three_does_not_claim_truncate_enforcement(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = self.runtime(Path(tmp), mode="structured-only")
+            try:
+                with patch.object(
+                    server_module,
+                    "landlock_status_payload",
+                    return_value={"available": True, "abi_version": 2},
+                ):
+                    payload = runtime.workspace_mutation_payload()
+                    checked = runtime.check_exec_environment({})
+            finally:
+                runtime.close()
+        self.assertIs(payload["enforced"], False)
+        self.assertEqual(payload["enforced_by"], "none")
+        self.assertTrue(any("cannot deny file truncation" in item for item in payload["warnings"]))
+        self.assertTrue(any("cannot deny file truncation" in item for item in checked["warnings"]))
 
     def test_structured_only_asks_landlock_for_a_read_only_workspace(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -613,7 +613,13 @@ def _eof_insert_index(lines: list[str]) -> int:
     return len(lines) - 1 if lines and lines[-1] == "" else len(lines)
 
 
-def _filter_by_scope(lines: list[str], candidates: list[int], scope: str | None) -> tuple[list[int], bool]:
+def _filter_by_scope(
+    lines: list[str],
+    candidates: list[int],
+    scope: str | None,
+    *,
+    strict: bool = False,
+) -> tuple[list[int], bool]:
     """Narrow candidates to the region a `@@ <scope>` header names.
 
     A candidate belongs to the scope whose anchor line most closely precedes
@@ -622,7 +628,7 @@ def _filter_by_scope(lines: list[str], candidates: list[int], scope: str | None)
     asked this header to avoid.
     """
 
-    if scope is None or len(candidates) < 2:
+    if scope is None:
         return candidates, False
     for anchors in (_scope_anchors(lines, scope, exact=True), _scope_anchors(lines, scope, exact=False)):
         if not anchors:
@@ -637,7 +643,9 @@ def _filter_by_scope(lines: list[str], candidates: list[int], scope: str | None)
             return next(iter(governed.values())), True
         if governed:
             return sorted(value for group in governed.values() for value in group), True
-    return candidates, False
+        if strict:
+            return [], True
+    return ([], False) if strict else (candidates, False)
 
 
 def _scope_anchors(lines: list[str], scope: str, *, exact: bool) -> list[int]:
@@ -738,18 +746,39 @@ def _already_applied(lines: list[str], hunk: ParsedHunk) -> bool:
       needs a multi-line ``new`` block to be evidence of anything; a single
       line such as ``pass`` or ``x = 2`` occurring somewhere in the file is a
       coincidence, not a completed edit.
+    - The result must be unique inside the same ``@@`` scope and EOF locator
+      constraints as the edit. A matching block elsewhere is not evidence.
     - A pure-context hunk has identical old and new text, so "already applied"
       would be indistinguishable from "never applied" and is not claimed.
     """
 
     if hunk.old == hunk.new or not hunk.new:
         return False
+    # A blank line is present in every newline-terminated file because
+    # split("\n") retains the trailing empty element. It cannot prove that a
+    # deletion whose result contains only blank context ever happened.
+    if not any(line.strip() for line in hunk.new):
+        return False
     anchored = any(source is not None for source in hunk.new_sources)
     if not anchored and len(hunk.new) < 2:
         return False
-    return any(
-        find_subsequence_all(lines, hunk.new, grade=grade) for grade in ALREADY_APPLIED_GRADES
-    )
+    for grade in ALREADY_APPLIED_GRADES:
+        candidates = find_subsequence_all(lines, hunk.new, grade=grade)
+        if not candidates:
+            continue
+        selected, _scope_used = _filter_by_scope(lines, candidates, hunk.scope, strict=True)
+        if hunk.eof_anchor:
+            eof = _eof_insert_index(lines)
+            selected = [
+                candidate for candidate in selected if candidate + len(hunk.new) >= eof
+            ]
+        if len(selected) == 1:
+            return True
+        if selected:
+            # A looser grade can only add candidates, never make this result
+            # unique.
+            return False
+    return False
 
 
 def _ambiguous_failure(

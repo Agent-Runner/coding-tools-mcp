@@ -30,8 +30,9 @@ The v0.5.0 reliability work. Migration notes:
 ### Added
 
 - **`apply_changes`**, a line-addressed editing tool. Each change names an
-  action (`create`, `write`, `edit`, `delete`, `move`, `copy`), a path, and —
-  for every action except `create` — the `revision` `read_file` reported.
+  action (`create`, `write`, `edit`, `delete`, `move`, `copy`) and a path.
+  Existing targets use the `revision` `read_file` reported. `write` is an
+  upsert and may omit it when creating a missing path; `create` asserts absence.
   Nothing has to match textually, and a file that changed since it was read is
   refused with `REVISION_MISMATCH` instead of being overwritten. A path may
   appear once per call.
@@ -45,7 +46,9 @@ The v0.5.0 reliability work. Migration notes:
   tree unless that directory is allowlisted. Also settable as
   `CODING_TOOLS_MCP_WORKSPACE_MUTATION` and `CODING_TOOLS_MCP_WRITE_PATHS`;
   the effective policy and whether it is enforced appear in `server_info` as
-  `workspace_mutation_policy`.
+  `workspace_mutation_policy`. Full enforcement requires Landlock ABI 3 or
+  newer, and missing in-workspace write directories are created before rules
+  are installed.
 - **`idempotency_key` on `apply_patch` and `apply_changes`.** Replaying a key
   with the same arguments returns the recorded result instead of doing the work
   twice, so a lost response is safe to retry. A key names one request: it is
@@ -54,9 +57,11 @@ The v0.5.0 reliability work. Migration notes:
   that was never done, and a `dry_run` result is never recorded at all.
 - **A repeat-failure circuit breaker.** The third byte-identical call that
   would produce the same deterministic error is refused with
-  `REPEATED_CALL_BLOCKED`. Changing any argument clears that entry; a
-  successful `apply_patch` or `apply_changes` clears the breaker entirely,
-  because the workspace state that made the call impossible has changed.
+  `REPEATED_CALL_BLOCKED`. Changing any argument gives the revised call a fresh
+  budget; a successful `apply_patch` or `apply_changes` clears the breaker
+  entirely, as does terminal `exec_command` in unrestricted workspace mode,
+  because the workspace state that made the call impossible may have changed.
+  `IDEMPOTENCY_KEY_REUSED` is excluded because its repair is a new key.
 - **Per-tool `outputSchema`** in `tools/list`, replacing one generic envelope.
 - **A real-task evaluation harness** under `benchmarks/agent_eval/`, which runs
   the same tasks and prompt through an agent's native tools and through this

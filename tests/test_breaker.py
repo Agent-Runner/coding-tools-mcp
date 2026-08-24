@@ -87,6 +87,49 @@ class BreakerInRuntimeTests(unittest.TestCase):
         self.assertIs(third["structuredContent"]["error"]["retryable"], False)
         self.assertIn("REPEATED_CALL_BLOCKED", third["content"][0]["text"])
 
+    def test_a_returned_ok_false_payload_counts_as_a_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="safe")
+            args = {
+                "tool_name": "exec_command",
+                "permission": "network",
+                "reason": "breaker regression",
+                "arguments": {"cmd": "curl https://example.com"},
+            }
+            try:
+                first = runtime.call_tool("request_permissions", args)
+                second = runtime.call_tool("request_permissions", args)
+                third = runtime.call_tool("request_permissions", args)
+            finally:
+                runtime.close()
+        self.assertEqual(first["structuredContent"]["error"]["code"], "ELICITATION_UNSUPPORTED")
+        self.assertEqual(
+            second["structuredContent"]["error"]["details"]["consecutive_identical_failures"],
+            2,
+        )
+        self.assertEqual(third["structuredContent"]["error"]["code"], "REPEATED_CALL_BLOCKED")
+
+    def test_revision_required_needs_a_changed_call_to_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "a.txt").write_text("old\n", encoding="utf-8")
+            runtime = Runtime(workspace, permission_mode="safe")
+            args = {
+                "changes": [{"action": "write", "path": "a.txt", "content": "new\n"}]
+            }
+            try:
+                first = runtime.call_tool("apply_changes", args)
+                second = runtime.call_tool("apply_changes", args)
+                third = runtime.call_tool("apply_changes", args)
+            finally:
+                runtime.close()
+        self.assertEqual(first["structuredContent"]["error"]["code"], "REVISION_REQUIRED")
+        self.assertEqual(
+            second["structuredContent"]["error"]["details"]["consecutive_identical_failures"],
+            2,
+        )
+        self.assertEqual(third["structuredContent"]["error"]["code"], "REPEATED_CALL_BLOCKED")
+
     def test_changing_the_arguments_is_never_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = Runtime(Path(tmp), permission_mode="safe")
@@ -116,6 +159,27 @@ class BreakerInRuntimeTests(unittest.TestCase):
                 self.assertFalse(self.call(runtime, {"path": "late.txt"})["isError"])
             finally:
                 runtime.close()
+
+    def test_a_completed_exec_makes_workspace_read_verdicts_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            try:
+                self.call(runtime, {"path": "late.txt"})
+                self.call(runtime, {"path": "late.txt"})
+                command = runtime.call_tool(
+                    "exec_command",
+                    {
+                        "cmd": "printf 'created\\n' > late.txt",
+                        "yield_time_ms": 5000,
+                        "timeout_ms": 5000,
+                    },
+                )
+                read = self.call(runtime, {"path": "late.txt"})
+            finally:
+                runtime.close()
+        self.assertFalse(command["isError"], command)
+        self.assertEqual(command["structuredContent"]["operation_outcome"], "exited_0")
+        self.assertFalse(read["isError"], read)
 
     def test_a_dry_run_changes_nothing_and_does_not_clear_the_breaker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

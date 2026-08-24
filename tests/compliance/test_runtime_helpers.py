@@ -125,6 +125,23 @@ class RuntimeHelperTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "TTY_UNSUPPORTED")
         self.assertEqual(raised.exception.details.get("platform"), "nt")
 
+    def test_popen_oserror_is_reported_as_a_spawn_error_outcome(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="dangerous")
+            try:
+                with patch.object(
+                    processes_module.subprocess,
+                    "Popen",
+                    side_effect=OSError(12, "cannot allocate memory"),
+                ):
+                    result = runtime.call_tool("exec_command", {"cmd": "true"})
+            finally:
+                runtime.close()
+        self.assertTrue(result["isError"])
+        payload = result["structuredContent"]
+        self.assertEqual(payload["operation_outcome"], "spawn_error")
+        self.assertEqual(payload["error"]["code"], "COMMAND_SPAWN_FAILED")
+
     def test_windows_process_termination_distinguishes_graceful_and_force(self) -> None:
         class FakeProcess:
             pid = 123
@@ -1476,6 +1493,33 @@ Maven home: /usr/share/maven
         self.assertEqual(declared - (set(paged) | set(complete)), set())
         self.assertEqual(set(complete) - declared, {"ok"})
 
+    def test_the_kill_command_schema_declares_its_command_and_kill_fields(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            try:
+                running = runtime.exec_command(
+                    {"cmd": "sleep 5", "yield_time_ms": 0, "timeout_ms": 10_000}
+                )
+                killed = runtime.kill_command(
+                    {"command_id": running["command_id"], "signal": "KILL"}
+                )
+            finally:
+                runtime.close()
+        declared = set(server_module.output_schemas()["kill_command"])
+        self.assertEqual(set(killed) - declared, {"ok"})
+        self.assertTrue(
+            {
+                "operation_outcome",
+                "killed",
+                "evicted",
+                "signal",
+                "signal_sent",
+                "stdout",
+                "stderr",
+            }
+            <= declared
+        )
+
     def test_output_retention_counters_track_evicted_output_and_reach_telemetry(self) -> None:
         data = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?"
         events: list[dict[str, Any]] = []
@@ -1918,11 +1962,21 @@ class SamePathChainingTests(unittest.TestCase):
         with self._runtime("one\ntwo\n") as (workspace, runtime):
             payload = runtime.apply_patch({"patch": patch_text})
             self.assertEqual((workspace / "app.py").read_text(encoding="utf-8"), "ONE\nTWO\n")
-            # One file, staged once: the committer refuses a path staged twice.
-            self.assertEqual([entry["path"] for entry in payload["affected_files"]], ["app.py", "app.py"])
+            # One file, staged and evidenced once. Intermediate revisions never
+            # existed on disk and must not be advertised as post-edit evidence.
+            self.assertEqual([entry["path"] for entry in payload["affected_files"]], ["app.py"])
+            evidence = payload["affected_files"][0]
             self.assertEqual(
-                payload["affected_files"][-1]["revision"],
+                evidence["revision"],
                 content_revision((workspace / "app.py").read_text(encoding="utf-8")),
+            )
+            self.assertNotEqual(evidence["revision"], content_revision("ONE\ntwo\n"))
+            self.assertEqual(
+                evidence["changed_ranges"],
+                [
+                    {"start_line": 1, "end_line": 1, "added_lines": 1, "removed_lines": 1},
+                    {"start_line": 2, "end_line": 2, "added_lines": 1, "removed_lines": 1},
+                ],
             )
 
     def test_a_later_block_may_edit_what_an_earlier_block_wrote(self) -> None:
@@ -1978,6 +2032,39 @@ class PatchEvidenceAndIdempotencyTests(unittest.TestCase):
         # an edit that never landed as a success.
         with self.assertRaises(ToolFailure) as raised:
             apply_update_hunks_detailed("alpha\nx = 2\nbeta\n", [["-x = 1", "+x = 2"]])
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_blank_only_context_is_not_already_applied_evidence(self) -> None:
+        # split("\n") leaves a trailing "" in every newline-terminated file.
+        # That ubiquitous blank cannot prove a missing deletion ever happened.
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed("unrelated\n", [["-never existed", " "]])
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_already_applied_evidence_must_be_unique(self) -> None:
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed(
+                "anchor\nnew\nother\nanchor\nnew\n",
+                [[" anchor", "-old", "+new"]],
+            )
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_already_applied_evidence_must_be_inside_the_named_scope(self) -> None:
+        content = "def wrong():\n    marker\n    new\n\ndef target():\n    pass\n"
+        hunk = PatchHunk(
+            ["     marker", "-    old", "+    new"],
+            "def target",
+        )
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed(content, [hunk])
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_already_applied_evidence_must_reach_the_eof_anchor(self) -> None:
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed(
+                "first\nsecond\ntrailing\n",
+                [["-old", "+first", "+second", "*** End of File"]],
+            )
         self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
 
     def test_an_indent_stripped_match_is_not_evidence_that_a_hunk_ran(self) -> None:

@@ -158,6 +158,23 @@ CASES: list[Case] = [
         expect_payload={"error_code": "PATCH_CONTEXT_NOT_FOUND", "has_nearby_text": True},
     ),
     Case(
+        name="C7 blank-only context is not already-applied",
+        why=(
+            "A trailing blank line exists in every newline-terminated file and cannot prove "
+            "that a deletion of text the file never contained already happened."
+        ),
+        files={"app.py": "unrelated\n"},
+        patch=(
+            "*** Begin Patch\n"
+            "*** Update File: app.py\n"
+            "@@\n"
+            "-never existed\n"
+            " \n"
+            "*** End Patch\n"
+        ),
+        expect_payload={"error_code": "PATCH_CONTEXT_NOT_FOUND", "has_nearby_text": True},
+    ),
+    Case(
         name="D-2 same-path chaining inside one envelope",
         why="Two updates to one path chain on the prior staged content; this is a promise now.",
         files={"app.py": "one\ntwo\n"},

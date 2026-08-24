@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from coding_tools_mcp import server as server_module
 from coding_tools_mcp.changes import (
     apply_line_edits,
     content_lines,
@@ -139,6 +140,16 @@ class LineEditTests(unittest.TestCase):
 
 
 class ChangeParsingTests(unittest.TestCase):
+    def test_write_revision_schema_text_describes_upsert_semantics(self) -> None:
+        change_schema = server_module.input_schemas()["apply_changes"]["properties"]["changes"][
+            "items"
+        ]
+        revision_description = change_schema["properties"]["revision"]["description"]
+        tool_description = server_module.TOOL_REGISTRY["apply_changes"].description
+        self.assertIn("Required for write when the path exists", revision_description)
+        self.assertIn("write is an upsert", tool_description)
+        self.assertIn("may omit it when creating a missing path", tool_description)
+
     def test_an_empty_array_fails_like_an_empty_patch(self) -> None:
         with self.assertRaises(ToolFailure) as raised:
             parse_changes([])
@@ -486,6 +497,40 @@ class ApplyChangesRuntimeTests(unittest.TestCase):
         self.assertTrue(second["isError"])
         self.assertEqual(second["structuredContent"]["error"]["code"], "IDEMPOTENCY_KEY_REUSED")
         self.assertFalse((self.workspace / "second.txt").exists())
+
+    def test_idempotency_collisions_do_not_block_the_fresh_key_they_prescribe(self) -> None:
+        original = self.runtime.call_tool(
+            "apply_changes",
+            {
+                "changes": [{"action": "create", "path": "first.txt", "content": "one\n"}],
+                "idempotency_key": "used-key",
+            },
+        )
+        self.assertFalse(original["isError"])
+        colliding = {
+            "changes": [{"action": "create", "path": "second.txt", "content": "two\n"}],
+            "idempotency_key": "used-key",
+        }
+        first_collision = self.runtime.call_tool("apply_changes", colliding)
+        identical_collision = self.runtime.call_tool("apply_changes", colliding)
+        self.assertEqual(
+            first_collision["structuredContent"]["error"]["code"],
+            "IDEMPOTENCY_KEY_REUSED",
+        )
+        self.assertEqual(
+            identical_collision["structuredContent"]["error"]["code"],
+            "IDEMPOTENCY_KEY_REUSED",
+        )
+
+        retried = self.runtime.call_tool(
+            "apply_changes",
+            {
+                "changes": colliding["changes"],
+                "idempotency_key": "fresh-key",
+            },
+        )
+        self.assertFalse(retried["isError"], retried)
+        self.assertEqual((self.workspace / "second.txt").read_text(encoding="utf-8"), "two\n")
 
 
 if __name__ == "__main__":
