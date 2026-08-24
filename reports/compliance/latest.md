@@ -1,32 +1,32 @@
 # Compliance Report
 
 - contract: `coding-tools-mcp-v0.3`
-- commit: `941f84e32b240bb64cc9b78e3793a48bf2d11f81+dirty`
-- suite: `schema-drift`
+- commit: `a03882dab098d2f0ed49afa4430054712d415e2b+dirty`
+- suite: `all`
 - passed: `true`
-- tests_run: `8`
-- elapsed_seconds: `0.105`
+- tests_run: `127`
+- elapsed_seconds: `100.168`
 
 ## Required Tools
 
-- `server_info`: not_measured
-- `check_exec_environment`: not_measured
-- `read_file`: not_measured
-- `list_dir`: not_measured
-- `list_files`: not_measured
-- `search_text`: not_measured
-- `apply_patch`: not_measured
-- `apply_changes`: not_measured
-- `exec_command`: not_measured
-- `write_stdin`: not_measured
-- `kill_command`: not_measured
-- `read_output`: not_measured
-- `git_status`: not_measured
-- `git_diff`: not_measured
-- `git_log`: not_measured
-- `git_show`: not_measured
-- `git_blame`: not_measured
-- `view_image`: not_measured
+- `server_info`: passed
+- `check_exec_environment`: passed
+- `read_file`: passed
+- `list_dir`: passed
+- `list_files`: passed
+- `search_text`: passed
+- `apply_patch`: passed
+- `exec_command`: passed
+- `write_stdin`: passed
+- `kill_command`: passed
+- `read_output`: passed
+- `git_status`: passed
+- `git_diff`: passed
+- `git_log`: passed
+- `git_show`: passed
+- `git_blame`: passed
+- `request_permissions`: passed
+- `view_image`: passed
 
 ## Failures
 
