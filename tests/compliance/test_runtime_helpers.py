@@ -2116,6 +2116,20 @@ class PatchEvidenceAndIdempotencyTests(unittest.TestCase):
             [{"start_line": 2, "end_line": 2, "added_lines": 1, "removed_lines": 1}],
         )
 
+    def test_context_free_hunks_are_numbered_where_their_lines_landed(self) -> None:
+        # Two hunks with no context both place at the top of the file, and
+        # back-to-front splicing puts the later one first. The ranges have to
+        # follow the text rather than the hunk order.
+        outcome = apply_update_hunks_detailed("z\n", [["+A1", "+A2"], ["+B1"]])
+        self.assertEqual(outcome.content, "B1\nA1\nA2\nz\n")
+        self.assertEqual(
+            outcome.changed_ranges,
+            [
+                {"start_line": 1, "end_line": 1, "added_lines": 1, "removed_lines": 0},
+                {"start_line": 2, "end_line": 3, "added_lines": 2, "removed_lines": 0},
+            ],
+        )
+
     def test_pure_deletion_reports_an_empty_range_at_the_removal_point(self) -> None:
         outcome = apply_update_hunks_detailed("a\nb\nc\n", [[" a", "-b", " c"]])
         self.assertEqual(outcome.changed_ranges[0]["start_line"], 2)

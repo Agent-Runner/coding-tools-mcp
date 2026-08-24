@@ -334,14 +334,20 @@ def apply_line_edits(content: str, edits: tuple[LineEdit, ...], path: str) -> Up
     placements = [_placement(edit, lines, total_lines, path) for edit in edits]
     _reject_overlaps(placements, path)
 
+    # Splicing back to front keeps every later placement's indices valid. An
+    # insertion is an empty span, so it can share a start with the replacement
+    # it sits in front of; the one spliced last is the one whose text ends up
+    # first, and reversing this order is therefore the order the new lines
+    # appear in the result.
+    application_order = sorted(placements, key=lambda item: (item.start, item.end), reverse=True)
     updated = list(lines)
-    for placement in sorted(placements, key=lambda item: (item.start, item.end), reverse=True):
+    for placement in application_order:
         updated = updated[: placement.start] + placement.new + updated[placement.end :]
     # A file that gained content but never ended with a newline keeps that
     # shape; POSIX-style text stays POSIX-style.
     ends_with_newline = trailing_newline if lines else bool(updated)
     rebuilt = bom + restore_line_endings(join_lines(updated, ends_with_newline), line_ending)
-    changed = [item for item in placements if item.old != item.new]
+    changed = [item for item in reversed(application_order) if item.old != item.new]
     return UpdateOutcome(
         content=rebuilt,
         changed_ranges=changed_ranges(changed),

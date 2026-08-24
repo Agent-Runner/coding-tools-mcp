@@ -138,6 +138,36 @@ class LineEditTests(unittest.TestCase):
             [{"start_line": 2, "end_line": 3, "added_lines": 2, "removed_lines": 0}],
         )
 
+    def test_an_insertion_in_front_of_a_replacement_is_numbered_in_order(self) -> None:
+        # The insertion is an empty span at the replacement's first line, so
+        # the two share a start. Whichever order the caller listed them in,
+        # the inserted line lands first and both ranges have to say so.
+        for order in ([0, 1], [1, 0]):
+            with self.subTest(order=order):
+                listed = [
+                    edit(op="replace", start_line=1, end_line=3, content="P"),
+                    edit(op="insert_after", line=0, content="X"),
+                ]
+                change = parse_changes(
+                    [
+                        {
+                            "action": "edit",
+                            "path": "f.txt",
+                            "revision": "r",
+                            "edits": [listed[position] for position in order],
+                        }
+                    ]
+                )[0]
+                outcome = apply_line_edits("a\nb\nc\nd\n", change.edits, "f.txt")
+                self.assertEqual(outcome.content, "X\nP\nd\n")
+                self.assertEqual(
+                    outcome.changed_ranges,
+                    [
+                        {"start_line": 1, "end_line": 1, "added_lines": 1, "removed_lines": 0},
+                        {"start_line": 2, "end_line": 2, "added_lines": 1, "removed_lines": 3},
+                    ],
+                )
+
 
 class ChangeParsingTests(unittest.TestCase):
     def test_write_revision_schema_text_describes_upsert_semantics(self) -> None:
