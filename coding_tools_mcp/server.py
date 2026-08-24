@@ -236,6 +236,14 @@ IDEMPOTENCY_KEY_MAX_LENGTH = 128
 COUNTED_OUTCOME_LEDGER_ENTRIES = 512
 REPEATED_CALL_BLOCKED = "REPEATED_CALL_BLOCKED"
 IDEMPOTENCY_KEY_REUSED = "IDEMPOTENCY_KEY_REUSED"
+IDEMPOTENCY_KEY_DESCRIPTION = (
+    "Names this exact request so a retry after a lost response replays the recorded result "
+    "(flagged idempotent_replay) instead of doing the work twice. Use a new key for new work: "
+    "the key is bound to the arguments that first used it, and reusing it with any other "
+    "argument — including a different dry_run — is refused with IDEMPOTENCY_KEY_REUSED. "
+    "Only a successful non-dry-run result is recorded, and only the last "
+    f"{IDEMPOTENCY_CACHE_ENTRIES} of them per tool."
+)
 _COMMAND_RECOVERY_HINT = (
     "This command_id has expired or never existed; a finished command keeps its"
     f" output for {COMPLETED_COMMAND_TTL_SECONDS} seconds and only the last"
@@ -5334,15 +5342,30 @@ def output_schemas() -> dict[str, dict[str, Any]]:
             "exit_code": nullable_integer,
             "warnings": string_array,
         },
+        # Paging a retained stream, not running one: this result has none of
+        # the head-truncation fields the `truncation` block declares, and its
+        # byte counts are per stream rather than one `total_bytes`.
         "read_output": {
             "output_ref": string,
+            "stream_output_ref": string,
             "stream": string,
             "content": string,
             "offset": integer,
+            "requested_offset": integer,
+            "limit": integer,
             "next_offset": nullable_integer,
-            "total_bytes": integer,
+            "total_stream_bytes": integer,
+            "total_retained_bytes": integer,
+            "head_retained_bytes": integer,
+            "retained_start_offset": integer,
             "evicted_gap_bytes": integer,
-            **truncation,
+            "omitted_bytes": integer,
+            "stream_dropped_bytes": integer,
+            "stdout_dropped_bytes": integer,
+            "stderr_dropped_bytes": integer,
+            "truncated": boolean,
+            "next_action": {"type": ["object", "null"], "additionalProperties": True},
+            "warnings": string_array,
         },
         "git_status": {"is_repo": boolean, "branch": nullable_string, "entries": object_array, **git_text},
         "git_diff": {"diff": string, "files": object_array, "include_untracked": boolean, **git_text},
@@ -5559,7 +5582,12 @@ def input_schemas() -> dict[str, dict[str, Any]]:
             {
                 "patch": {**string, "minLength": 1},
                 "dry_run": {**boolean, "default": False},
-                "idempotency_key": {**string, "minLength": 1, "maxLength": IDEMPOTENCY_KEY_MAX_LENGTH},
+                "idempotency_key": {
+                    **string,
+                    "minLength": 1,
+                    "maxLength": IDEMPOTENCY_KEY_MAX_LENGTH,
+                    "description": IDEMPOTENCY_KEY_DESCRIPTION,
+                },
             },
             ["patch"],
         ),
@@ -5661,7 +5689,12 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                     ),
                 },
                 "dry_run": {**boolean, "default": False},
-                "idempotency_key": {**string, "minLength": 1, "maxLength": IDEMPOTENCY_KEY_MAX_LENGTH},
+                "idempotency_key": {
+                    **string,
+                    "minLength": 1,
+                    "maxLength": IDEMPOTENCY_KEY_MAX_LENGTH,
+                    "description": IDEMPOTENCY_KEY_DESCRIPTION,
+                },
             },
             ["changes"],
         ),

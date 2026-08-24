@@ -1458,6 +1458,24 @@ Maven home: /usr/share/maven
                 self.assertEqual(third.get("content"), data[60:].decode())
                 self.assertIsNone(third.get("next_offset"))
 
+    def test_the_read_output_schema_names_only_fields_the_tool_returns(self) -> None:
+        # The declared schema is a promise to the model. It used to name
+        # total_bytes and the head-truncation fields (truncated_by,
+        # output_lines, output_bytes), none of which this tool ever returns.
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="trusted")
+            with subprocess.Popen([sys.executable, "-c", ""], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                command = server_module.CommandRun(command_id="declared", process=process, buffer_limit=32)
+                command.append_stdout(b"abcdefghij")
+                runtime._remember_output_command(command)
+                paged = runtime.read_output({"output_ref": "command:declared:stdout", "offset": 0, "limit": 4})
+                complete = runtime.read_output({"output_ref": "command:declared:stdout", "offset": 0, "limit": 64})
+        declared = set(server_module.output_schemas()["read_output"])
+        # next_action only appears while there is more to read, so the two
+        # reads together have to cover the schema exactly.
+        self.assertEqual(declared - (set(paged) | set(complete)), set())
+        self.assertEqual(set(complete) - declared, {"ok"})
+
     def test_output_retention_counters_track_evicted_output_and_reach_telemetry(self) -> None:
         data = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?"
         events: list[dict[str, Any]] = []
