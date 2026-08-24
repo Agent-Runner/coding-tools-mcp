@@ -1882,8 +1882,10 @@ class PatchEvidenceAndIdempotencyTests(unittest.TestCase):
         self.assertEqual(outcome.changed_ranges[0]["removed_lines"], 1)
 
     def test_already_applied_hunks_are_skipped_rather_than_failing(self) -> None:
-        outcome = apply_update_hunks_detailed("value = 2\n", [["-value = 1", "+value = 2"]])
-        self.assertEqual(outcome.content, "value = 2\n")
+        outcome = apply_update_hunks_detailed(
+            "def run():\n    value = 2\n", [[" def run():", "-    value = 1", "+    value = 2"]]
+        )
+        self.assertEqual(outcome.content, "def run():\n    value = 2\n")
         self.assertEqual(outcome.already_applied_hunks, [0])
         self.assertEqual(outcome.applied_hunks, 0)
 
@@ -1891,6 +1893,30 @@ class PatchEvidenceAndIdempotencyTests(unittest.TestCase):
         with self.assertRaises(ToolFailure) as raised:
             apply_update_hunks_detailed("a\n", [[" nowhere"]])
         self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_one_common_line_somewhere_else_is_not_an_already_applied_hunk(self) -> None:
+        # The probe: the hunk carries no context, and its single added line
+        # happens to exist elsewhere in the file. Accepting that would report
+        # an edit that never landed as a success.
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed("alpha\nx = 2\nbeta\n", [["-x = 1", "+x = 2"]])
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_an_indent_stripped_match_is_not_evidence_that_a_hunk_ran(self) -> None:
+        # `return None` under some other indentation is not this hunk's result.
+        with self.assertRaises(ToolFailure) as raised:
+            apply_update_hunks_detailed(
+                "def a():\n        return None\n",
+                [[" def b():", "-    pass", "+    return None"]],
+            )
+        self.assertEqual(raised.exception.code, "PATCH_CONTEXT_NOT_FOUND")
+
+    def test_a_multi_line_addition_is_evidence_even_without_context(self) -> None:
+        outcome = apply_update_hunks_detailed(
+            "alpha\nfirst\nsecond\n", [["-old", "+first", "+second"]]
+        )
+        self.assertEqual(outcome.already_applied_hunks, [0])
+        self.assertEqual(outcome.content, "alpha\nfirst\nsecond\n")
 
     def test_revision_is_the_sha256_of_the_files_utf8_bytes(self) -> None:
         with TemporaryDirectory() as tmp:

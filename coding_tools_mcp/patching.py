@@ -26,6 +26,11 @@ MATCH_GRADE_WARNINGS = {
     "trailing_ws": "context matched only after ignoring trailing whitespace",
     "indent": "context matched only after ignoring indentation width",
 }
+# Grades that may be used to decide a hunk is *already applied*. The indent
+# grade is deliberately absent: stripping indentation makes a line match
+# wherever it appears at any depth, which is too weak to turn a miss into a
+# success.
+ALREADY_APPLIED_GRADES = ("exact", "trailing_ws")
 
 # `@@ -1,4 +1,4 @@` is a unified-diff position header, not a Codex-dialect
 # scope anchor. It names line numbers this parser does not use, so it has to
@@ -721,17 +726,30 @@ def _shift_indent(value: str, shift: tuple[str, int]) -> str:
 def _already_applied(lines: list[str], hunk: ParsedHunk) -> bool:
     """Report whether this hunk's result is already present in the file.
 
-    Only meaningful for a hunk that changes something: a pure-context hunk has
-    identical old and new text, so "already applied" would be indistinguishable
-    from "never applied" and is not claimed.
+    "Already applied" turns a miss into a success, so the evidence for it is
+    held to a higher standard than the evidence for a placement:
+
+    - Only the ``exact`` and ``trailing_ws`` grades count. An indent-stripped
+      comparison finds ``return None`` under any indentation anywhere in the
+      file, which is not evidence that this hunk ran.
+    - The result has to be locatable. A hunk that carries a context line has
+      it inside ``new``, so finding that whole block finds the place the hunk
+      belonged. A hunk with no context at all has no location to check, so it
+      needs a multi-line ``new`` block to be evidence of anything; a single
+      line such as ``pass`` or ``x = 2`` occurring somewhere in the file is a
+      coincidence, not a completed edit.
+    - A pure-context hunk has identical old and new text, so "already applied"
+      would be indistinguishable from "never applied" and is not claimed.
     """
 
     if hunk.old == hunk.new or not hunk.new:
         return False
-    for grade in MATCH_GRADES:
-        if find_subsequence_all(lines, hunk.new, grade=grade):
-            return True
-    return False
+    anchored = any(source is not None for source in hunk.new_sources)
+    if not anchored and len(hunk.new) < 2:
+        return False
+    return any(
+        find_subsequence_all(lines, hunk.new, grade=grade) for grade in ALREADY_APPLIED_GRADES
+    )
 
 
 def _ambiguous_failure(

@@ -129,16 +129,33 @@ CASES: list[Case] = [
     Case(
         name="C7 already-applied patch is not an error",
         why="Re-sending a patch after a lost response returned PATCH_CONTEXT_NOT_FOUND.",
-        files={"app.py": "value = 2\n"},
+        files={"app.py": "def run():\n    value = 2\n"},
         patch="""*** Begin Patch
 *** Update File: app.py
 @@
--value = 1
-+value = 2
+ def run():
+-    value = 1
++    value = 2
 *** End Patch
 """,
-        expect_contains={"app.py": "value = 2\n"},
+        expect_contains={"app.py": "def run():\n    value = 2\n"},
         expect_payload={"already_applied": True},
+    ),
+    Case(
+        name="C7 a common line elsewhere is not already-applied",
+        why=(
+            "An unanchored single line found anywhere in the file used to count as "
+            "the hunk's result, turning a miss into a silent success."
+        ),
+        files={"app.py": "alpha\nx = 2\nbeta\n"},
+        patch="""*** Begin Patch
+*** Update File: app.py
+@@
+-x = 1
++x = 2
+*** End Patch
+""",
+        expect_payload={"error_code": "PATCH_CONTEXT_NOT_FOUND", "has_nearby_text": True},
     ),
     Case(
         name="D-2 same-path chaining inside one envelope",
