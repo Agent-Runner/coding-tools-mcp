@@ -203,6 +203,14 @@ MAX_ACTIVE_COMMANDS = 16
 MAX_RETAINED_OUTPUT_COMMANDS = 32
 COMPLETED_COMMAND_TTL_SECONDS = 300
 MAX_RUNTIME_OUTPUT_BYTES = 16 * 1024 * 1024
+# timeout_ms is the total process lifetime and yield_time_ms is only how long
+# the call waits before returning a command_id. They are separate budgets: a
+# build that outlives the first return keeps running until the lifetime ends.
+DEFAULT_PROCESS_LIFETIME_MS = 300000
+MAX_PROCESS_LIFETIME_MS = 600000
+DEFAULT_YIELD_MS = 10000
+MAX_YIELD_MS = 30000
+MAX_UNTRACKED_DIFF_FILES = 100
 # A mutating call may be retried because its response was lost, not because it
 # failed. Tools in this set accept an idempotency_key and replay the recorded
 # result for a repeat of the same key instead of applying the work twice.
@@ -672,7 +680,9 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         title="Execute command",
         description=(
             "Run a bounded command under runtime policy. Pass workdir explicitly for reconnect-safe paths. "
-            "A still-running command returns command_id. Example: "
+            "yield_time_ms is only how long this call waits (default 10s); timeout_ms is the total process "
+            "lifetime (default 300s). A command still running when the call returns keeps running under its "
+            "command_id; poll it with write_stdin or read_output. Example: "
             "{\"cmd\":\"pytest -q\",\"workdir\":\".\",\"yield_time_ms\":30000}. "
             "Retained output is bounded per stream; for very large output redirect to a file "
             "(cmd > out.log 2>&1) and page it with read_file or search_text."
@@ -715,7 +725,10 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     ),
     "git_diff": ToolSpec(
         title="Git diff",
-        description="Return unified git diff for workspace changes.",
+        description=(
+            "Return unified git diff for workspace changes. Untracked files are included as "
+            "additions by default, so a newly created file is verifiable here."
+        ),
         read_only=True,
         idempotent=True,
     ),
@@ -1655,6 +1668,8 @@ class Runtime:
             "output_retention": {
                 "buffer_bytes_per_stream": COMMAND_BUFFER_BYTES,
                 "head_bytes_per_stream": COMMAND_BUFFER_BYTES // COMMAND_HEAD_BUFFER_DIVISOR,
+                "completed_command_ttl_seconds": COMPLETED_COMMAND_TTL_SECONDS,
+                "max_retained_completed_commands": MAX_RETAINED_OUTPUT_COMMANDS,
             },
             "endpoint_path": MCP_ENDPOINT_PATH,
             "project_context": {
@@ -1832,6 +1847,14 @@ class Runtime:
     def check_exec_environment(self, args: dict[str, Any]) -> dict[str, Any]:
         landlock = landlock_status_payload()
         warnings: list[str] = []
+        # Landlock is the only filesystem confinement this server has, and it is
+        # Linux-only. Elsewhere a command runs with the whole user account's
+        # reach, which callers must be told rather than left to infer.
+        if sys.platform != "linux":
+            warnings.append(
+                f"platform {sys.platform} has no filesystem confinement for exec_command; "
+                "commands run with full user privileges outside the workspace"
+            )
         if not landlock.get("available"):
             warnings.append("Linux Landlock filesystem confinement is unavailable")
         if self.capabilities.skip_all_permissions:
@@ -2571,8 +2594,8 @@ class Runtime:
         if not workdir.path.is_dir():
             raise ToolFailure("NOT_A_DIRECTORY", "workdir is not a directory.", category="validation")
         self._check_command_policy(cmd, args)
-        timeout_ms = int(args.get("timeout_ms", 30000))
-        yield_ms = int(args.get("yield_time_ms", 10000))
+        timeout_ms = int(args.get("timeout_ms", DEFAULT_PROCESS_LIFETIME_MS))
+        yield_ms = int(args.get("yield_time_ms", DEFAULT_YIELD_MS))
         max_output_bytes = int(args.get("max_output_bytes", 65536))
         tty = bool(args.get("tty", False))
         stdin_text = str(args.get("stdin", ""))
@@ -2666,7 +2689,7 @@ class Runtime:
         finally:
             if not tty:
                 command.close_stdin()
-        initial_wait = max(0, min(yield_ms, 30000)) / 1000.0
+        initial_wait = max(0, min(yield_ms, MAX_YIELD_MS)) / 1000.0
 
         def finish() -> dict[str, Any]:
             # snapshot_since_cursor owns the status mapping (running/exited/
@@ -3018,7 +3041,7 @@ class Runtime:
                 "arguments": {
                     "command_id": command.command_id,
                     "chars": "",
-                    "yield_time_ms": 10000,
+                    "yield_time_ms": DEFAULT_YIELD_MS,
                 },
             }
         output_refs = {
@@ -3217,7 +3240,7 @@ class Runtime:
             return self._format_command_output(command, payload, args)
         if chars:
             command.write_input(chars.encode("utf-8"))
-        wait_until = time.time() + (int(args.get("yield_time_ms", 10000)) / 1000.0)
+        wait_until = time.time() + (int(args.get("yield_time_ms", DEFAULT_YIELD_MS)) / 1000.0)
         first_output_at: float | None = None
         while time.time() < wait_until and command.process.poll() is None:
             time.sleep(0.02)
@@ -3357,6 +3380,7 @@ class Runtime:
         git_env = self._git_env()
         staged = bool(args.get("staged", False))
         unstaged = bool(args.get("unstaged", True))
+        include_untracked = bool(args.get("include_untracked", True))
         context = int(args.get("context_lines", 3))
         max_bytes = int(args.get("max_bytes", 262144))
         path_filters = self._git_path_filters(args)
@@ -3367,6 +3391,16 @@ class Runtime:
             chunks.append(self._run_git_diff(git, context, path_filters, cached=False, env=git_env))
         if staged:
             chunks.append(self._run_git_diff(git, context, path_filters, cached=True, env=git_env))
+        warnings: list[str] = []
+        # A file created by apply_patch is untracked, so plain `git diff` cannot
+        # confirm it exists. Diff each untracked path against an empty file so
+        # an added file is verifiable from the same output as an edited one.
+        if include_untracked and unstaged:
+            untracked_chunks, untracked_warnings = self._untracked_diffs(
+                git, context, path_filters, max_bytes, env=git_env
+            )
+            chunks.extend(untracked_chunks)
+            warnings.extend(untracked_warnings)
         combined = b""
         for chunk in chunks:
             if combined and chunk and not combined.endswith(b"\n"):
@@ -3375,12 +3409,69 @@ class Runtime:
         diff_truncation = truncate_text_head(combined.decode("utf-8", errors="replace"), max_lines=DEFAULT_MAX_LINES, max_bytes=max_bytes)
         diff_text = diff_truncation.content
         truncated = diff_truncation.truncated
+        if truncated:
+            warnings.append("diff truncated")
         return {
             "diff": diff_text,
             "files": parse_diff_files(diff_text),
+            "include_untracked": include_untracked and unstaged,
             **truncation_fields(diff_truncation),
-            "warnings": ["diff truncated"] if truncated else [],
+            "warnings": warnings,
         }
+
+    def _untracked_diffs(
+        self,
+        git: str,
+        context: int,
+        path_filters: list[str],
+        max_bytes: int,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> tuple[list[bytes], list[str]]:
+        listing = [git, "-C", str(self.workspace.root), "ls-files", "--others", "--exclude-standard", "-z"]
+        if path_filters:
+            listing.append("--")
+            listing.extend(path_filters)
+        completed = self._run_git_bytes(listing, timeout=10, env=env)
+        if completed.returncode != 0:
+            return [], ["untracked files could not be listed"]
+        paths = [entry for entry in completed.stdout.decode("utf-8", errors="replace").split("\0") if entry]
+        chunks: list[bytes] = []
+        warnings: list[str] = []
+        if len(paths) > MAX_UNTRACKED_DIFF_FILES:
+            warnings.append(
+                f"only the first {MAX_UNTRACKED_DIFF_FILES} of {len(paths)} untracked files are diffed"
+            )
+            paths = paths[:MAX_UNTRACKED_DIFF_FILES]
+        spent = 0
+        for rel in paths:
+            if spent >= max_bytes:
+                warnings.append("untracked diff truncated")
+                break
+            chunk = self._run_git_bytes(
+                [
+                    git,
+                    "-C",
+                    str(self.workspace.root),
+                    "diff",
+                    "--no-index",
+                    f"--unified={context}",
+                    "--",
+                    os.devnull,
+                    rel,
+                ],
+                timeout=10,
+                env=env,
+            )
+            # --no-index reports a difference with exit 1; anything else is a
+            # per-file problem (unreadable path, vanished file) that must not
+            # fail the whole diff.
+            if chunk.returncode not in {0, 1}:
+                warnings.append(f"untracked file could not be diffed: {rel}")
+                continue
+            chunks.append(chunk.stdout)
+            spent += len(chunk.stdout)
+        return chunks, warnings
 
     def _run_git_diff(
         self, git: str, context: int, path_filters: list[str], *, cached: bool, env: dict[str, str] | None = None
@@ -4809,7 +4900,7 @@ def output_schemas() -> dict[str, dict[str, Any]]:
             **truncation,
         },
         "git_status": {"is_repo": boolean, "branch": nullable_string, "entries": object_array, **git_text},
-        "git_diff": {"diff": string, "files": object_array, **git_text},
+        "git_diff": {"diff": string, "files": object_array, "include_untracked": boolean, **git_text},
         "git_log": {"is_repo": boolean, "commits": object_array, **git_text},
         "git_show": {"content": string, "files": object_array, **git_text},
         "git_blame": {"path": string, "lines": object_array, **git_text},
@@ -5025,8 +5116,26 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "cmd": {**string, "minLength": 1},
                 "workdir": {**string, "default": "."},
                 "cwd": {**string},
-                "timeout_ms": {**integer, "minimum": 1, "maximum": 600000, "default": 30000},
-                "yield_time_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 10000},
+                "timeout_ms": {
+                    **integer,
+                    "minimum": 1,
+                    "maximum": MAX_PROCESS_LIFETIME_MS,
+                    "default": DEFAULT_PROCESS_LIFETIME_MS,
+                    "description": (
+                        "Total process lifetime in milliseconds. The command is killed when this "
+                        "elapses, whether or not the call has already returned."
+                    ),
+                },
+                "yield_time_ms": {
+                    **integer,
+                    "minimum": 0,
+                    "maximum": MAX_YIELD_MS,
+                    "default": DEFAULT_YIELD_MS,
+                    "description": (
+                        "How long this call waits before returning. A command still running at that "
+                        "point keeps running and returns a command_id; it is not killed."
+                    ),
+                },
                 "max_output_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 65536},
                 "verbosity": {**string, "enum": ["summary", "preview", "full"]},
                 "preview_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},
@@ -5040,7 +5149,7 @@ def input_schemas() -> dict[str, dict[str, Any]]:
             {
                 "command_id": {**string, "minLength": 1},
                 "chars": {**string, "default": ""},
-                "yield_time_ms": {**integer, "minimum": 0, "maximum": 30000, "default": 10000},
+                "yield_time_ms": {**integer, "minimum": 0, "maximum": MAX_YIELD_MS, "default": DEFAULT_YIELD_MS},
                 "max_output_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 65536},
                 "verbosity": {**string, "enum": ["summary", "preview", "full"]},
                 "preview_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 4096},
@@ -5081,6 +5190,14 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                 "paths": string_array,
                 "staged": {**boolean, "default": False},
                 "unstaged": {**boolean, "default": True},
+                "include_untracked": {
+                    **boolean,
+                    "default": True,
+                    "description": (
+                        "Diff untracked files against an empty file so newly created files appear "
+                        "as additions. Applies to the unstaged pass only."
+                    ),
+                },
                 "context_lines": {**integer, "minimum": 0, "maximum": 20, "default": 3},
                 "max_bytes": {**integer, "minimum": 1, "maximum": 1048576, "default": 262144},
             }

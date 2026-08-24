@@ -349,6 +349,27 @@ class ExecAndGitGoldenTests(ComplianceTestCase):
         filtered = self.client.call_tool("git_diff", {"path": "package.json"})
         self.assertNotIn("src/math.js", self.tool_text(filtered))
 
+    def test_git_diff_shows_a_file_that_apply_patch_just_created(self) -> None:
+        add_file = """*** Begin Patch
+*** Add File: src/created.js
++export const created = true;
+*** End Patch
+"""
+        self.assert_tool_success(self.client.call_tool("apply_patch", {"patch": add_file}))
+        diff = self.client.call_tool("git_diff", {})
+        payload = self.assert_tool_success(diff)
+        self.assertIs(payload.get("include_untracked"), True)
+        diff_text = self.tool_text(diff)
+        self.assertIn("src/created.js", diff_text)
+        self.assertIn("+export const created = true;", diff_text)
+        paths = {entry.get("path") for entry in payload.get("files", [])}
+        self.assertIn("src/created.js", paths)
+
+        without = self.client.call_tool("git_diff", {"include_untracked": False})
+        without_payload = self.assert_tool_success(without)
+        self.assertIs(without_payload.get("include_untracked"), False)
+        self.assertNotIn("src/created.js", self.tool_text(without))
+
 
 def assert_search_entries_have_shape(testcase: ComplianceTestCase, payload: dict[str, Any]) -> None:
     entries = payload.get("matches") or payload.get("results") or []

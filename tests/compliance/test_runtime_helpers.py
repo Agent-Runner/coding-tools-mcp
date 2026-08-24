@@ -30,6 +30,8 @@ from coding_tools_mcp.patching import (
     parse_patch,
 )
 from coding_tools_mcp.server import (
+    DEFAULT_PROCESS_LIFETIME_MS,
+    DEFAULT_YIELD_MS,
     LANDLOCK_ACCESS_FS_IOCTL_DEV,
     LANDLOCK_ACCESS_FS_TRUNCATE,
     LANDLOCK_ACCESS_FS_WRITE_FILE,
@@ -1940,6 +1942,41 @@ class PatchEvidenceAndIdempotencyTests(unittest.TestCase):
         self.assertEqual(details["hunk_index"], 0)
         self.assertEqual(details["total_lines"], 4)
         self.assertIn("1: alpha", details["nearby_text"])
+
+
+class ProcessLifetimeTests(unittest.TestCase):
+    """Yielding a command back to the caller must not shorten its life.
+
+    Before v0.5.0 both budgets came from one 30s default, so a build that had
+    not finished by the first return was killed a few seconds later and the
+    model saw a truncated, unreproducible failure.
+    """
+
+    def test_the_defaults_keep_the_two_budgets_apart(self) -> None:
+        self.assertEqual(DEFAULT_YIELD_MS, 10000)
+        self.assertEqual(DEFAULT_PROCESS_LIFETIME_MS, 300000)
+        schema = server_module.input_schemas()["exec_command"]["properties"]
+        self.assertEqual(schema["timeout_ms"]["default"], DEFAULT_PROCESS_LIFETIME_MS)
+        self.assertEqual(schema["yield_time_ms"]["default"], DEFAULT_YIELD_MS)
+
+    def test_a_command_outliving_the_yield_keeps_running(self) -> None:
+        with TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="dangerous")
+            try:
+                payload = runtime.exec_command(
+                    {"cmd": f"{sys.executable} -c 'import time; time.sleep(5)'", "yield_time_ms": 200}
+                )
+                command_id = payload.get("command_id")
+                self.assertEqual(payload.get("status"), "running")
+                self.assertIsInstance(command_id, str)
+                # The default lifetime is minutes away, so the process is still
+                # alive well after the call that started it returned.
+                time.sleep(0.5)
+                command = runtime.commands[str(command_id)]
+                self.assertIsNone(command.process.poll())
+                runtime.kill_command({"command_id": command_id, "signal": "KILL"})
+            finally:
+                runtime.close()
 
 
 class ErrorTextTerminalityTests(unittest.TestCase):
