@@ -99,12 +99,18 @@ def _render_read_file(payload: dict[str, Any]) -> str:
     content = payload.get("content")
     if not isinstance(content, str):
         return ""
-    if not payload.get("truncated"):
-        return content
     shown = (
-        f"Showing lines {payload.get('start_line', '?')}-{payload.get('end_line', '?')}"
+        f"{payload.get('path', '')} lines {payload.get('start_line', '?')}-{payload.get('end_line', '?')}"
         f" of {payload.get('total_lines', '?')}"
     )
+    # apply_changes requires the revision of the bytes the model actually read.
+    # Most clients forward only this text, so a revision that lived solely in
+    # structuredContent would be unreachable for the caller that needs it.
+    revision = payload.get("revision")
+    if isinstance(revision, str) and revision:
+        shown = f"{shown} revision={revision}"
+    if not payload.get("truncated"):
+        return f"[{shown}]\n{content}"
     next_start = payload.get("next_start_line")
     next_call = _render_next_action(payload)
     if not next_call and next_start:

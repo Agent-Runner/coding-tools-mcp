@@ -1943,9 +1943,15 @@ class Runtime:
         selected_bytes = 0
         total_lines = 0
         selection_complete = False
+        # The revision is folded into the pass that already walks every line,
+        # so it names the bytes this call decoded rather than whatever a second
+        # open would have found a moment later.
+        digest = hashlib.sha256()
         try:
             with resolved.path.open("r", encoding="utf-8", errors="strict", newline="") as handle:
                 for total_lines, line in enumerate(handle, start=1):
+                    line_bytes = line.encode("utf-8")
+                    digest.update(line_bytes)
                     if total_lines < start_line:
                         continue
                     if requested_end is not None and total_lines > requested_end:
@@ -1953,7 +1959,7 @@ class Runtime:
                     if selection_complete:
                         continue
                     selected_parts.append(line)
-                    selected_bytes += len(line.encode("utf-8"))
+                    selected_bytes += len(line_bytes)
                     if len(selected_parts) > DEFAULT_MAX_LINES or selected_bytes > max_bytes:
                         selection_complete = True
         except UnicodeDecodeError as exc:
@@ -1978,6 +1984,8 @@ class Runtime:
             "path": resolved.display,
             "content": selected,
             "encoding": "utf-8",
+            "revision": digest.hexdigest(),
+            "revision_algorithm": REVISION_ALGORITHM,
             "max_bytes": max_bytes,
             "start_line": start_line,
             "end_line": actual_end,

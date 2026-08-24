@@ -1944,6 +1944,54 @@ class PatchEvidenceAndIdempotencyTests(unittest.TestCase):
         self.assertIn("1: alpha", details["nearby_text"])
 
 
+class ReadFileRevisionTests(unittest.TestCase):
+    """The revision read_file publishes has to name the bytes it just read."""
+
+    @contextmanager
+    def _runtime(self, content: str) -> Iterator[tuple[Path, Runtime]]:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "a.txt").write_text(content, encoding="utf-8")
+            runtime = Runtime(workspace, permission_mode="safe")
+            try:
+                yield workspace, runtime
+            finally:
+                runtime.close()
+
+    def test_revision_matches_the_hash_of_the_whole_file(self) -> None:
+        with self._runtime("alpha\nbeta\ngamma\n") as (workspace, runtime):
+            payload = runtime.read_file({"path": "a.txt"})
+            self.assertEqual(payload["revision_algorithm"], "sha256")
+            self.assertEqual(
+                payload["revision"],
+                content_revision((workspace / "a.txt").read_text(encoding="utf-8")),
+            )
+
+    def test_a_line_range_still_reports_the_whole_file_revision(self) -> None:
+        with self._runtime("alpha\nbeta\ngamma\n") as (workspace, runtime):
+            whole = runtime.read_file({"path": "a.txt"})
+            ranged = runtime.read_file({"path": "a.txt", "start_line": 2, "end_line": 2})
+            self.assertEqual(ranged["content"], "beta\n")
+            self.assertEqual(ranged["revision"], whole["revision"])
+
+    def test_apply_patch_reports_the_revision_a_later_read_confirms(self) -> None:
+        with self._runtime("alpha\n") as (_workspace, runtime):
+            patched = runtime.apply_patch(
+                {"patch": "*** Begin Patch\n*** Update File: a.txt\n@@\n-alpha\n+beta\n*** End Patch\n"}
+            )
+            self.assertEqual(
+                patched["affected_files"][0]["revision"],
+                runtime.read_file({"path": "a.txt"})["revision"],
+            )
+
+    def test_the_model_text_carries_the_revision(self) -> None:
+        with self._runtime("alpha\n") as (_workspace, runtime):
+            result = runtime.call_tool("read_file", {"path": "a.txt"})
+            text = result["content"][0]["text"]
+            self.assertIn(f"revision={result['structuredContent']['revision']}", text)
+            self.assertIn("alpha", text)
+
+
 class ProcessLifetimeTests(unittest.TestCase):
     """Yielding a command back to the caller must not shorten its life.
 
