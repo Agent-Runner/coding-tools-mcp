@@ -50,6 +50,7 @@ from .oauth import (
     validate_access_token,
     verify_pkce,
 )
+from .breaker import RepeatFailureBreaker, argument_fingerprint
 from .patching import (
     REVISION_ALGORITHM,
     AtomicPatchCommitter,
@@ -64,6 +65,7 @@ from .processes import (
     HARD_KILL_SIGNAL,
     COMMAND_BUFFER_BYTES,
     COMMAND_HEAD_BUFFER_DIVISOR,
+    COMMAND_OUTCOMES,
     CommandRun,
     spawn_process,
     start_reader_threads,
@@ -205,8 +207,12 @@ MAX_RUNTIME_OUTPUT_BYTES = 16 * 1024 * 1024
 # failed. Tools in this set accept an idempotency_key and replay the recorded
 # result for a repeat of the same key instead of applying the work twice.
 IDEMPOTENT_TOOLS = frozenset({"apply_patch", "apply_changes"})
+# The write primitives. A success here changes the tree every other tool reads,
+# which is what makes a previously deterministic failure worth re-attempting.
+WORKSPACE_WRITE_TOOLS = frozenset({"apply_patch", "apply_changes"})
 IDEMPOTENCY_CACHE_ENTRIES = 64
 IDEMPOTENCY_KEY_MAX_LENGTH = 128
+REPEATED_CALL_BLOCKED = "REPEATED_CALL_BLOCKED"
 _COMMAND_RECOVERY_HINT = (
     "This command_id has expired or never existed; a finished command keeps its"
     f" output for {COMPLETED_COMMAND_TTL_SECONDS} seconds and only the last"
@@ -563,6 +569,14 @@ class ToolSpec:
     content_builder: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None
     gated_by: str | None = None
     """Name of a Runtime attribute that must be truthy for the tool to be exposed."""
+    callable_when_hidden: bool = False
+    """Whether a client that already knows the name may still call it when hidden.
+
+    A capability gate (``view_image``) means the tool cannot work, so a hidden
+    tool is an unknown tool. A mode gate means the tool works but can only ever
+    report one answer, so hiding it stops advertising a guaranteed failure
+    without breaking a client that calls it anyway.
+    """
 
 
 def _count_lines(text: str) -> int:
@@ -725,8 +739,14 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     ),
     "request_permissions": ToolSpec(
         title="Request permissions",
-        description="Report scoped permission-request status without silently granting operations.",
+        description=(
+            "Report scoped permission-request status without silently granting operations. "
+            "Advertised only in permission_mode=dangerous, the sole configuration in which it can "
+            "return granted; elsewhere it can only ever return ELICITATION_UNSUPPORTED."
+        ),
         read_only=True,
+        gated_by="dangerously_skip_all_permissions",
+        callable_when_hidden=True,
     ),
     "view_image": ToolSpec(
         title="View image",
@@ -1323,12 +1343,6 @@ class Runtime:
     ) -> None:
         self.workspace = Workspace(workspace)
         self.enable_view_image = enable_view_image
-        self._exposed_tool_names = [
-            name
-            for name, spec in TOOL_REGISTRY.items()
-            if spec.gated_by is None or getattr(self, spec.gated_by)
-        ]
-        self._exposed_tool_name_set = frozenset(self._exposed_tool_names)
         if permission_mode not in PERMISSION_MODE_CHOICES:
             raise ToolFailure(
                 "INVALID_ARGUMENT",
@@ -1339,6 +1353,14 @@ class Runtime:
         self.permission_mode = permission_mode
         self.capabilities = PERMISSION_MODE_CAPABILITIES[permission_mode]
         self.dangerously_skip_all_permissions = self.capabilities.skip_all_permissions
+        # Computed after the permission mode resolves: `gated_by` names a
+        # runtime property, and one of the gates is the permission mode.
+        self._exposed_tool_names = [
+            name
+            for name, spec in TOOL_REGISTRY.items()
+            if spec.gated_by is None or getattr(self, spec.gated_by)
+        ]
+        self._exposed_tool_name_set = frozenset(self._exposed_tool_names)
         # Faking annotations is only defensible where the caller has already
         # asserted the workspace is disposable, so bind it to that assertion
         # instead of letting it be set orthogonally.
@@ -1380,6 +1402,7 @@ class Runtime:
         self.patch_committer = AtomicPatchCommitter()
         self._idempotency_results: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
         self._idempotency_lock = threading.Lock()
+        self.breaker = RepeatFailureBreaker()
         # ProjectContext is frozen and derived only from the workspace tree, so
         # an embedder that builds several runtimes over one workspace can reuse
         # the discovery (git ls-files / directory walk) result.
@@ -1652,7 +1675,7 @@ class Runtime:
     ) -> dict[str, Any]:
         started_at = time.time()
         args = arguments or {}
-        handler = self._tool_handlers.get(name) if name in self._exposed_tool_name_set else None
+        handler = self._tool_handlers.get(name) if self._is_callable_tool(name) else None
         if handler is None:
             raise JsonRpcError(-32602, f"Unknown tool: {name}", {"reason": "unknown_tool"})
         spec = TOOL_REGISTRY[name]
@@ -1663,9 +1686,21 @@ class Runtime:
             self.emit_tool_trace(name, args, replayed, started_at, context=context)
             content = spec.content_builder(dict(replayed)) if spec.content_builder else None
             return make_tool_result(name, replayed, is_error=replayed.get("ok") is False, content=content)
+        fingerprint = argument_fingerprint(args)
         try:
+            blocked = self.breaker.blocked_error_code(name, fingerprint)
+            if blocked is not None:
+                raise self._repeat_failure_error(name, blocked)
             payload = handler(args)
             payload.setdefault("ok", True)
+            self.breaker.record_success(name, fingerprint)
+            if name in WORKSPACE_WRITE_TOOLS and not (
+                payload.get("dry_run") or payload.get("already_applied") or payload.get("idempotent_replay")
+            ):
+                # A write landed, so every "this call can never succeed"
+                # verdict the breaker holds was reached against a tree that no
+                # longer exists.
+                self.breaker.reset()
             self._record_result(idempotency_key, payload)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             content = spec.content_builder(payload) if spec.content_builder else None
@@ -1696,6 +1731,19 @@ class Runtime:
                 }
             if exc.code == "ELICITATION_UNSUPPORTED":
                 payload["status"] = "unsupported"
+            if exc.code != REPEATED_CALL_BLOCKED:
+                repeats = self.breaker.record_failure(
+                    name, fingerprint, error_code=exc.code, retryable=exc.retryable
+                )
+                if repeats >= self.breaker.limit:
+                    payload["error"]["details"] = {
+                        **exc.details,
+                        "consecutive_identical_failures": repeats,
+                        "breaker": (
+                            "This exact call has now failed "
+                            f"{repeats} times. Repeating it unchanged will be refused."
+                        ),
+                    }
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
         except Exception as exc:  # noqa: BLE001 - tool failures must stay structured
@@ -1711,8 +1759,38 @@ class Runtime:
             }
             if spec.error_status:
                 payload["status"] = spec.error_status
+            self.breaker.record_failure(name, fingerprint, error_code="INTERNAL_ERROR", retryable=False)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             return make_tool_result(name, payload, is_error=True)
+
+    def _is_callable_tool(self, name: str) -> bool:
+        if name in self._exposed_tool_name_set:
+            return True
+        spec = TOOL_REGISTRY.get(name)
+        # A mode-gated tool disappears from tools/list but keeps answering a
+        # client that already knows about it, so removing it from the catalog
+        # never turns a working call into "unknown tool".
+        return spec is not None and spec.callable_when_hidden
+
+    def _repeat_failure_error(self, name: str, error_code: str) -> ToolFailure:
+        return ToolFailure(
+            REPEATED_CALL_BLOCKED,
+            (
+                f"This exact {name} call already failed {self.breaker.limit} times with {error_code}"
+                " and is refused until its arguments change."
+            ),
+            category="validation",
+            retryable=False,
+            details={
+                "tool": name,
+                "error_code": error_code,
+                "attempts": self.breaker.limit,
+                "retry_hint": (
+                    "Do not resend these arguments. Read the current state (read_file, git_status,"
+                    " list_dir) and construct a different call."
+                ),
+            },
+        )
 
     def _idempotency_slot(self, name: str, args: dict[str, Any]) -> tuple[str, str] | None:
         if name not in IDEMPOTENT_TOOLS:
@@ -1783,6 +1861,8 @@ class Runtime:
         raw_error = payload.get("error")
         error = raw_error if isinstance(raw_error, dict) else {}
         duration_ms = int((time.time() - started_at) * 1000)
+        raw_outcome = payload.get("operation_outcome")
+        outcome = raw_outcome if isinstance(raw_outcome, str) else None
         # `context` is passed on as the opaque per-request fact it is: the
         # runtime neither reads the client identity in it nor branches on it.
         self.telemetry.record_tool_call(
@@ -1792,6 +1872,7 @@ class Runtime:
             duration_ms=duration_ms,
             truncated=bool(payload.get("truncated")),
             context=context,
+            outcome=outcome,
         )
         if os.environ.get(f"{ENV_PREFIX}_TRACE") != "1":
             return
@@ -1801,6 +1882,7 @@ class Runtime:
             "tool": name,
             "ok": bool(payload.get("ok", False)),
             "status": payload.get("status"),
+            "operation_outcome": outcome,
             "error_code": error.get("code"),
             "duration_ms": duration_ms,
             "command_id": payload.get("command_id"),
@@ -4566,8 +4648,18 @@ def object_schema(properties: dict[str, Any] | None = None, required: list[str] 
     }
 
 
-def tool_output_schema() -> dict[str, Any]:
-    return {
+def tool_output_schema(name: str | None = None) -> dict[str, Any]:
+    """Declare what one tool actually returns, not just that it returns `ok`.
+
+    One generic schema for eighteen tools told a client nothing: every field a
+    caller needed — `command_id`, `exit_code`, `output_ref`, patch evidence —
+    was undeclared. Each entry below adds the tool's own fields on top of the
+    shared envelope. `additionalProperties` stays open because payloads still
+    carry advisory fields (warnings, next_action) that are not part of the
+    contract.
+    """
+
+    schema: dict[str, Any] = {
         "type": "object",
         "properties": {
             "ok": {"type": "boolean"},
@@ -4586,6 +4678,157 @@ def tool_output_schema() -> dict[str, Any]:
         },
         "required": ["ok"],
         "additionalProperties": True,
+    }
+    if name is not None:
+        schema["properties"] = {**schema["properties"], **output_schemas().get(name, {})}
+    return schema
+
+
+@functools.cache
+def output_schemas() -> dict[str, dict[str, Any]]:
+    string: dict[str, Any] = {"type": "string"}
+    nullable_string: dict[str, Any] = {"type": ["string", "null"]}
+    integer: dict[str, Any] = {"type": "integer"}
+    nullable_integer: dict[str, Any] = {"type": ["integer", "null"]}
+    boolean: dict[str, Any] = {"type": "boolean"}
+    string_array: dict[str, Any] = {"type": "array", "items": {"type": "string"}}
+    object_array: dict[str, Any] = {"type": "array", "items": {"type": "object", "additionalProperties": True}}
+    truncation: dict[str, Any] = {
+        "truncated": boolean,
+        "truncated_by": nullable_string,
+        "output_lines": integer,
+        "output_bytes": integer,
+        "warnings": string_array,
+    }
+    command_result: dict[str, Any] = {
+        "command_id": string,
+        "status": string,
+        "operation_outcome": {**string, "enum": list(COMMAND_OUTCOMES)},
+        "exit_code": nullable_integer,
+        "signal": nullable_string,
+        "timed_out": boolean,
+        "stdout": string,
+        "stderr": string,
+        "stdout_truncated": boolean,
+        "stderr_truncated": boolean,
+        "output_ref": nullable_string,
+        "output_refs": {"type": "object", "additionalProperties": {"type": "string"}},
+        "truncated": boolean,
+        "next_action": {"type": ["object", "null"], "additionalProperties": True},
+        "warnings": string_array,
+    }
+    patch_result: dict[str, Any] = {
+        "dry_run": boolean,
+        "clean": boolean,
+        "already_applied": boolean,
+        "idempotent_replay": boolean,
+        "revision_algorithm": {**string, "enum": [REVISION_ALGORITHM]},
+        "summary": string,
+        "affected_files": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": string,
+                    "old_path": string,
+                    "operation": string,
+                    "revision": string,
+                    "total_lines": integer,
+                    "match_quality": string,
+                    "changed_ranges": object_array,
+                },
+                "additionalProperties": True,
+            },
+        },
+        "additions": integer,
+        "removals": integer,
+        "warnings": string_array,
+    }
+    git_text: dict[str, Any] = {"truncated": boolean, "warnings": string_array}
+    return {
+        "server_info": {
+            "server": string,
+            "version": string,
+            "workspace": string,
+            "permission_mode": string,
+            "workspace_mutation_policy": {"type": "object", "additionalProperties": True},
+            "tools": string_array,
+            "tool_count": integer,
+        },
+        "check_exec_environment": {
+            "workspace": string,
+            "permission_mode": string,
+            "landlock_enabled": boolean,
+            "landlock_abi": nullable_integer,
+            "warnings": string_array,
+        },
+        "read_file": {
+            "path": string,
+            "content": string,
+            "encoding": string,
+            "revision": string,
+            "revision_algorithm": {**string, "enum": [REVISION_ALGORITHM]},
+            "start_line": integer,
+            "end_line": integer,
+            "total_lines": integer,
+            "total_bytes": integer,
+            "bytes_read": integer,
+            "next_start_line": nullable_integer,
+            "first_line_exceeds_limit": boolean,
+            **truncation,
+        },
+        "list_dir": {"path": string, "entries": object_array, **truncation},
+        "list_files": {"path": string, "files": object_array, **truncation},
+        "search_text": {
+            "query": string,
+            "matches": object_array,
+            "total_matches": integer,
+            "total_matches_exact": boolean,
+            "engine": string,
+            **truncation,
+        },
+        "apply_patch": patch_result,
+        "apply_changes": patch_result,
+        "exec_command": command_result,
+        "write_stdin": command_result,
+        "kill_command": {
+            "command_id": string,
+            "status": string,
+            "signal_sent": nullable_string,
+            "exit_code": nullable_integer,
+            "warnings": string_array,
+        },
+        "read_output": {
+            "output_ref": string,
+            "stream": string,
+            "content": string,
+            "offset": integer,
+            "next_offset": nullable_integer,
+            "total_bytes": integer,
+            "evicted_gap_bytes": integer,
+            **truncation,
+        },
+        "git_status": {"is_repo": boolean, "branch": nullable_string, "entries": object_array, **git_text},
+        "git_diff": {"diff": string, "files": object_array, **git_text},
+        "git_log": {"is_repo": boolean, "commits": object_array, **git_text},
+        "git_show": {"content": string, "files": object_array, **git_text},
+        "git_blame": {"path": string, "lines": object_array, **git_text},
+        "request_permissions": {
+            "status": string,
+            "grant_id": nullable_string,
+            "expires_at": nullable_string,
+            "constraints": {"type": "object", "additionalProperties": True},
+            "warnings": string_array,
+        },
+        "view_image": {
+            "path": string,
+            "mime_type": string,
+            "width": nullable_integer,
+            "height": nullable_integer,
+            "bytes": integer,
+            "resized": boolean,
+            "warnings": string_array,
+        },
     }
 
 
@@ -4676,7 +4919,7 @@ def tool_definition(name: str, *, fake_readonly: bool = False) -> dict[str, Any]
         "title": annotations["title"],
         "description": TOOL_REGISTRY[name].description,
         "inputSchema": schemas[name],
-        "outputSchema": tool_output_schema(),
+        "outputSchema": tool_output_schema(name),
         "annotations": annotations,
     }
 
@@ -4883,7 +5126,6 @@ def input_schemas() -> dict[str, dict[str, Any]]:
                         "shell_expansion",
                         INLINE_SCRIPT_PERMISSION,
                         "privileged_executable",
-                        "write_generated_or_ignored",
                     ],
                 },
                 "reason": {**string, "minLength": 1},

@@ -492,6 +492,94 @@ class FirstAppearanceLogTests(unittest.TestCase):
         self.assertNotIn("\x07", output)
 
 
+class FailureStreakKeyingTests(unittest.TestCase):
+    """D2: streaks belong to a (tool, error_code) pair, not to one global slot."""
+
+    def session(self) -> SessionTelemetry:
+        return SessionTelemetry(permission_mode="safe")
+
+    def fail(self, session: SessionTelemetry, tool: str, code: str) -> None:
+        session.record_tool_call(tool, ok=False, error_code=code, duration_ms=1, truncated=False)
+
+    def succeed(self, session: SessionTelemetry, tool: str, outcome: str | None = None) -> None:
+        session.record_tool_call(
+            tool, ok=True, error_code=None, duration_ms=1, truncated=False, outcome=outcome
+        )
+
+    def test_another_tools_success_does_not_clear_a_streak(self) -> None:
+        session = self.session()
+        self.fail(session, "apply_patch", "PATCH_CONTEXT_NOT_FOUND")
+        self.fail(session, "apply_patch", "PATCH_CONTEXT_NOT_FOUND")
+        self.succeed(session, "read_file")
+        self.fail(session, "apply_patch", "PATCH_CONTEXT_NOT_FOUND")
+        self.assertEqual(session.consecutive_failures("apply_patch", "PATCH_CONTEXT_NOT_FOUND"), 3)
+
+    def test_two_error_codes_on_one_tool_count_separately(self) -> None:
+        session = self.session()
+        self.fail(session, "apply_patch", "PATCH_CONTEXT_NOT_FOUND")
+        self.fail(session, "apply_patch", "PATCH_CONFLICT")
+        self.assertEqual(session.consecutive_failures("apply_patch", "PATCH_CONTEXT_NOT_FOUND"), 1)
+        self.assertEqual(session.consecutive_failures("apply_patch", "PATCH_CONFLICT"), 1)
+
+    def test_a_success_of_the_same_tool_clears_its_streaks(self) -> None:
+        session = self.session()
+        self.fail(session, "apply_patch", "PATCH_CONTEXT_NOT_FOUND")
+        self.succeed(session, "apply_patch")
+        self.assertEqual(session.consecutive_failures("apply_patch", "PATCH_CONTEXT_NOT_FOUND"), 0)
+
+    def test_a_failed_operation_is_not_a_success_and_clears_nothing(self) -> None:
+        session = self.session()
+        self.fail(session, "exec_command", "INVALID_ARGUMENT")
+        self.succeed(session, "exec_command", outcome="exited_nonzero")
+        self.assertEqual(session.consecutive_failures("exec_command", "INVALID_ARGUMENT"), 1)
+        self.succeed(session, "exec_command", outcome="exited_0")
+        self.assertEqual(session.consecutive_failures("exec_command", "INVALID_ARGUMENT"), 0)
+
+
+class OperationOutcomeTests(unittest.TestCase):
+    """D1: a command that exits non-zero is not a successful operation."""
+
+    def test_tool_summary_separates_call_success_from_operation_success(self) -> None:
+        sender = _CapturingSender()
+        with scrubbed_env(CODING_TOOLS_MCP_TELEMETRY="on"), patch.object(
+            telemetry, "_get_sender", return_value=sender
+        ):
+            session = SessionTelemetry(permission_mode="safe")
+            session.record_request(LEGACY_PROTOCOL_VERSION, "tools/call")
+            for outcome in ("exited_0", "exited_nonzero", "timeout", "signal"):
+                session.record_tool_call(
+                    "exec_command",
+                    ok=True,
+                    error_code=None,
+                    duration_ms=1,
+                    truncated=False,
+                    outcome=outcome,
+                )
+            session.finish()
+        summary = next(
+            _properties(event)
+            for event in sender.events
+            if event["event"] == "tool_summary" and _properties(event)["tool"] == "exec_command"
+        )
+        self.assertEqual(summary["calls"], 4)
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["operation_failures"], 3)
+        self.assertEqual(summary["outcome_exited_nonzero"], 1)
+        self.assertEqual(summary["outcome_timeout"], 1)
+        self.assertEqual(summary["outcome_signal"], 1)
+
+    def test_a_nonzero_exit_is_reported_as_the_operation_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Runtime(Path(tmp), permission_mode="safe")
+            try:
+                payload = runtime.exec_command({"cmd": "exit 3", "timeout_ms": 5000})
+            finally:
+                runtime.close()
+        self.assertIs(payload["ok"], True)
+        self.assertEqual(payload["exit_code"], 3)
+        self.assertEqual(payload["operation_outcome"], "exited_nonzero")
+
+
 class DocumentationDriftTests(unittest.TestCase):
     def test_documented_schema_matches_emitted_events(self) -> None:
         doc = (Path(__file__).resolve().parents[1] / "docs" / "telemetry.md").read_text(encoding="utf-8")

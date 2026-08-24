@@ -39,9 +39,15 @@ REQUIRED_TOOLS = (
     "git_log",
     "git_show",
     "git_blame",
-    "request_permissions",
     "view_image",
 )
+
+# Advertised only when the runtime property their `gated_by` names is truthy,
+# so they are absent from a default `tools/list` and are not required of one.
+# `request_permissions` can only return ELICITATION_UNSUPPORTED outside
+# permission_mode=dangerous; advertising a guaranteed failure is what produced
+# its 59.9% failure rate.
+MODE_GATED_TOOLS = ("request_permissions",)
 
 FORBIDDEN_TOOL_NAMES = {
     "codex",

@@ -551,7 +551,7 @@ def assert_sdk_smoke(test: unittest.TestCase, summary: dict[str, Any]) -> None:
     test.assertEqual(summary["tools_capability"], False, summary)
     test.assertIn("inside the configured workspace", summary["instructions"], summary)
     test.assertIn("check_exec_environment", summary["tools"])
-    test.assertGreaterEqual(len(summary["tools"]), 18, summary)
+    test.assertGreaterEqual(len(summary["tools"]), 17, summary)
     test.assertFalse(summary["is_error"], summary)
     test.assertTrue(summary["content"], summary)
 
