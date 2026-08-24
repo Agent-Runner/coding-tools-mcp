@@ -1,11 +1,11 @@
 # Compliance Report
 
 - contract: `coding-tools-mcp-v0.3`
-- commit: `7b2b3c72bb4376f426dbd132cc94f5916231e33c+dirty`
-- suite: `docs-required`
+- commit: `941f84e32b240bb64cc9b78e3793a48bf2d11f81+dirty`
+- suite: `schema-drift`
 - passed: `true`
-- tests_run: `4`
-- elapsed_seconds: `0.002`
+- tests_run: `8`
+- elapsed_seconds: `0.105`
 
 ## Required Tools
 

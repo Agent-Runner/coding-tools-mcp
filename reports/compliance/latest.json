@@ -1,9 +1,9 @@
 {
-  "commit": "7b2b3c72bb4376f426dbd132cc94f5916231e33c+dirty",
+  "commit": "941f84e32b240bb64cc9b78e3793a48bf2d11f81+dirty",
   "contract": "coding-tools-mcp-v0.3",
   "dogfood": "not_run",
   "e2e": "not_run",
-  "elapsed_seconds": 0.002,
+  "elapsed_seconds": 0.105,
   "failures": [],
   "passed": true,
   "required_tools": {
@@ -28,7 +28,7 @@
   },
   "security": "not_run",
   "skipped": [],
-  "suite": "docs-required",
-  "tests_run": 4,
+  "suite": "schema-drift",
+  "tests_run": 8,
   "write_only": false
 }
