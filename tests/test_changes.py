@@ -453,6 +453,40 @@ class ApplyChangesRuntimeTests(unittest.TestCase):
         self.assertFalse(second["isError"])
         self.assertIs(second["structuredContent"]["idempotent_replay"], True)
 
+    def test_a_dry_run_under_a_key_never_answers_the_real_apply(self) -> None:
+        changes = [{"action": "create", "path": "new.txt", "content": "x\n"}]
+        rehearsal = self.runtime.call_tool(
+            "apply_changes", {"changes": changes, "dry_run": True, "idempotency_key": "k1"}
+        )
+        self.assertFalse(rehearsal["isError"])
+        self.assertFalse((self.workspace / "new.txt").exists())
+
+        applied = self.runtime.call_tool("apply_changes", {"changes": changes, "idempotency_key": "k1"})
+        self.assertFalse(applied["isError"])
+        self.assertNotIn("idempotent_replay", applied["structuredContent"])
+        self.assertEqual((self.workspace / "new.txt").read_text(encoding="utf-8"), "x\n")
+
+    def test_reusing_a_key_for_different_work_is_refused_rather_than_replayed(self) -> None:
+        first = self.runtime.call_tool(
+            "apply_changes",
+            {
+                "changes": [{"action": "create", "path": "first.txt", "content": "one\n"}],
+                "idempotency_key": "k1",
+            },
+        )
+        self.assertFalse(first["isError"])
+
+        second = self.runtime.call_tool(
+            "apply_changes",
+            {
+                "changes": [{"action": "create", "path": "second.txt", "content": "two\n"}],
+                "idempotency_key": "k1",
+            },
+        )
+        self.assertTrue(second["isError"])
+        self.assertEqual(second["structuredContent"]["error"]["code"], "IDEMPOTENCY_KEY_REUSED")
+        self.assertFalse((self.workspace / "second.txt").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

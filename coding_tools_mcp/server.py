@@ -231,6 +231,7 @@ WORKSPACE_WRITE_TOOLS = frozenset({"apply_patch", "apply_changes"})
 IDEMPOTENCY_CACHE_ENTRIES = 64
 IDEMPOTENCY_KEY_MAX_LENGTH = 128
 REPEATED_CALL_BLOCKED = "REPEATED_CALL_BLOCKED"
+IDEMPOTENCY_KEY_REUSED = "IDEMPOTENCY_KEY_REUSED"
 _COMMAND_RECOVERY_HINT = (
     "This command_id has expired or never existed; a finished command keeps its"
     f" output for {COMPLETED_COMMAND_TTL_SECONDS} seconds and only the last"
@@ -1499,7 +1500,7 @@ class Runtime:
         self.patch_baselines: dict[str, str | None] = {}
         self.patch_lock = threading.Lock()
         self.patch_committer = AtomicPatchCommitter()
-        self._idempotency_results: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+        self._idempotency_results: OrderedDict[tuple[str, str], tuple[str, dict[str, Any]]] = OrderedDict()
         self._idempotency_lock = threading.Lock()
         self.breaker = RepeatFailureBreaker()
         # ProjectContext is frozen and derived only from the workspace tree, so
@@ -1826,14 +1827,16 @@ class Runtime:
             raise JsonRpcError(-32602, f"Unknown tool: {name}", {"reason": "unknown_tool"})
         spec = TOOL_REGISTRY[name]
         validate_arguments(name, args)
-        idempotency_key = self._idempotency_slot(name, args)
-        replayed = self._recorded_result(idempotency_key)
-        if replayed is not None:
-            self.emit_tool_trace(name, args, replayed, started_at, context=context)
-            content = spec.content_builder(dict(replayed)) if spec.content_builder else None
-            return make_tool_result(name, replayed, is_error=replayed.get("ok") is False, content=content)
         fingerprint = argument_fingerprint(args)
+        idempotency_key = self._idempotency_slot(name, args)
         try:
+            # Inside the try: a key reused for different work is a tool error
+            # the model can act on, not an exception that escapes the envelope.
+            replayed = self._recorded_result(idempotency_key, fingerprint)
+            if replayed is not None:
+                self.emit_tool_trace(name, args, replayed, started_at, context=context)
+                content = spec.content_builder(dict(replayed)) if spec.content_builder else None
+                return make_tool_result(name, replayed, is_error=replayed.get("ok") is False, content=content)
             blocked = self.breaker.blocked_error_code(name, fingerprint)
             if blocked is not None:
                 raise self._repeat_failure_error(name, blocked)
@@ -1847,7 +1850,7 @@ class Runtime:
                 # verdict the breaker holds was reached against a tree that no
                 # longer exists.
                 self.breaker.reset()
-            self._record_result(idempotency_key, payload)
+            self._record_result(idempotency_key, fingerprint, payload)
             self.emit_tool_trace(name, args, payload, started_at, context=context)
             content = spec.content_builder(payload) if spec.content_builder else None
             return make_tool_result(name, payload, is_error=payload.get("ok") is False, content=content)
@@ -1944,12 +1947,13 @@ class Runtime:
         raw = args.get("idempotency_key")
         return (name, raw) if isinstance(raw, str) and raw else None
 
-    def _recorded_result(self, slot: tuple[str, str] | None) -> dict[str, Any] | None:
+    def _recorded_result(self, slot: tuple[str, str] | None, fingerprint: str) -> dict[str, Any] | None:
         """Return the result a previous call under this key produced, if any.
 
-        Only successes are recorded. A failure carries its own retryability,
-        and replaying one would turn a transient conflict into a permanent
-        answer for as long as the key is reused.
+        A key stands for one piece of work, so the recorded result is only
+        replayed for the arguments that produced it. Reusing a key for a
+        different request is answered with an error rather than with the first
+        request's success, which would report work that was never done.
         """
 
         if slot is None:
@@ -1959,15 +1963,38 @@ class Runtime:
             if recorded is None:
                 return None
             self._idempotency_results.move_to_end(slot)
-        replay = dict(recorded)
+        recorded_fingerprint, payload = recorded
+        if recorded_fingerprint != fingerprint:
+            raise ToolFailure(
+                IDEMPOTENCY_KEY_REUSED,
+                f"idempotency_key {slot[1]!r} was already used by a different {slot[0]} request. "
+                "A key names one request: replay it with the same arguments, or send a new key.",
+                category="validation",
+                retryable=False,
+                details={
+                    "tool": slot[0],
+                    "idempotency_key": slot[1],
+                    "retry_hint": "Resend the original arguments to replay, or choose a new idempotency_key.",
+                },
+            )
+        replay = dict(payload)
         replay["idempotent_replay"] = True
         return replay
 
-    def _record_result(self, slot: tuple[str, str] | None, payload: dict[str, Any]) -> None:
-        if slot is None or payload.get("ok") is False:
+    def _record_result(self, slot: tuple[str, str] | None, fingerprint: str, payload: dict[str, Any]) -> None:
+        """Record one success under its key, with the arguments that earned it.
+
+        A failure is never recorded: it carries its own retryability, and
+        replaying one would turn a transient conflict into a permanent answer
+        for as long as the key is reused. A dry run is never recorded either —
+        it changed nothing, so answering a later real apply with it would
+        report a write that never happened.
+        """
+
+        if slot is None or payload.get("ok") is False or payload.get("dry_run"):
             return
         with self._idempotency_lock:
-            self._idempotency_results[slot] = dict(payload)
+            self._idempotency_results[slot] = (fingerprint, dict(payload))
             self._idempotency_results.move_to_end(slot)
             while len(self._idempotency_results) > IDEMPOTENCY_CACHE_ENTRIES:
                 self._idempotency_results.popitem(last=False)
